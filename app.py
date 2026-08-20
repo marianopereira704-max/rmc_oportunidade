@@ -1,0 +1,94 @@
+"""Ponto de entrada do sistema (Streamlit).
+
+Fluxo: garante o banco pronto -> aplica tema -> tenta restaurar sessão via
+cookie de 'lembrar-me' -> se não tem usuário logado, mostra a tela de login;
+se tem, mostra a sidebar de navegação e renderiza a seção escolhida.
+"""
+from __future__ import annotations
+
+import streamlit as st
+
+from core import auth, theme
+from core.config import settings
+from core.db import init_db
+from views import dados, dashboard, login, oportunidade_loja, oportunidade_produto, pedido
+
+st.set_page_config(
+    page_title=f"{settings.nome_fornecedor} Oportunidades",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+init_db()
+theme.aplicar_tema()
+
+usuario_logado = auth.tentar_restaurar_sessao()
+
+if not usuario_logado:
+    login.render()
+    st.stop()
+
+usuario = auth.usuario_atual()
+
+# (chave, rótulo do botão, ícone, grupo da sidebar, função de render, admin-only).
+# O rótulo do botão é curto ("Por Loja") — o título completo ("Análise de
+# Oportunidade · Loja") continua no cabeçalho de cada tela; o grupo é só o
+# rótulo de separação visual na sidebar (mesmo padrão do mockup aprovado).
+# Ícones usam a sintaxe ":material/..." do Streamlit (Material Symbols) em
+# vez de emoji — emoji tem cor fixa do sistema operacional e ignoraria o
+# branco/navy do botão conforme ele está inativo ou ativo; o ícone Material
+# herda a cor do texto do botão normalmente.
+SECOES = [
+    ("oportunidade_loja", "Por Loja", ":material/storefront:", "Análise de Oportunidade", oportunidade_loja.render, False),
+    ("oportunidade_produto", "Por Produto", ":material/inventory_2:", "Análise de Oportunidade", oportunidade_produto.render, False),
+    ("pedido", "Pedido", ":material/shopping_cart:", "Gestão", pedido.render, False),
+    ("dashboard", "Dashboard", ":material/dashboard:", "Gestão", dashboard.render, False),
+    ("dados", "Dados", ":material/folder:", "Administração", dados.render, True),  # só admin
+]
+
+_apenas_admin_por_chave = {chave: apenas_admin for chave, _r, _i, _g, _fn, apenas_admin in SECOES}
+
+if "secao_ativa" not in st.session_state:
+    st.session_state["secao_ativa"] = "oportunidade_loja"
+
+# Trava de acesso: nunca renderizar uma seção admin-only pra quem não é admin
+# — cobre tanto alguém digitando/injetando a chave quanto o caso real: um
+# admin estava na aba Dados, deu logout, um consultor logou na mesma sessão
+# do navegador, e sem essa checagem a última seção ativa (herdada do usuário
+# anterior) continuava sendo renderizada mesmo sem o botão dela na sidebar.
+if _apenas_admin_por_chave.get(st.session_state["secao_ativa"]) and not auth.is_admin():
+    st.session_state["secao_ativa"] = "oportunidade_loja"
+
+with st.sidebar:
+    st.markdown(
+        f"""<div style="padding: 8px 4px 20px 4px;">
+        <div style="font-weight:700; font-size:1.1rem;">{settings.nome_fornecedor} Oportunidades</div>
+        <div style="font-size:0.8rem; color:#C9D4E0;">{usuario['nome']} · {"Admin" if auth.is_admin() else "Consultor"}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
+    _ultimo_grupo = None
+    for chave, rotulo, icone, grupo, _fn, apenas_admin in SECOES:
+        if apenas_admin and not auth.is_admin():
+            continue
+        if grupo != _ultimo_grupo:
+            theme.nav_grupo_label(grupo)
+            _ultimo_grupo = grupo
+        ativa = st.session_state["secao_ativa"] == chave
+        with st.container():
+            st.markdown(f'<div class="nav-marker{"-ativo" if ativa else ""}"></div>', unsafe_allow_html=True)
+            if st.button(rotulo, key=f"nav_{chave}", icon=icone, use_container_width=True):
+                st.session_state["secao_ativa"] = chave
+                st.rerun()
+
+    st.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
+    with st.container():
+        st.markdown('<div class="nav-marker"></div>', unsafe_allow_html=True)
+        if st.button("Sair", key="nav_sair", icon=":material/logout:", use_container_width=True):
+            auth.encerrar_sessao()
+            st.rerun()
+
+_secoes_por_chave = {chave: fn for chave, _r, _i, _g, fn, _a in SECOES}
+_secoes_por_chave[st.session_state["secao_ativa"]]()
