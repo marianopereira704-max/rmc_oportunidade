@@ -1,0 +1,7 @@
+.git
+.streamlit/secrets.toml
+data/
+tests/
+__pycache__/
+*.pyc
+.pytest_cache/

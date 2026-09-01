@@ -1,0 +1,16 @@
+services:
+  rmc_oportunidades:
+    build: .
+    container_name: rmc_oportunidades
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8501:8501"
+    volumes:
+      - ./.streamlit/secrets.toml:/app/.streamlit/secrets.toml:ro
+      - ./data/local_storage:/app/data/local_storage
+    networks:
+      - postgres_default
+
+networks:
+  postgres_default:
+    external: true
