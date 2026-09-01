@@ -65,11 +65,11 @@ def processar_planilha_base_genericos(
         mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    linhas: list[tuple[str, str]] = []
-    for _, linha in df.iterrows():
-        ean = normalizar_ean(linha[mapa["ean"]])
-        descricao = str(linha[mapa["descricao"]]).strip() if pd.notna(linha[mapa["descricao"]]) else ""
-        linhas.append((ean, descricao))
+    df_norm = pd.DataFrame({"ean": df[mapa["ean"]], "descricao": df[mapa["descricao"]]})
+    linhas: list[tuple[str, str]] = [
+        (normalizar_ean(linha.ean), str(linha.descricao).strip() if pd.notna(linha.descricao) else "")
+        for linha in df_norm.itertuples(index=False)
+    ]
 
     resultado = reconciliation_motor.importar_base_genericos(session, linhas, criado_por)
 

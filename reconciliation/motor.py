@@ -126,6 +126,8 @@ def resolver_ean(
     criado_por: str = "sistema",
     cache_candidatos: dict | None = None,
     cache_eans_resolvidos: dict[str, int] | None = None,
+    cache_fila_pendente: dict[str, FilaResolucaoEAN] | None = None,
+    cache_descricao_pendente: dict[str, str] | None = None,
 ) -> int | None:
     """Retorna o base_generico_id se o EAN já está (ou acabou de ficar)
     resolvido; None se caiu na fila (ainda pendente).
@@ -139,10 +141,29 @@ def resolver_ean(
     profiling real: numa planilha de ~150 mil linhas, a maioria repete EAN
     já resolvido (mesmo produto comprado por várias lojas/meses), e isso
     sozinho era ~2/3 do tempo restante depois de cachear buscar_candidatos.
-    Só ajuda quem já está RESOLVIDO — EAN pendente (fila) sempre reconsulta
-    de propósito, porque cada ocorrência pode trazer uma descrição
-    ligeiramente diferente e a fila precisa acumular valor/ocorrências a
-    cada uma mesmo assim (ver upsert_fila_resolucao)."""
+    Só ajuda quem já está RESOLVIDO.
+
+    `cache_fila_pendente` (opcional, ean -> FilaResolucaoEAN) é o
+    equivalente pra EAN AINDA PENDENTE — repassado direto pra
+    `upsert_fila_resolucao` (ver lá): evita 1 SELECT + 1 flush no SQLite
+    por OCORRÊNCIA de um EAN que nunca resolve sozinho.
+
+    `cache_descricao_pendente` (opcional, ean -> descrição normalizada da
+    última chamada) é o que evita repetir o fuzzy-match em si (o `PONTO
+    mais caro de todos, medido via profiling real numa planilha de 150 mil
+    linhas: um EAN "preso" na fila pode se repetir em dezenas de milhares
+    de linhas — ex: o mesmo genérico comprado por centenas de lojas — e sem
+    isso `buscar_candidatos` reavaliava as ~2 mil opções ativas EM TODA
+    ocorrência). Só pula o fuzzy-match quando a descrição normalizada desta
+    ocorrência é IDÊNTICA à da última vez que resolvemos este EAN nesta
+    mesma sessão — `buscar_candidatos` é função pura de
+    (descrição normalizada, catálogo ativo), e o catálogo não muda durante
+    um upload (ver docstring de `buscar_candidatos`), então mesma entrada
+    SEMPRE dá a mesma saída: reaproveitar não muda nenhum resultado, só
+    evita recalcular o que já calculamos. Descrição DIFERENTE (loja
+    reportou o produto com texto ligeiramente distinto) ainda recalcula
+    normalmente — preserva o comportamento de sempre reavaliar quando algo
+    pode ter mudado."""
     ean = (ean or "").strip()
     if not ean:
         return None
@@ -157,7 +178,30 @@ def resolver_ean(
         return existente.base_generico_id
 
     descricao_norm = normalizar_texto(descricao_origem)
+
+    fila_cacheada = cache_fila_pendente.get(ean) if cache_fila_pendente is not None else None
+    descricao_norm_anterior = cache_descricao_pendente.get(ean) if cache_descricao_pendente is not None else None
+
+    if fila_cacheada is not None and descricao_norm_anterior == descricao_norm:
+        # Mesmo EAN, mesma descrição normalizada já vista nesta sessão: o
+        # score seria idêntico ao já calculado (função pura — ver acima).
+        # Já sabemos que NÃO foi "auto" da vez anterior (senão a próxima
+        # ocorrência teria batido em cache_eans_resolvidos, nem chegado
+        # aqui) — então a decisão continua sendo fila, sem reclassificar.
+        sugestao_id = fila_cacheada.sugestao_base_generico_id
+        sugestao_score_raw = fila_cacheada.sugestao_score
+        sugestao_score = float(sugestao_score_raw) if sugestao_score_raw is not None else None
+        upsert_fila_resolucao(
+            session, ean=ean, descricao_observada=descricao_origem, origem=origem,
+            valor=valor, aparece_em_estoque=aparece_em_estoque,
+            sugestao_base_generico_id=sugestao_id, sugestao_score=sugestao_score,
+            cache_fila_pendente=cache_fila_pendente,
+        )
+        return None
+
     melhor = buscar_candidatos(session, descricao_norm, cache=cache_candidatos)
+    if cache_descricao_pendente is not None:
+        cache_descricao_pendente[ean] = descricao_norm
     score = melhor[1] if melhor else 0.0
 
     decisao = classificar(score, settings.reconciliacao.limiar_auto_aceite, settings.reconciliacao.limiar_fila_media)
@@ -190,6 +234,7 @@ def resolver_ean(
         aparece_em_estoque=aparece_em_estoque,
         sugestao_base_generico_id=sugestao_id,
         sugestao_score=sugestao_score,
+        cache_fila_pendente=cache_fila_pendente,
     )
     return None
 
@@ -203,11 +248,39 @@ def upsert_fila_resolucao(
     aparece_em_estoque: bool = False,
     sugestao_base_generico_id: int | None = None,
     sugestao_score: float | None = None,
+    cache_fila_pendente: dict[str, FilaResolucaoEAN] | None = None,
 ) -> FilaResolucaoEAN:
     """Idempotente por EAN (chave de dedup — ver nota em core/models.py):
     uma ocorrência nova do mesmo EAN não cria linha nova, só soma valor e
     incrementa ocorrências na linha existente. Item IGNORADA não é reaberto
-    automaticamente — dispensar é uma decisão deliberada do admin."""
+    automaticamente — dispensar é uma decisão deliberada do admin.
+
+    `cache_fila_pendente` (opcional, ean -> FilaResolucaoEAN) evita 1
+    SELECT + 1 flush no SQLite por OCORRÊNCIA de um EAN que nunca resolve
+    sozinho — sem isso, numa planilha real de 150 mil linhas onde só um
+    punhado de EANs distintos fica preso na fila (mas cada um se repete em
+    dezenas de milhares de linhas, ex: o mesmo genérico comprado por
+    centenas de lojas), essa era a operação mais cara de todo o
+    processamento, medida via profiling real — muito à frente do
+    fuzzy-match em si. Passe o MESMO dict entre chamadas sucessivas dentro
+    de um upload/reprocesso em massa (mesmo padrão de `cache_candidatos`/
+    `cache_eans_resolvidos` em `resolver_ean`); o objeto ORM fica só
+    mutado em memória a cada ocorrência seguinte, e o flush de todas as
+    mutações acontece de uma vez só quando a sessão inteira dá flush/commit
+    (a soma de valor/contagem de ocorrências fica idêntica a fazer 1
+    flush por linha — só o COMO grava muda, nunca o total acumulado)."""
+    if cache_fila_pendente is not None and ean in cache_fila_pendente:
+        fila = cache_fila_pendente[ean]
+        fila.valor_total_acumulado = float(fila.valor_total_acumulado or 0) + float(valor or 0)
+        fila.qtd_ocorrencias = (fila.qtd_ocorrencias or 0) + 1
+        fila.aparece_em_estoque = bool(fila.aparece_em_estoque or aparece_em_estoque)
+        if sugestao_base_generico_id is not None:
+            fila.sugestao_base_generico_id = sugestao_base_generico_id
+            fila.sugestao_score = sugestao_score
+        if descricao_observada:
+            fila.descricao_observada = descricao_observada
+        return fila
+
     fila = session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == ean)).scalar_one_or_none()
     if fila is None:
         fila = FilaResolucaoEAN(
@@ -231,7 +304,15 @@ def upsert_fila_resolucao(
             fila.sugestao_score = sugestao_score
         if descricao_observada:
             fila.descricao_observada = descricao_observada
-    session.flush()
+
+    if cache_fila_pendente is not None:
+        # 1º flush pra ESTE ean nesta sessão — precisa acontecer pra garantir
+        # que `fila` tenha id/estado consistente antes de virar cache; as
+        # próximas ocorrências deste mesmo ean não passam mais por aqui.
+        session.flush()
+        cache_fila_pendente[ean] = fila
+    else:
+        session.flush()
     return fila
 
 
@@ -335,43 +416,49 @@ def importar_base_genericos(
     eans_ja_resolvidos = {row[0] for row in session.execute(select(EanGenerico.ean)).all()}
     cache_generico_por_nome: dict[str, BaseGenerico] = {}
 
-    for ean, descricao in linhas:
-        ean = (ean or "").strip()
-        descricao = (descricao or "").strip()
-        if not ean or not descricao:
-            linhas_invalidas += 1
-            continue
+    # ver justificativa detalhada em integrations/gps.py::_processar_linhas —
+    # mesmo raciocínio: toda SELECT abaixo (cache miss de `cache_generico_por_nome`)
+    # já é seguida de `session.flush()` explícito quando cria algo novo, então
+    # autoflush implícito a cada SELECT (disparando flush do que já foi
+    # `session.add`ado no loop) é só custo redundante.
+    with session.no_autoflush:
+        for ean, descricao in linhas:
+            ean = (ean or "").strip()
+            descricao = (descricao or "").strip()
+            if not ean or not descricao:
+                linhas_invalidas += 1
+                continue
 
-        if ean in eans_ja_resolvidos:
-            eans_pulados += 1
-            continue
+            if ean in eans_ja_resolvidos:
+                eans_pulados += 1
+                continue
 
-        generico = cache_generico_por_nome.get(descricao)
-        if generico is None:
-            generico = session.execute(
-                select(BaseGenerico).where(BaseGenerico.nome_canonico == descricao)
-            ).scalar_one_or_none()
+            generico = cache_generico_por_nome.get(descricao)
             if generico is None:
-                generico = BaseGenerico(nome_canonico=descricao, criado_por=criado_por)
-                session.add(generico)
-                session.flush()
-                genericos_criados += 1
-            else:
-                genericos_reaproveitados += 1
-            cache_generico_por_nome[descricao] = generico
+                generico = session.execute(
+                    select(BaseGenerico).where(BaseGenerico.nome_canonico == descricao)
+                ).scalar_one_or_none()
+                if generico is None:
+                    generico = BaseGenerico(nome_canonico=descricao, criado_por=criado_por)
+                    session.add(generico)
+                    session.flush()
+                    genericos_criados += 1
+                else:
+                    genericos_reaproveitados += 1
+                cache_generico_por_nome[descricao] = generico
 
-        session.add(
-            EanGenerico(
-                ean=ean,
-                base_generico_id=generico.id,
-                origem_resolucao=OrigemResolucao.IMPORTADA,
-                score_similaridade=None,
-                descricao_origem_snapshot=descricao,
-                resolvido_por=criado_por,
+            session.add(
+                EanGenerico(
+                    ean=ean,
+                    base_generico_id=generico.id,
+                    origem_resolucao=OrigemResolucao.IMPORTADA,
+                    score_similaridade=None,
+                    descricao_origem_snapshot=descricao,
+                    resolvido_por=criado_por,
+                )
             )
-        )
-        eans_ja_resolvidos.add(ean)  # mesma planilha repetindo o EAN não deve duplicar
-        eans_vinculados += 1
+            eans_ja_resolvidos.add(ean)  # mesma planilha repetindo o EAN não deve duplicar
+            eans_vinculados += 1
 
     session.flush()
 

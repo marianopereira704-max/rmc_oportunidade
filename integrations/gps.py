@@ -156,6 +156,19 @@ def ignorar_cnpj_orfao(session: Session, fila_id: int) -> None:
     session.flush()
 
 
+def _dataframe_normalizado(df: pd.DataFrame, mapa: dict[str, str]) -> pd.DataFrame:
+    """Monta um DataFrame com uma coluna por CAMPO (não por nome de coluna da
+    planilha original) — 'cnpj', 'ean', 'laboratorio' etc., sempre presentes
+    (as opcionais viram None quando não mapeadas). Isso permite iterar com
+    `itertuples` (atributo por nome fixo do domínio, ex: `linha.cnpj`) em vez
+    de `iterrows` (que materializa uma Series inteira, com coerção de dtype,
+    a cada linha — o gargalo medido em profiling real pra 150 mil linhas)."""
+    colunas = {campo: df[coluna] for campo, coluna in mapa.items()}
+    for campo_opcional in ("laboratorio", "razao_social"):
+        colunas.setdefault(campo_opcional, None)
+    return pd.DataFrame(colunas)
+
+
 def _processar_linhas(
     session: Session,
     df: pd.DataFrame,
@@ -166,6 +179,8 @@ def _processar_linhas(
     apenas_cnpjs: set[str] | None = None,
     cache_candidatos: dict | None = None,
     cache_eans_resolvidos: dict[str, int] | None = None,
+    cache_fila_pendente: dict | None = None,
+    cache_descricao_pendente: dict | None = None,
 ) -> dict[str, int]:
     """Núcleo compartilhado entre upload normal e reprocessamento de CNPJ
     órfão (manual — 1 item — ou em lote — N itens de uma vez, ver
@@ -182,7 +197,21 @@ def _processar_linhas(
     `existentes_registro_por_chave` é pré-carregado abaixo (1 SELECT pra
     todo o `ano_mes`, não 1 por linha) — mesmo motivo: o profiling mostrou
     que reconsultar RegistroCompraGPS linha a linha (upsert manual) era a
-    outra metade do tempo restante depois de cachear resolver_ean."""
+    outra metade do tempo restante depois de cachear resolver_ean.
+
+    `session.no_autoflush`: sem isso, toda SELECT feita dentro do loop (em
+    `resolver_ean`/`upsert_fila_resolucao`, pra EAN ainda não resolvido)
+    dispara um flush do SQLAlchemy de TODOS os objetos pendentes na sessão
+    antes de rodar — com até ~150 mil `RegistroCompraGPS` acumulados via
+    `session.add`, isso deixa o custo de flush crescente ao longo do loop
+    (quanto mais linhas já processadas, mais caro o flush da próxima SELECT).
+    Seguro desligar aqui porque todo ponto do código que grava e depois
+    RELÊ o que gravou (`resolver_ean`, `upsert_fila_resolucao`,
+    `upsert_fila_cnpj_orfao`) já dá `session.flush()` explícito logo após
+    escrever — nenhuma SELECT deste loop depende de autoflush implícito pra
+    enxergar uma escrita anterior; `RegistroCompraGPS` em si nunca é
+    reconsultado dentro do loop (só via `existentes_registro_por_chave`, um
+    dict em memória, não uma query)."""
     contadores = {"processados": 0, "atualizados": 0, "linhas_lixo": 0, "cnpj_orfao": 0}
 
     existentes_registro_por_chave = {
@@ -192,99 +221,115 @@ def _processar_linhas(
         ).scalars().all()
     }
 
-    for _, linha in df.iterrows():
-        cnpj_digitos = _somente_digitos(linha[mapa["cnpj"]])
-        ean = normalizar_ean(linha[mapa["ean"]])
+    df_norm = _dataframe_normalizado(df, mapa)
+    novos_registros: list[RegistroCompraGPS] = []
 
-        if apenas_cnpjs is not None and cnpj_digitos not in apenas_cnpjs:
-            continue
-        if _linha_e_lixo(cnpj_digitos, ean):
-            contadores["linhas_lixo"] += 1
-            continue
+    with session.no_autoflush:
+        for linha in df_norm.itertuples(index=False):
+            cnpj_digitos = _somente_digitos(linha.cnpj)
+            ean = normalizar_ean(linha.ean)
 
-        try:
-            quantidade = float(linha[mapa["quantidade"]])
-            fat_liquido = float(linha[mapa["fat_liquido"]])
-            pct_cmv = normalizar_percentual(linha[mapa["pct_cmv"]])
-            estoque = float(linha[mapa["estoque"]]) if pd.notna(linha[mapa["estoque"]]) else 0.0
-        except (ValueError, TypeError):
-            contadores["linhas_lixo"] += 1
-            continue
+            if apenas_cnpjs is not None and cnpj_digitos not in apenas_cnpjs:
+                continue
+            if _linha_e_lixo(cnpj_digitos, ean):
+                contadores["linhas_lixo"] += 1
+                continue
 
-        loja = lojas_por_cnpj.get(cnpj_digitos)
-        if loja is None:
-            if apenas_cnpjs is None:  # reprocesso já filtrou pelos CNPJs resolvidos — não deveria cair aqui
-                razao_social = (
-                    str(linha[mapa["razao_social"]]).strip()
-                    if "razao_social" in mapa and pd.notna(linha[mapa["razao_social"]])
-                    else None
+            try:
+                quantidade = float(linha.quantidade)
+                fat_liquido = float(linha.fat_liquido)
+                pct_cmv = normalizar_percentual(linha.pct_cmv)
+                estoque = float(linha.estoque) if pd.notna(linha.estoque) else 0.0
+            except (ValueError, TypeError):
+                contadores["linhas_lixo"] += 1
+                continue
+
+            loja = lojas_por_cnpj.get(cnpj_digitos)
+            if loja is None:
+                if apenas_cnpjs is None:  # reprocesso já filtrou pelos CNPJs resolvidos — não deveria cair aqui
+                    razao_social = (
+                        str(linha.razao_social).strip() if pd.notna(linha.razao_social) else None
+                    )
+                    upsert_fila_cnpj_orfao(session, cnpj_digitos, razao_social, fat_liquido)
+                    contadores["cnpj_orfao"] += 1
+                continue
+
+            descricao = str(linha.descricao).strip()
+            laboratorio_compra = None
+            if pd.notna(linha.laboratorio):
+                texto = str(linha.laboratorio).strip()
+                laboratorio_compra = texto if texto and texto.lower() != "nan" else None
+
+            custo_unitario = (fat_liquido * pct_cmv) / quantidade if quantidade else 0.0
+
+            chave = (loja.id, ean)
+            existente = existentes_registro_por_chave.get(chave)
+
+            if existente is not None:
+                existente.descricao_origem = descricao
+                existente.laboratorio_compra = laboratorio_compra
+                existente.quantidade = quantidade
+                existente.fat_liquido = fat_liquido
+                existente.pct_cmv = pct_cmv
+                existente.custo_unitario = custo_unitario
+                existente.estoque = estoque
+                existente.upload_fs_node_id = upload_fs_node_id
+                contadores["atualizados"] += 1
+            else:
+                novo_registro = RegistroCompraGPS(
+                    loja_id=loja.id,
+                    ean=ean,
+                    descricao_origem=descricao,
+                    laboratorio_compra=laboratorio_compra,
+                    ano_mes=ano_mes,
+                    quantidade=quantidade,
+                    fat_liquido=fat_liquido,
+                    pct_cmv=pct_cmv,
+                    custo_unitario=custo_unitario,
+                    estoque=estoque,
+                    upload_fs_node_id=upload_fs_node_id,
                 )
-                upsert_fila_cnpj_orfao(session, cnpj_digitos, razao_social, fat_liquido)
-                contadores["cnpj_orfao"] += 1
-            continue
+                novos_registros.append(novo_registro)
+                # mesma chave repetida MAIS ADIANTE no mesmo arquivo precisa achar
+                # este registro como "existente" — sem isso, duplicaria a linha e
+                # violaria a UniqueConstraint (loja_id, ean, ano_mes) na hora do flush.
+                existentes_registro_por_chave[chave] = novo_registro
+                contadores["processados"] += 1
 
-        descricao = str(linha[mapa["descricao"]]).strip()
-        laboratorio_compra = None
-        if "laboratorio" in mapa and pd.notna(linha[mapa["laboratorio"]]):
-            texto = str(linha[mapa["laboratorio"]]).strip()
-            laboratorio_compra = texto if texto and texto.lower() != "nan" else None
-
-        custo_unitario = (fat_liquido * pct_cmv) / quantidade if quantidade else 0.0
-
-        chave = (loja.id, ean)
-        existente = existentes_registro_por_chave.get(chave)
-
-        if existente is not None:
-            existente.descricao_origem = descricao
-            existente.laboratorio_compra = laboratorio_compra
-            existente.quantidade = quantidade
-            existente.fat_liquido = fat_liquido
-            existente.pct_cmv = pct_cmv
-            existente.custo_unitario = custo_unitario
-            existente.estoque = estoque
-            existente.upload_fs_node_id = upload_fs_node_id
-            contadores["atualizados"] += 1
-        else:
-            novo_registro = RegistroCompraGPS(
-                loja_id=loja.id,
-                ean=ean,
-                descricao_origem=descricao,
-                laboratorio_compra=laboratorio_compra,
-                ano_mes=ano_mes,
-                quantidade=quantidade,
-                fat_liquido=fat_liquido,
-                pct_cmv=pct_cmv,
-                custo_unitario=custo_unitario,
-                estoque=estoque,
-                upload_fs_node_id=upload_fs_node_id,
+            reconciliation_motor.resolver_ean(
+                session, ean=ean, descricao_origem=descricao, origem=OrigemFila.GPS,
+                valor=fat_liquido, aparece_em_estoque=estoque > 0, criado_por="sistema",
+                cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
+                cache_fila_pendente=cache_fila_pendente, cache_descricao_pendente=cache_descricao_pendente,
             )
-            session.add(novo_registro)
-            # mesma chave repetida MAIS ADIANTE no mesmo arquivo precisa achar
-            # este registro como "existente" — sem isso, duplicaria a linha e
-            # violaria a UniqueConstraint (loja_id, ean, ano_mes) na hora do flush.
-            existentes_registro_por_chave[chave] = novo_registro
-            contadores["processados"] += 1
 
-        reconciliation_motor.resolver_ean(
-            session, ean=ean, descricao_origem=descricao, origem=OrigemFila.GPS,
-            valor=fat_liquido, aparece_em_estoque=estoque > 0, criado_por="sistema",
-            cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
-        )
+    if novos_registros:
+        # add_all em lote em vez de session.add() por linha — evita reinserir
+        # no identity map da sessão 150 mil vezes espalhado pelo loop.
+        session.add_all(novos_registros)
 
     return contadores
 
 
 def processar_planilha_gps(
     session: Session, conteudo: bytes, nome_arquivo: str, criado_por: str, pasta_destino_id: int, ano_mes: str,
-    mapa_confirmado: dict[str, str] | None = None,
+    mapa_confirmado: dict[str, str] | None = None, df: pd.DataFrame | None = None,
 ) -> ResultadoSincronizacao:
     """`mapa_confirmado` vem do popup de confirmação de mapeamento (campo ->
     coluna escolhido pelo usuário) — quando informado, substitui a detecção
     automática por sinônimo pra ESTA planilha. Ainda validamos que nenhum
     campo obrigatório ficou de fora, como segurança contra um mapeamento
     incompleto vindo de um chamador que não seja o popup (que já bloqueia
-    isso na própria UI)."""
-    df = pd.read_excel(io.BytesIO(conteudo))
+    isso na própria UI).
+
+    `df`, se informado, evita reler/reparsear o Excel — o popup de
+    mapeamento já leu a planilha inteira pra montar o preview de colunas
+    (`pd.read_excel` sozinho leva ~19s numa planilha GPS real de 150 mil
+    linhas); sem isso, o mesmo parse acontecia 2x: uma no preview, outra
+    aqui. `conteudo` continua obrigatório (é o que vai pro storage do
+    arquivo bruto, ver `filesystem.salvar_arquivo`)."""
+    if df is None:
+        df = pd.read_excel(io.BytesIO(conteudo))
     if mapa_confirmado is not None:
         faltando = CAMPOS_OBRIGATORIOS - mapa_confirmado.keys()
         if faltando:
@@ -308,6 +353,7 @@ def processar_planilha_gps(
     contadores = _processar_linhas(
         session, df, mapa, ano_mes, node.id, lojas_por_cnpj,
         cache_candidatos={}, cache_eans_resolvidos=reconciliation_motor.carregar_cache_eans_resolvidos(session),
+        cache_fila_pendente={}, cache_descricao_pendente={},
     )
 
     partes = [f"{contadores['processados']} compras importadas"]
@@ -363,6 +409,8 @@ def _reprocessar_cnpjs(session: Session, lojas_por_cnpj: dict[str, Loja]) -> int
     total_inseridas = 0
     cache_candidatos: dict = {}
     cache_eans_resolvidos = reconciliation_motor.carregar_cache_eans_resolvidos(session)
+    cache_fila_pendente: dict = {}
+    cache_descricao_pendente: dict = {}
 
     for node, upload in _uploads_gps_ja_processados(session):
         conteudo = filesystem.ler_arquivo(node)
@@ -381,6 +429,7 @@ def _reprocessar_cnpjs(session: Session, lojas_por_cnpj: dict[str, Loja]) -> int
         contadores = _processar_linhas(
             session, df, mapa, upload.ano_mes, node.id, lojas_por_cnpj, apenas_cnpjs=cnpjs,
             cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
+            cache_fila_pendente=cache_fila_pendente, cache_descricao_pendente=cache_descricao_pendente,
         )
         total_inseridas += contadores["processados"] + contadores["atualizados"]
 

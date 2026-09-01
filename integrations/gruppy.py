@@ -152,20 +152,26 @@ def processar_planilha_gruppy(
     ufs: list[str],
     modo_custo: ModoCustoGruppy,
     mapa_confirmado: dict[str, str] | None = None,
+    df: pd.DataFrame | None = None,
 ) -> ResultadoSincronizacao:
     """`mapa_confirmado` vem do popup de confirmação de mapeamento (campo ->
     coluna escolhido pelo usuário) — quando informado, substitui a detecção
     automática por sinônimo pra ESTA planilha. Ainda validamos que nenhum
     campo obrigatório ficou de fora, como segurança contra um mapeamento
     incompleto vindo de um chamador que não seja o popup (que já bloqueia
-    isso na própria UI)."""
+    isso na própria UI).
+
+    `df`, se informado, evita reler/reparsear o Excel — mesmo raciocínio de
+    `integrations.gps.processar_planilha_gps` (o popup de mapeamento já leu
+    a planilha inteira pra montar o preview)."""
     laboratorio = laboratorio.strip()
     if not laboratorio:
         raise ValueError("Informe o laboratório da tabela.")
     if not ufs:
         raise ValueError("Selecione ao menos uma UF de cobertura.")
 
-    df = pd.read_excel(io.BytesIO(conteudo))
+    if df is None:
+        df = pd.read_excel(io.BytesIO(conteudo))
     if mapa_confirmado is not None:
         faltando = campos_obrigatorios(modo_custo) - mapa_confirmado.keys()
         if faltando:
@@ -199,48 +205,62 @@ def processar_planilha_gruppy(
     ignorados_sem_ean = 0
     cache_candidatos: dict = {}  # ver reconciliation/motor.py::buscar_candidatos
     cache_eans_resolvidos = reconciliation_motor.carregar_cache_eans_resolvidos(session)
+    cache_fila_pendente: dict = {}  # ver reconciliation/motor.py::upsert_fila_resolucao
+    cache_descricao_pendente: dict = {}  # ver reconciliation/motor.py::resolver_ean
 
-    for _, linha in df.iterrows():
-        ean = normalizar_ean(linha[mapa["ean"]])
-        if not ean or ean.lower() == "nan":
-            ignorados_sem_ean += 1
-            continue
-        descricao = str(linha[mapa["descricao"]]).strip()
+    # Mesma técnica de integrations/gps.py::_dataframe_normalizado — colunas
+    # renomeadas por campo (não por nome de coluna da planilha) permitem
+    # `itertuples` (atributo fixo, ex: `linha.ean`) em vez de `iterrows`
+    # (Series inteira reconstruída por linha).
+    df_norm = pd.DataFrame({campo: df[coluna] for campo, coluna in mapa.items()})
+    novos_itens: list[ItemTabelaGruppy] = []
 
-        if modo_custo == ModoCustoGruppy.PRONTO:
-            custo = float(linha[mapa["custo"]])
-            preco_bruto = None
-            percentual_desconto = None
-        else:
-            preco_bruto = float(linha[mapa["preco_bruto"]])
-            # normalizar_percentual já devolve fração (0-1), detectando a
-            # escala igual ao % de CMV do GPS — nunca dividir por 100 de
-            # novo aqui, senão uma planilha que já vem em fração (0.84)
-            # sai ~100x menor que o desconto real (vira 0,84%, não 84%).
-            percentual_desconto = normalizar_percentual(linha[mapa["desconto"]])
-            custo = preco_bruto * (1 - percentual_desconto)
+    with session.no_autoflush:  # ver justificativa detalhada em integrations/gps.py::_processar_linhas
+        for linha in df_norm.itertuples(index=False):
+            ean = normalizar_ean(linha.ean)
+            if not ean or ean.lower() == "nan":
+                ignorados_sem_ean += 1
+                continue
+            descricao = str(linha.descricao).strip()
 
-        session.add(
-            ItemTabelaGruppy(
-                tabela_gruppy_id=tabela.id,
-                ean=ean,
-                descricao_origem=descricao,
-                custo_liquido=custo,
-                preco_bruto=preco_bruto,
-                percentual_desconto=percentual_desconto,
+            if modo_custo == ModoCustoGruppy.PRONTO:
+                custo = float(linha.custo)
+                preco_bruto = None
+                percentual_desconto = None
+            else:
+                preco_bruto = float(linha.preco_bruto)
+                # normalizar_percentual já devolve fração (0-1), detectando a
+                # escala igual ao % de CMV do GPS — nunca dividir por 100 de
+                # novo aqui, senão uma planilha que já vem em fração (0.84)
+                # sai ~100x menor que o desconto real (vira 0,84%, não 84%).
+                percentual_desconto = normalizar_percentual(linha.desconto)
+                custo = preco_bruto * (1 - percentual_desconto)
+
+            novos_itens.append(
+                ItemTabelaGruppy(
+                    tabela_gruppy_id=tabela.id,
+                    ean=ean,
+                    descricao_origem=descricao,
+                    custo_liquido=custo,
+                    preco_bruto=preco_bruto,
+                    percentual_desconto=percentual_desconto,
+                )
             )
-        )
 
-        # Reconciliação de EAN é side-effect aqui: registra resolvido ou
-        # enfileira. `valor` fica 0 de propósito — a Gruppy é catálogo de
-        # preço unitário, não valor transacionado; a fila prioriza por
-        # dinheiro real em jogo, que só o GPS carrega (ver reconciliation/motor.py).
-        reconciliation_motor.resolver_ean(
-            session, ean=ean, descricao_origem=descricao, origem=OrigemFila.GRUPPY,
-            valor=0, aparece_em_estoque=False, criado_por="sistema",
-            cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
-        )
-        processados += 1
+            # Reconciliação de EAN é side-effect aqui: registra resolvido ou
+            # enfileira. `valor` fica 0 de propósito — a Gruppy é catálogo de
+            # preço unitário, não valor transacionado; a fila prioriza por
+            # dinheiro real em jogo, que só o GPS carrega (ver reconciliation/motor.py).
+            reconciliation_motor.resolver_ean(
+                session, ean=ean, descricao_origem=descricao, origem=OrigemFila.GRUPPY,
+                valor=0, aparece_em_estoque=False, criado_por="sistema",
+                cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
+                cache_fila_pendente=cache_fila_pendente, cache_descricao_pendente=cache_descricao_pendente,
+            )
+            processados += 1
+
+    if novos_itens:
+        session.add_all(novos_itens)
 
     msg = f"{processados} itens importados da tabela '{laboratorio}' ({', '.join(ufs)})."
     if ignorados_sem_ean:

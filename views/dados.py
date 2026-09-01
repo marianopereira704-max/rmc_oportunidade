@@ -12,6 +12,7 @@ Quatro responsabilidades:
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import io
 
 import pandas as pd
@@ -32,6 +33,30 @@ from reconciliation import motor as reconciliation_motor
 from storage import filesystem as fs
 
 _SEM_SELECAO = "— selecione —"
+
+_CACHE_DF_GRUPPY = "_cache_df_gruppy"
+_CACHE_DF_GPS = "_cache_df_gps"
+
+
+def _ler_planilha_cacheada(chave_cache: str, arquivo_bytes: bytes) -> pd.DataFrame:
+    """Evita reparsear a mesma planilha do zero toda vez que o popup de
+    mapeamento rerenderiza (a cada interação — trocar uma coluna no
+    selectbox, por exemplo) e de novo dentro do `processar_planilha_*`
+    (ver chamada abaixo, que agora passa `df=` em vez de deixar reler) —
+    numa planilha GPS real de 150 mil linhas, só o parse já custa ~19s.
+
+    Cache de slot ÚNICO por tipo (`chave_cache`), guardado com o fingerprint
+    (hash) do conteúdo: um upload de arquivo DIFERENTE não acumula no
+    session_state, só substitui o slot — sem isso, cada novo upload dentro
+    da mesma sessão do navegador ia empilhando DataFrames grandes na memória
+    do processo Streamlit indefinidamente."""
+    fingerprint = hashlib.md5(arquivo_bytes).hexdigest()
+    cache = st.session_state.get(chave_cache)
+    if cache is not None and cache[0] == fingerprint:
+        return cache[1]
+    df = pd.read_excel(io.BytesIO(arquivo_bytes))
+    st.session_state[chave_cache] = (fingerprint, df)
+    return df
 
 _ROTULOS_CAMPOS_GRUPPY = {
     "ean": "EAN",
@@ -272,7 +297,7 @@ def _dialog_mapeamento_gruppy(
     usuario: dict, arquivo_bytes: bytes, nome_arquivo: str, laboratorio: str, ufs: list[str],
     modo_custo: ModoCustoGruppy,
 ) -> None:
-    df_preview = pd.read_excel(io.BytesIO(arquivo_bytes))
+    df_preview = _ler_planilha_cacheada(_CACHE_DF_GRUPPY, arquivo_bytes)
     colunas_planilha = [str(c) for c in df_preview.columns]
     mapa_automatico = gruppy_integ.detectar_colunas_automatico(df_preview, modo_custo)
     campos = gruppy_integ.campos_obrigatorios(modo_custo)
@@ -301,8 +326,10 @@ def _dialog_mapeamento_gruppy(
                 resultado = gruppy_integ.processar_planilha_gruppy(
                     session, arquivo_bytes, nome_arquivo, usuario["nome"], pasta_id,
                     laboratorio=laboratorio, ufs=ufs, modo_custo=modo_custo, mapa_confirmado=mapa_escolhido,
+                    df=df_preview,
                 )
                 mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GRUPPY, mapa_escolhido, usuario["nome"])
+            st.session_state.pop(_CACHE_DF_GRUPPY, None)
             st.session_state["gruppy_upload_sucesso"] = resultado.mensagem
             st.rerun()
         except Exception as exc:
@@ -311,7 +338,7 @@ def _dialog_mapeamento_gruppy(
 
 @st.dialog("Confirmar mapeamento de colunas — GPS", width="large")
 def _dialog_mapeamento_gps(usuario: dict, arquivo_bytes: bytes, nome_arquivo: str, ano_mes: str) -> None:
-    df_preview = pd.read_excel(io.BytesIO(arquivo_bytes))
+    df_preview = _ler_planilha_cacheada(_CACHE_DF_GPS, arquivo_bytes)
     colunas_planilha = [str(c) for c in df_preview.columns]
     mapa_automatico = gps_integ.detectar_colunas_automatico(df_preview)
     campos = gps_integ.CAMPOS_OBRIGATORIOS
@@ -336,9 +363,10 @@ def _dialog_mapeamento_gps(usuario: dict, arquivo_bytes: bytes, nome_arquivo: st
                 pasta_id = _subpasta(session, "Compras", "GPS", ano_mes)
                 resultado = gps_integ.processar_planilha_gps(
                     session, arquivo_bytes, nome_arquivo, usuario["nome"], pasta_id,
-                    ano_mes=ano_mes, mapa_confirmado=mapa_escolhido,
+                    ano_mes=ano_mes, mapa_confirmado=mapa_escolhido, df=df_preview,
                 )
                 mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GPS, mapa_escolhido, usuario["nome"])
+            st.session_state.pop(_CACHE_DF_GPS, None)
             st.session_state["gps_upload_sucesso"] = resultado.mensagem
             st.rerun()
         except Exception as exc:

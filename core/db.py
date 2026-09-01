@@ -3,8 +3,10 @@ tabelas + seed dos 2 usuários fixos + estrutura mínima de pastas)."""
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 
 from sqlalchemy import create_engine, event, select
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.config import settings
@@ -12,6 +14,18 @@ from core.models import Base, Papel, Usuario
 from core.security import hash_senha
 
 _connect_args = {"check_same_thread": False} if settings.db.is_sqlite else {}
+
+if settings.db.is_sqlite:
+    # SQLite não cria diretórios sozinho — só o arquivo, e só se a pasta pai já
+    # existir. `DatabaseConfig.url` pode ter sido sobrescrito via secrets.toml
+    # pra apontar pra fora da árvore do OneDrive (evitar lock de sincronização
+    # — ver comentário em .streamlit/secrets.toml), e essa pasta pode ainda não
+    # existir na máquina. Sem isso, create_engine/create_all falha com
+    # "unable to open database file".
+    _caminho_db = make_url(settings.db.url).database
+    if _caminho_db:
+        Path(_caminho_db).resolve().parent.mkdir(parents=True, exist_ok=True)
+
 engine = create_engine(settings.db.url, connect_args=_connect_args, future=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
