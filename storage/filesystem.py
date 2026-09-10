@@ -41,6 +41,14 @@ class _BackendArmazenamento:
         NÃO é chamado pelo fluxo normal de inativação."""
         raise NotImplementedError
 
+    def url_assinada(self, storage_key: str, expira_em: int = 300) -> str | None:
+        """URL temporária pra download direto do backend, sem o conteúdo
+        passar pela memória do processo Streamlit. `None` quando o backend
+        não suporta (disco local não tem endpoint HTTP) — quem chama trata
+        isso como "sem URL disponível, cai pro fallback de leitura sob
+        demanda", nunca como erro."""
+        return None
+
 
 class _BackendLocal(_BackendArmazenamento):
     def __init__(self) -> None:
@@ -87,11 +95,29 @@ class _BackendDigitalOceanSpaces(_BackendArmazenamento):
     def excluir_fisicamente(self, storage_key: str) -> None:
         self.client.delete_object(Bucket=self.bucket, Key=storage_key)
 
+    def url_assinada(self, storage_key: str, expira_em: int = 300) -> str | None:
+        return self.client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": self.bucket, "Key": storage_key},
+            ExpiresIn=expira_em,
+        )
+
+
+_backend_instancia: _BackendArmazenamento | None = None
+
 
 def backend() -> _BackendArmazenamento:
-    if settings.spaces.configured:
-        return _BackendDigitalOceanSpaces()
-    return _BackendLocal()
+    """Singleton de módulo: antes, cada chamada criava um `_BackendDigitalOceanSpaces`
+    novo (e portanto um client boto3 novo) — no Explorador de Arquivos isso
+    significava recriar o client uma vez por ARQUIVO LISTADO, a cada rerun.
+    Client boto3 é thread-safe e caro de montar, então cachear no processo
+    (não em session_state — várias sessões Streamlit compartilham o mesmo
+    processo/worker) é seguro e é o que se espera aqui: a config de storage
+    (Spaces configurado ou não) não muda em runtime."""
+    global _backend_instancia
+    if _backend_instancia is None:
+        _backend_instancia = _BackendDigitalOceanSpaces() if settings.spaces.configured else _BackendLocal()
+    return _backend_instancia
 
 
 def modo_storage() -> str:

@@ -163,6 +163,21 @@ _UFS_BRASIL_PADRAO: list[str] = [
     "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC", "SP", "SE", "TO",
 ]
 
+# IPs de saída do Streamlit Community Cloud liberados no firewall do servidor
+# de persistência (consultoria.rmc.tec.br) para a conexão com o Postgres —
+# lista publicada em docs.streamlit.io/deploy/streamlit-community-cloud/status
+# em 2026-09-09. O próprio Streamlit avisa que "essas IPs podem mudar a
+# qualquer momento sem aviso"; por isso o sistema reconfere periodicamente
+# (ver core/monitoramento.py) se a lista publicada ainda bate com esta, e
+# avisa o admin se não bater mais — nunca ajusta o firewall sozinho.
+_IPS_STREAMLIT_CLOUD_PADRAO: list[str] = [
+    "35.230.127.150", "35.203.151.101", "34.19.100.134", "34.83.176.217",
+    "35.230.58.211", "35.203.187.165", "35.185.209.55", "34.127.88.74",
+    "34.127.0.121", "35.230.78.192", "35.247.110.67", "35.197.92.111",
+    "34.168.247.159", "35.230.56.30", "34.127.33.101", "35.227.190.87",
+    "35.199.156.97", "34.82.135.155",
+]
+
 _COLUNAS_GRUPPY_PADRAO: dict[str, list[str]] = {
     "ean": ["ean", "codigo", "sku", "codigoean", "codigobarras", "codigoproduto"],
     "descricao": ["descricao", "produto", "nomeproduto"],
@@ -230,6 +245,22 @@ class GeografiaConfig:
 
 
 @dataclass
+class StreamlitCloudConfig:
+    """IPs de saída do Streamlit Community Cloud liberados no firewall do
+    servidor de persistência — configurável (STREAMLIT_CLOUD_IPS_CONHECIDOS
+    em secrets/env, formato "1.2.3.4,5.6.7.8,...") pra atualizar sem editar
+    código quando a lista publicada pelo Streamlit mudar (ver
+    core/monitoramento.py, que reconfere isso periodicamente e avisa o
+    admin em vez de deixar a conexão quebrar em silêncio)."""
+    ips_conhecidos: list[str] = field(
+        default_factory=lambda: _get_list("STREAMLIT_CLOUD_IPS_CONHECIDOS", _IPS_STREAMLIT_CLOUD_PADRAO)
+    )
+    intervalo_verificacao_horas: int = field(
+        default_factory=lambda: int(_get("STREAMLIT_CLOUD_IPS_INTERVALO_HORAS", "24"))
+    )
+
+
+@dataclass
 class TemaConfig:
     """Parâmetros de layout do tema que fazem sentido variar por ambiente
     (ex: largura da sidebar) sem precisar editar core/theme.py."""
@@ -260,6 +291,7 @@ class AppConfig:
     reconciliacao: ReconciliacaoConfig = field(default_factory=ReconciliacaoConfig)
     colunas: ColunasMapeamentoConfig = field(default_factory=ColunasMapeamentoConfig)
     geografia: GeografiaConfig = field(default_factory=GeografiaConfig)
+    streamlit_cloud: StreamlitCloudConfig = field(default_factory=StreamlitCloudConfig)
     tema: TemaConfig = field(default_factory=TemaConfig)
     seed: SeedConfig = field(default_factory=SeedConfig)
     local_storage_dir: Path = field(default_factory=lambda: Path(

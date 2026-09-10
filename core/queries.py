@@ -18,8 +18,10 @@ Peças centrais (nomes batem com o plano de construção):
 - `_compras_periodo_subquery`: consolida quantidade e custo médio PONDERADO
   (por quantidade/valor, não média simples) por (loja, genérico) no período —
   múltiplos EAN do mesmo genérico caem numa linha só.
-- `_estoque_atual_subquery`: sempre o snapshot mais recente por (loja, EAN),
-  nunca histórico — decisão já confirmada, sem aviso de idade do dado.
+- `_estoque_atual_subquery`: sempre o snapshot do mês mais recente por
+  (loja, EAN), nunca histórico — decisão já confirmada, sem aviso de idade
+  do dado. Restrita aos `ano_meses` já calculados em `_query_base` (índice
+  em `ano_mes`), nunca um scan sem filtro da tabela inteira.
 - `_economia_expr`: CASE portátil (funciona igual em SQLite e Postgres, ao
   contrário de `func.greatest` que é Postgres-only) para
   max(0, custo_pago - menor_preco) * quantidade — nunca negativa.
@@ -119,7 +121,12 @@ def _compras_periodo_subquery(ano_meses: list[str]):
             RegistroCompraGPS.loja_id.label("loja_id"),
             EanGenerico.base_generico_id.label("base_generico_id"),
             func.sum(RegistroCompraGPS.quantidade).label("quantidade_total"),
-            (func.sum(peso) / func.sum(RegistroCompraGPS.quantidade)).label("custo_medio_ponderado"),
+            # NULLIF evita divisão por zero se a soma de quantidade der 0 num
+            # grupo (ex: linhas com quantidade zerada que passaram do filtro
+            # de lixo) — sem isso o Postgres derruba a query com
+            # "division by zero" (SQLite silenciosamente vira NULL, então o
+            # bug só aparecia em produção).
+            (func.sum(peso) / func.nullif(func.sum(RegistroCompraGPS.quantidade), 0)).label("custo_medio_ponderado"),
         )
         .select_from(RegistroCompraGPS)
         .join(EanGenerico, EanGenerico.ean == RegistroCompraGPS.ean)
@@ -129,40 +136,41 @@ def _compras_periodo_subquery(ano_meses: list[str]):
     return stmt.subquery()
 
 
-def _estoque_atual_subquery():
-    """Snapshot de estoque mais recente por (loja_id, ean) — via
-    row_number() OVER (PARTITION BY loja_id, ean ORDER BY ano_mes DESC),
-    depois somado por genérico. Sempre o mês mais recente carregado, NUNCA
-    histórico (decisão já confirmada — sem aviso de idade do dado)."""
-    ranqueado = (
-        select(
-            RegistroCompraGPS.loja_id,
-            RegistroCompraGPS.ean,
-            RegistroCompraGPS.estoque,
-            func.row_number()
-            .over(
-                partition_by=[RegistroCompraGPS.loja_id, RegistroCompraGPS.ean],
-                order_by=RegistroCompraGPS.ano_mes.desc(),
-            )
-            .label("rn"),
-        )
-    ).subquery()
+def _estoque_atual_subquery(ano_meses: list[str]):
+    """Snapshot de estoque do mês mais recente por (loja_id, ean), depois
+    somado por genérico. Sempre o mês mais recente, NUNCA histórico (decisão
+    já confirmada — sem aviso de idade do dado).
 
-    mais_recente = (
-        select(ranqueado.c.loja_id, ranqueado.c.ean, ranqueado.c.estoque)
-        .where(ranqueado.c.rn == 1)
-        .subquery()
-    )
+    Restrito a `max(ano_meses)` — os mesmos `ano_meses` já calculados em
+    `_query_base` pra `_compras_periodo_subquery` (a N-ésima janela de meses
+    mais recentes já carregados via GPS). Antes disso a query rodava um
+    row_number() OVER (PARTITION BY loja_id, ean ORDER BY ano_mes DESC) SEM
+    NENHUM filtro de WHERE — ou seja, escaneava e ordenava a tabela
+    `registros_compra_gps` INTEIRA (todo mês já carregado desde o início) só
+    pra descartar quase tudo no rn==1 depois. Com o filtro por ano_mes e a
+    UniqueConstraint(loja_id, ean, ano_mes) garantindo no máximo 1 linha por
+    (loja_id, ean) dentro de um único ano_mes, o row_number()/partição
+    inteira deixam de ser necessários — group by direto já basta (o SUM
+    continua precisando existir porque vários EAN do mesmo genérico, cada um
+    com sua própria linha nesse ano_mes, ainda precisam ser consolidados).
 
+    Índice usado: `registros_compra_gps.ano_mes` tem índice próprio
+    (`index=True` em core/models.py) — é ele que atende o filtro abaixo. A
+    UniqueConstraint(loja_id, ean, ano_mes) NÃO ajuda aqui: é uma unique
+    composta com ano_mes por último na ordem das colunas, e pela regra de
+    prefixo à esquerda um índice assim não serve pra filtrar só por
+    ano_mes."""
+    ultimo_ano_mes = max(ano_meses)
     stmt = (
         select(
-            mais_recente.c.loja_id.label("loja_id"),
+            RegistroCompraGPS.loja_id.label("loja_id"),
             EanGenerico.base_generico_id.label("base_generico_id"),
-            func.sum(mais_recente.c.estoque).label("estoque_total"),
+            func.sum(RegistroCompraGPS.estoque).label("estoque_total"),
         )
-        .select_from(mais_recente)
-        .join(EanGenerico, EanGenerico.ean == mais_recente.c.ean)
-        .group_by(mais_recente.c.loja_id, EanGenerico.base_generico_id)
+        .select_from(RegistroCompraGPS)
+        .join(EanGenerico, EanGenerico.ean == RegistroCompraGPS.ean)
+        .where(RegistroCompraGPS.ano_mes == ultimo_ano_mes)
+        .group_by(RegistroCompraGPS.loja_id, EanGenerico.base_generico_id)
     )
     return stmt.subquery()
 
@@ -191,7 +199,7 @@ def _query_base(session: Session, filtros: Filtros):
 
     compras = _compras_periodo_subquery(ano_meses)
     menor_preco = _menor_preco_rmc_subquery()
-    estoque = _estoque_atual_subquery()
+    estoque = _estoque_atual_subquery(ano_meses)
 
     economia = _economia_expr(compras.c.custo_medio_ponderado, menor_preco.c.menor_preco, compras.c.quantidade_total)
 
@@ -337,7 +345,8 @@ def historico_compras(
         select(
             RegistroCompraGPS.ano_mes,
             func.sum(RegistroCompraGPS.quantidade).label("quantidade"),
-            (func.sum(peso) / func.sum(RegistroCompraGPS.quantidade)).label("custo_medio_ponderado"),
+            # Mesma guarda de _compras_periodo_subquery (ver comentário lá).
+            (func.sum(peso) / func.nullif(func.sum(RegistroCompraGPS.quantidade), 0)).label("custo_medio_ponderado"),
             func.sum(peso).label("valor_total"),
         )
         .select_from(RegistroCompraGPS)

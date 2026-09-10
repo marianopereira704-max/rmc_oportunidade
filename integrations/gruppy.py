@@ -203,6 +203,7 @@ def processar_planilha_gruppy(
 
     processados = 0
     ignorados_sem_ean = 0
+    linhas_invalidas = 0
     cache_candidatos: dict = {}  # ver reconciliation/motor.py::buscar_candidatos
     cache_eans_resolvidos = reconciliation_motor.carregar_cache_eans_resolvidos(session)
     cache_fila_pendente: dict = {}  # ver reconciliation/motor.py::upsert_fila_resolucao
@@ -221,20 +222,47 @@ def processar_planilha_gruppy(
             if not ean or ean.lower() == "nan":
                 ignorados_sem_ean += 1
                 continue
-            descricao = str(linha.descricao).strip()
+            # pd.notna: célula vazia/NaN vira "" (não a string "nan"), que o
+            # motor de reconciliação já trata como "sem candidato" (score 0.0
+            # -> fila_manual), nunca como match errado nem linha descartada.
+            descricao = str(linha.descricao).strip() if pd.notna(linha.descricao) else ""
 
+            # Mesmo padrão de integrations/gps.py::_processar_linhas: uma
+            # célula ruim (texto não numérico, célula vazia/NaN) não pode
+            # abortar a importação inteira. Antes disso, `float()`/
+            # `normalizar_percentual()` sem tratamento levantavam
+            # ValueError/TypeError direto pra fora de `processar_planilha_gruppy`
+            # — sem nenhum commit ainda feito (session.add_all só roda no
+            # fim), isso derrubava a transação toda e nem as linhas boas já
+            # processadas antes da ruim ficavam salvas ("nada foi
+            # importado" em vez de "4.980 de 5.000 importados, 20
+            # ignoradas"). NaN passa batido pelo float() (não levanta), por
+            # isso o pd.notna correspondente vem antes do try/except, não
+            # dentro dele — mesmo motivo do guard em integrations/gps.py.
             if modo_custo == ModoCustoGruppy.PRONTO:
-                custo = float(linha.custo)
-                preco_bruto = None
-                percentual_desconto = None
-            else:
-                preco_bruto = float(linha.preco_bruto)
-                # normalizar_percentual já devolve fração (0-1), detectando a
-                # escala igual ao % de CMV do GPS — nunca dividir por 100 de
-                # novo aqui, senão uma planilha que já vem em fração (0.84)
-                # sai ~100x menor que o desconto real (vira 0,84%, não 84%).
-                percentual_desconto = normalizar_percentual(linha.desconto)
-                custo = preco_bruto * (1 - percentual_desconto)
+                if not pd.notna(linha.custo):
+                    linhas_invalidas += 1
+                    continue
+            elif not pd.notna(linha.preco_bruto) or not pd.notna(linha.desconto):
+                linhas_invalidas += 1
+                continue
+
+            try:
+                if modo_custo == ModoCustoGruppy.PRONTO:
+                    custo = float(linha.custo)
+                    preco_bruto = None
+                    percentual_desconto = None
+                else:
+                    preco_bruto = float(linha.preco_bruto)
+                    # normalizar_percentual já devolve fração (0-1), detectando a
+                    # escala igual ao % de CMV do GPS — nunca dividir por 100 de
+                    # novo aqui, senão uma planilha que já vem em fração (0.84)
+                    # sai ~100x menor que o desconto real (vira 0,84%, não 84%).
+                    percentual_desconto = normalizar_percentual(linha.desconto)
+                    custo = preco_bruto * (1 - percentual_desconto)
+            except (ValueError, TypeError):
+                linhas_invalidas += 1
+                continue
 
             novos_itens.append(
                 ItemTabelaGruppy(
@@ -265,6 +293,8 @@ def processar_planilha_gruppy(
     msg = f"{processados} itens importados da tabela '{laboratorio}' ({', '.join(ufs)})."
     if ignorados_sem_ean:
         msg += f" {ignorados_sem_ean} linhas ignoradas por EAN vazio."
+    if linhas_invalidas:
+        msg += f" {linhas_invalidas} linhas ignoradas (custo/preço/desconto inválido ou vazio)."
 
     return ResultadoSincronizacao(status=StatusIntegracao.MANUAL, registros_processados=processados, mensagem=msg)
 
@@ -286,6 +316,7 @@ class ResultadoExclusaoTabelaGruppy:
     laboratorio: str
     itens_removidos: int
     coberturas_removidas: int
+    storage_key: str | None
 
 
 def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> ResultadoExclusaoTabelaGruppy:
@@ -300,7 +331,15 @@ def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> 
     FilaCnpjOrfao — mesmo que um EAN desta tabela já tenha sido reconciliado,
     EanGenerico é histórico de decisão (não pertence à tabela de preço em
     si); apagar a tabela não desfaz uma reconciliação já feita, nem mexe em
-    nenhuma outra tabela Gruppy (cada uma só apaga a própria linhagem)."""
+    nenhuma outra tabela Gruppy (cada uma só apaga a própria linhagem).
+
+    Devolve `storage_key` (None se o FSNode já não existia) pra quem chamou
+    apagar o BYTE FÍSICO do Spaces depois — de propósito NÃO faz isso aqui
+    dentro: esta função só mexe no banco, ainda dentro de uma transação que
+    pode dar rollback (ex: erro em outra parte do `with get_session()` do
+    chamador). Apagar o arquivo físico só depois do commit confirmado evita
+    o cenário pior — banco intacto (rollback) mas arquivo já destruído,
+    deixando o FSNode apontando pra um storage_key que não existe mais."""
     tabela = session.execute(
         select(TabelaGruppy).where(TabelaGruppy.upload_fs_node_id == fs_node_id)
     ).scalar_one_or_none()
@@ -321,6 +360,7 @@ def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> 
     session.flush()
 
     node = session.get(FSNode, fs_node_id)
+    storage_key = node.storage_key if node is not None else None
     if node is not None:
         session.delete(node)
 
@@ -331,6 +371,7 @@ def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> 
         laboratorio=laboratorio,
         itens_removidos=itens_removidos,
         coberturas_removidas=coberturas_removidas,
+        storage_key=storage_key,
     )
 
 

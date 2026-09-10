@@ -195,6 +195,13 @@ class FilaCnpjOrfao(Base):
     qtd_ocorrencias: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[StatusFila] = mapped_column(Enum(StatusFila), default=StatusFila.PENDENTE)
     resolvido_para_loja_id: Mapped[int | None] = mapped_column(ForeignKey("lojas.id"), nullable=True)
+    # JSON (lista de int) dos FSNode.id dos uploads GPS em que este CNPJ
+    # apareceu — só nesses arquivos vale a pena reler na hora de resolver o
+    # órfão (ver integrations/gps.py::_reprocessar_cnpjs), em vez de reler
+    # TODOS os uploads GPS já enviados. Nulo em fila criada antes deste campo
+    # existir -> fallback pro comportamento antigo (relê tudo), pois não tem
+    # como saber em quais arquivos aquele CNPJ apareceu.
+    uploads_fs_node_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     atualizado_em: Mapped[dt.datetime] = mapped_column(
         DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
@@ -342,6 +349,25 @@ class UploadGPS(Base):
     mapa_colunas_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     criado_por: Mapped[str] = mapped_column(String(120))
     criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Monitoramento de infraestrutura
+# ---------------------------------------------------------------------------
+
+class VerificacaoIpsStreamlitCloud(Base):
+    """Um registro por checagem feita (ver core/monitoramento.py) se a lista
+    de IPs de saída do Streamlit Community Cloud publicada oficialmente
+    ainda bate com `settings.streamlit_cloud.ips_conhecidos` (a lista usada
+    pra liberar o firewall do servidor de persistência). Guardado no banco
+    — não em st.session_state — pra sobreviver a reinícios do processo
+    Streamlit e pra não precisar bater na rede a cada rerun da página."""
+    __tablename__ = "verificacoes_ips_streamlit_cloud"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    verificado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    ips_publicados_snapshot: Mapped[str] = mapped_column(Text)  # JSON, só para auditoria
+    divergente: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 # ---------------------------------------------------------------------------

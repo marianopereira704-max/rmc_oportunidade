@@ -13,7 +13,15 @@ from core.config import settings
 from core.models import Base, Papel, Usuario
 from core.security import hash_senha
 
-_connect_args = {"check_same_thread": False} if settings.db.is_sqlite else {}
+if settings.db.is_sqlite:
+    _connect_args = {"check_same_thread": False}
+else:
+    # Sem isso, um problema de rede entre o app e o Postgres (ex: firewall
+    # descartando pacote em silêncio, em vez de recusar a conexão na hora)
+    # deixa o app travado por minutos esperando o TCP dar timeout sozinho —
+    # com connect_timeout curto, falha rápido com um erro claro em vez de
+    # travar a tela inteira do Streamlit.
+    _connect_args = {"connect_timeout": 10}
 
 if settings.db.is_sqlite:
     # SQLite não cria diretórios sozinho — só o arquivo, e só se a pasta pai já

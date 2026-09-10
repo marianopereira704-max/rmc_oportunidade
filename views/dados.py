@@ -14,6 +14,7 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import io
+import logging
 
 import pandas as pd
 import streamlit as st
@@ -22,7 +23,17 @@ from sqlalchemy import func, select
 from core import auth, theme, ui
 from core.config import settings
 from core.db import get_session
-from core.models import BaseGenerico, ItemTabelaGruppy, Loja, ModoCustoGruppy, OrigemFila, TabelaGruppy, TipoNode
+from core.models import (
+    BaseGenerico,
+    ItemTabelaGruppy,
+    Loja,
+    ModoCustoGruppy,
+    OrigemFila,
+    RegistroCompraGPS,
+    TabelaGruppy,
+    TipoNode,
+    UploadGPS,
+)
 from integrations import base_genericos as base_genericos_integ
 from integrations import gps as gps_integ
 from integrations import gruppy as gruppy_integ
@@ -31,6 +42,8 @@ from integrations import sistema_interno as loja_integ
 from integrations.base import StatusIntegracao
 from reconciliation import motor as reconciliation_motor
 from storage import filesystem as fs
+
+logger = logging.getLogger(__name__)
 
 _SEM_SELECAO = "— selecione —"
 
@@ -118,6 +131,37 @@ def _icone(node) -> str:
     return "📁" if node.tipo == TipoNode.PASTA else "📄"
 
 
+def _purgar_arquivo_fisico(storage_key: str | None) -> str | None:
+    """Chamada depois que o `with get_session()` do chamador já fechou (ou
+    seja, depois do commit confirmado) — nunca antes, pra nunca apagar o
+    byte físico de uma exclusão de banco que ainda pode dar rollback (ver
+    docstring de `excluir_tabela_gruppy_definitivamente`/
+    `excluir_upload_gps_definitivamente`). `storage_key=None` (FSNode já não
+    existia) é um no-op silencioso.
+
+    Devolve uma mensagem de aviso se a purga falhar (None se deu certo ou não
+    havia nada pra purgar) — o chamador guarda em session_state pra mostrar
+    DEPOIS do st.rerun() que segue a exclusão; um st.warning chamado aqui
+    seria descartado pelo rerun antes do usuário ver. Uma falha aqui (ex:
+    Spaces fora do ar naquele instante) não desfaz a exclusão do banco, que
+    já está commitada — só avisa, porque o arquivo fica órfão no Spaces até
+    uma limpeza manual, mas os dados (o que realmente importa) já foram
+    removidos."""
+    if not storage_key:
+        return None
+    try:
+        fs.backend().excluir_fisicamente(storage_key)
+        return None
+    except Exception:
+        logger.exception(
+            "Falha ao purgar arquivo físico do Spaces (storage_key=%s) após exclusão definitiva.", storage_key
+        )
+        return (
+            "Os dados foram excluídos definitivamente, mas não foi possível remover o arquivo "
+            "físico do armazenamento agora — ele ficará órfão até uma limpeza manual."
+        )
+
+
 @st.dialog("Excluir definitivamente — Gruppy", width="large")
 def _dialog_excluir_tabela_gruppy(nome_arquivo: str, fs_node_id: int, tabela_id: int, laboratorio: str) -> None:
     with get_session() as session:
@@ -139,7 +183,66 @@ def _dialog_excluir_tabela_gruppy(nome_arquivo: str, fs_node_id: int, tabela_id:
     ):
         with get_session() as session:
             resultado = gruppy_integ.excluir_tabela_gruppy_definitivamente(session, fs_node_id)
+        aviso_purga = _purgar_arquivo_fisico(resultado.storage_key)
         st.session_state["explorador_exclusao_resultado"] = resultado
+        if aviso_purga:
+            st.session_state["explorador_exclusao_aviso_purga"] = aviso_purga
+        st.rerun()
+
+
+@st.dialog("Excluir definitivamente — GPS", width="large")
+def _dialog_excluir_upload_gps(nome_arquivo: str, fs_node_id: int, ano_mes: str) -> None:
+    with get_session() as session:
+        qtd_registros = session.execute(
+            select(func.count()).select_from(RegistroCompraGPS)
+            .where(RegistroCompraGPS.upload_fs_node_id == fs_node_id)
+        ).scalar_one()
+
+    st.warning(
+        f"Isso apaga DE VERDADE (não é inativar — não dá pra desfazer) o upload GPS de "
+        f"**{ano_mes}**, do arquivo **{nome_arquivo}**: **{qtd_registros} registro(s)** de "
+        "compra serão removidos junto, além do próprio arquivo no Explorador."
+    )
+    confirmar = st.checkbox(
+        "Sim, entendi — quero excluir definitivamente este upload.", key=f"confirma_exclusao_gps_{fs_node_id}",
+    )
+    if confirmar and st.button(
+        "Excluir definitivamente", type="primary", key=f"exec_exclusao_gps_{fs_node_id}", use_container_width=True,
+    ):
+        with get_session() as session:
+            resultado = gps_integ.excluir_upload_gps_definitivamente(session, fs_node_id)
+        aviso_purga = _purgar_arquivo_fisico(resultado.storage_key)
+        st.session_state["explorador_exclusao_gps_resultado"] = resultado
+        if aviso_purga:
+            st.session_state["explorador_exclusao_aviso_purga"] = aviso_purga
+        st.rerun()
+
+
+def _baixar_arquivo_ui(item: fs.FSNode) -> None:
+    """O corpo de um `with popover(...):` roda a cada rerun mesmo com o
+    popover fechado — antes disso, `fs.ler_arquivo(item)` era chamado pra
+    TODO arquivo listado na pasta, todo rerun, mesmo que ninguém abrisse o
+    popover daquela linha (pior ainda numa pasta com muitos arquivos grandes).
+
+    Caminho preferido: se o backend suporta URL pré-assinada (Spaces), o
+    navegador baixa direto de lá — o conteúdo nunca entra na memória do
+    processo Streamlit. Fallback (storage local de dev, sem endpoint HTTP):
+    um botão "Preparar download" guarda o id em session_state e só lê o
+    arquivo no rerun seguinte, exibindo aí o download_button real — ou seja,
+    o `ler_arquivo` só roda quando o usuário pediu, e só pra aquele item."""
+    url = fs.backend().url_assinada(item.storage_key)
+    if url is not None:
+        st.link_button("Baixar", url, use_container_width=True)
+        return
+
+    if st.session_state.get("dados_baixar_pendente_id") == item.id:
+        conteudo = fs.ler_arquivo(item)
+        st.download_button(
+            "Baixar", data=conteudo, file_name=item.nome, key=f"baixar_{item.id}", use_container_width=True,
+        )
+        st.session_state.pop("dados_baixar_pendente_id", None)
+    elif st.button("Preparar download", key=f"preparar_baixar_{item.id}", use_container_width=True):
+        st.session_state["dados_baixar_pendente_id"] = item.id
         st.rerun()
 
 
@@ -153,6 +256,14 @@ def _explorador() -> None:
             f"Tabela Gruppy \"{r.laboratorio}\" excluída definitivamente — "
             f"{r.itens_removidos} item(ns) de preço removidos."
         )
+    if "explorador_exclusao_gps_resultado" in st.session_state:
+        r = st.session_state.pop("explorador_exclusao_gps_resultado")
+        st.success(
+            f"Upload GPS \"{r.ano_mes}\" excluído definitivamente — "
+            f"{r.registros_removidos} registro(s) de compra removidos."
+        )
+    if "explorador_exclusao_aviso_purga" in st.session_state:
+        st.warning(st.session_state.pop("explorador_exclusao_aviso_purga"))
 
     with get_session() as session:
         pasta_atual = session.get(fs.FSNode, pasta_id)
@@ -189,14 +300,18 @@ def _explorador() -> None:
         itens = fs.listar_conteudo(session, pasta_id, incluir_inativos=mostrar_inativos)
         pastas_para_mover = fs.listar_todas_pastas(session)
         opcoes_mover = {fs.caminho_texto(session, p): p.id for p in pastas_para_mover}
-        # "Excluir definitivamente" só existe pra arquivo Gruppy (tem elo de
-        # volta pro FSNode via TabelaGruppy.upload_fs_node_id) — GPS/Base
-        # Genéricos não têm esse vínculo, então nunca entram aqui.
+        # "Excluir definitivamente" existe pra arquivo Gruppy (elo via
+        # TabelaGruppy.upload_fs_node_id) e GPS (elo via UploadGPS.fs_node_id)
+        # — Base Genéricos não tem esse vínculo, nunca entra aqui.
         tabelas_gruppy_por_fs_node = {
             t.upload_fs_node_id: (t.id, t.laboratorio)
             for t in session.execute(
                 select(TabelaGruppy).where(TabelaGruppy.upload_fs_node_id.is_not(None))
             ).scalars().all()
+        }
+        uploads_gps_por_fs_node = {
+            u.fs_node_id: u.ano_mes
+            for u in session.execute(select(UploadGPS)).scalars().all()
         }
 
     if not itens:
@@ -225,10 +340,7 @@ def _explorador() -> None:
 
         with c[4].popover("Ações", use_container_width=True):
             if item.tipo == TipoNode.ARQUIVO and item.status.value == "ativo":
-                conteudo = fs.ler_arquivo(item)
-                st.download_button(
-                    "Baixar", data=conteudo, file_name=item.nome, key=f"baixar_{item.id}", use_container_width=True
-                )
+                _baixar_arquivo_ui(item)
 
             if item.status.value == "ativo":
                 novo_nome = st.text_input("Renomear para", value=item.nome, key=f"renomear_txt_{item.id}")
@@ -260,6 +372,12 @@ def _explorador() -> None:
                 st.divider()
                 if st.button("Excluir definitivamente", key=f"excluir_def_{item.id}", use_container_width=True):
                     _dialog_excluir_tabela_gruppy(item.nome, item.id, tabela_id, laboratorio)
+
+            if item.tipo == TipoNode.ARQUIVO and item.id in uploads_gps_por_fs_node:
+                ano_mes = uploads_gps_por_fs_node[item.id]
+                st.divider()
+                if st.button("Excluir definitivamente", key=f"excluir_def_gps_{item.id}", use_container_width=True):
+                    _dialog_excluir_upload_gps(item.nome, item.id, ano_mes)
 
 
 # ---------------------------------------------------------------------------
@@ -359,11 +477,24 @@ def _dialog_mapeamento_gps(usuario: dict, arquivo_bytes: bytes, nome_arquivo: st
         "Confirmar e processar", key="map_gps_confirmar", type="primary", use_container_width=True
     ):
         try:
+            # A planilha GPS pode ter ~150 mil linhas e o processamento agora
+            # roda em blocos (ver `_TAMANHO_BLOCO` em integrations/gps.py) —
+            # a barra dá visibilidade real do progresso em vez da tela travada
+            # até o fim, sem este módulo de views precisar saber COMO o
+            # processamento é feito por dentro.
+            barra_progresso = st.progress(0.0, text="Processando planilha...")
+
+            def _atualizar_progresso(linhas_feitas: int, total_linhas: int) -> None:
+                fracao = min(1.0, linhas_feitas / total_linhas) if total_linhas else 1.0
+                texto = f"Processando planilha... {linhas_feitas:,}/{total_linhas:,} linhas".replace(",", ".")
+                barra_progresso.progress(fracao, text=texto)
+
             with get_session() as session:
                 pasta_id = _subpasta(session, "Compras", "GPS", ano_mes)
                 resultado = gps_integ.processar_planilha_gps(
                     session, arquivo_bytes, nome_arquivo, usuario["nome"], pasta_id,
                     ano_mes=ano_mes, mapa_confirmado=mapa_escolhido, df=df_preview,
+                    progresso_callback=_atualizar_progresso,
                 )
                 mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GPS, mapa_escolhido, usuario["nome"])
             st.session_state.pop(_CACHE_DF_GPS, None)
