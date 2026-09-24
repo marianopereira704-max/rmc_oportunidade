@@ -106,6 +106,18 @@ def detectar_colunas_automatico(df: pd.DataFrame, modo_custo: ModoCustoGruppy) -
     return mapa
 
 
+def validar_planilha(df: pd.DataFrame) -> None:
+    """Recusa planilha de compras GPS enviada como tabela de preços: coluna
+    de CNPJ só existe no GPS (uma tabela Gruppy é por laboratório, não por
+    loja). Levanta ValueError antes de qualquer gravação."""
+    com_cnpj = [str(c) for c in df.columns if "cnpj" in _normalizar_coluna(c)]
+    if com_cnpj:
+        raise ValueError(
+            f"Esta planilha tem coluna de CNPJ ({', '.join(com_cnpj)}) — parece compras do GPS, não uma "
+            "tabela de preços Gruppy. Nada foi importado — envie esta planilha na seção Compras das Lojas (GPS)."
+        )
+
+
 def mapear_colunas(df: pd.DataFrame, modo_custo: ModoCustoGruppy) -> dict[str, str]:
     mapa = detectar_colunas_automatico(df, modo_custo)
     faltando = campos_obrigatorios(modo_custo) - mapa.keys()
@@ -153,6 +165,8 @@ def processar_planilha_gruppy(
     modo_custo: ModoCustoGruppy,
     mapa_confirmado: dict[str, str] | None = None,
     df: pd.DataFrame | None = None,
+    storage_key: str | None = None,
+    tamanho_bytes: int | None = None,
 ) -> ResultadoSincronizacao:
     """`mapa_confirmado` vem do popup de confirmação de mapeamento (campo ->
     coluna escolhido pelo usuário) — quando informado, substitui a detecção
@@ -161,9 +175,10 @@ def processar_planilha_gruppy(
     incompleto vindo de um chamador que não seja o popup (que já bloqueia
     isso na própria UI).
 
-    `df`, se informado, evita reler/reparsear o Excel — mesmo raciocínio de
-    `integrations.gps.processar_planilha_gps` (o popup de mapeamento já leu
-    a planilha inteira pra montar o preview)."""
+    `df`, se informado, evita ler o Excel aqui (a tela já recebe a planilha
+    lida no navegador — ver views/leitor_planilha.py). `storage_key`, se
+    informado, é o original que o navegador já enviou direto ao Spaces; sem
+    ele, `conteudo` é gravado pelo caminho de sempre."""
     laboratorio = laboratorio.strip()
     if not laboratorio:
         raise ValueError("Informe o laboratório da tabela.")
@@ -172,6 +187,7 @@ def processar_planilha_gruppy(
 
     if df is None:
         df = pd.read_excel(io.BytesIO(conteudo))
+    validar_planilha(df)
     if mapa_confirmado is not None:
         faltando = campos_obrigatorios(modo_custo) - mapa_confirmado.keys()
         if faltando:
@@ -180,9 +196,9 @@ def processar_planilha_gruppy(
     else:
         mapa = mapear_colunas(df, modo_custo)
 
-    node = filesystem.salvar_arquivo(
-        session, pasta_destino_id, nome_arquivo, conteudo, criado_por,
-        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    node = filesystem.guardar_planilha(
+        session, pasta_destino_id, nome_arquivo, criado_por,
+        conteudo=conteudo, storage_key=storage_key, tamanho_bytes=tamanho_bytes,
     )
 
     tabela = TabelaGruppy(
