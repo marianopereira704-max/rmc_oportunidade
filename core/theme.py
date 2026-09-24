@@ -295,6 +295,54 @@ div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] d
 /* Texto secundário/metadado */
 .rmc-muted {{ color: var(--texto-muted); font-size: 0.85rem; }}
 
+/* Loja + CNPJ embaixo do produto na visão Por Produto: 2px menor que o
+   texto da tabela (pedido de 24/09/2026), no mesmo cinza dos metadados. */
+.rmc-sub-loja {{ color: var(--texto-muted); font-size: calc(1em - 2px); }}
+
+/* Valor negativo (ex: diferença por unidade quando a loja já paga menos) */
+.rmc-negativo {{ color: #B3261E; font-weight: 600; }}
+
+/* Faixa do filtro principal (Laboratório) nas telas de Análise de
+   Oportunidade: destaca o filtro que "libera" a análise sem criar um
+   componente novo — mesmo branco/borda dos cards, com o verde da marca só
+   na borda esquerda, e compacta (uma linha só). Seletor por key do
+   container, que o Streamlit expõe como classe "st-key-<key>". */
+div[class*="st-key-faixa-laboratorio"] {{
+    background: #FFFFFF;
+    border: 1px solid var(--borda);
+    border-left: 4px solid var(--verde);
+    border-radius: 12px;
+    /* Padding e altura mínima fixos: sem laboratório cadastrado a faixa só
+       tem texto (sem o seletor), e ficava rasa, com o subtítulo colado na
+       borda de baixo. Assim ela tem a mesma altura com ou sem seletor. */
+    padding: 14px 18px 16px;
+    min-height: 76px;
+    justify-content: center;
+    margin-bottom: 6px;
+}}
+.rmc-faixa-titulo {{ font-weight: 700; color: var(--navy); font-size: 0.95rem; line-height: 1.3; }}
+.rmc-faixa-sub {{ color: var(--texto-muted); font-size: 0.78rem; line-height: 1.3; margin-top: 2px; }}
+
+/* Cabeçalho ordenável das tabelas (clique ordena; seta mostra o sentido):
+   botões sem cara de botão — texto navy em negrito, como os cabeçalhos
+   fixos de antes; o sublinhado no hover é a pista de que é clicável. */
+div[class*="st-key-cabecalho-"] div.stButton > button {{
+    background: transparent;
+    border: none;
+    color: var(--navy);
+    padding: 0;
+    min-height: 0;
+    justify-content: flex-start;
+    text-align: left;
+    box-shadow: none;
+}}
+div[class*="st-key-cabecalho-"] div.stButton > button:hover {{
+    background: transparent;
+    color: var(--verde-escuro);
+    text-decoration: underline;
+}}
+div[class*="st-key-cabecalho-"] div.stButton > button p {{ font-weight: 700; }}
+
 /* Nunca usar cor padrão vermelho/rosa do Streamlit em elementos de marca */
 div.stButton > button:focus:not(:active) {{
     box-shadow: none;
@@ -310,6 +358,14 @@ div.stButton > button:focus:not(:active) {{
 }}
 [data-testid="stTab"] .react-aria-SelectionIndicator {{
     background-color: var(--navy) !important;
+}}
+
+/* Selectbox (st.selectbox, Streamlit 1.62 = ComboBox do react-aria): a borda
+   de foco vem vermelha por padrão — navy, como o resto da marca. Seletor
+   validado por inspeção do DOM real (Playwright): o contorno é desenhado no
+   `div[role=group]`, que ganha data-focus-within ao focar. */
+[data-testid="stSelectbox"] div[role="group"][data-focus-within="true"] {{
+    border-color: var(--navy) !important;
 }}
 
 /* Checkbox e toggle (st.checkbox / st.toggle): nunca o vermelho/rosa padrão

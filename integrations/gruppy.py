@@ -106,6 +106,18 @@ def detectar_colunas_automatico(df: pd.DataFrame, modo_custo: ModoCustoGruppy) -
     return mapa
 
 
+def validar_planilha(df: pd.DataFrame) -> None:
+    """Recusa planilha de compras GPS enviada como tabela de preços: coluna
+    de CNPJ só existe no GPS (uma tabela Gruppy é por laboratório, não por
+    loja). Levanta ValueError antes de qualquer gravação."""
+    com_cnpj = [str(c) for c in df.columns if "cnpj" in _normalizar_coluna(c)]
+    if com_cnpj:
+        raise ValueError(
+            f"Esta planilha tem coluna de CNPJ ({', '.join(com_cnpj)}) — parece compras do GPS, não uma "
+            "tabela de preços Gruppy. Nada foi importado — envie esta planilha na seção Compras das Lojas (GPS)."
+        )
+
+
 def mapear_colunas(df: pd.DataFrame, modo_custo: ModoCustoGruppy) -> dict[str, str]:
     mapa = detectar_colunas_automatico(df, modo_custo)
     faltando = campos_obrigatorios(modo_custo) - mapa.keys()
@@ -153,6 +165,8 @@ def processar_planilha_gruppy(
     modo_custo: ModoCustoGruppy,
     mapa_confirmado: dict[str, str] | None = None,
     df: pd.DataFrame | None = None,
+    storage_key: str | None = None,
+    tamanho_bytes: int | None = None,
 ) -> ResultadoSincronizacao:
     """`mapa_confirmado` vem do popup de confirmação de mapeamento (campo ->
     coluna escolhido pelo usuário) — quando informado, substitui a detecção
@@ -161,9 +175,10 @@ def processar_planilha_gruppy(
     incompleto vindo de um chamador que não seja o popup (que já bloqueia
     isso na própria UI).
 
-    `df`, se informado, evita reler/reparsear o Excel — mesmo raciocínio de
-    `integrations.gps.processar_planilha_gps` (o popup de mapeamento já leu
-    a planilha inteira pra montar o preview)."""
+    `df`, se informado, evita ler o Excel aqui (a tela já recebe a planilha
+    lida no navegador — ver views/leitor_planilha.py). `storage_key`, se
+    informado, é o original que o navegador já enviou direto ao Spaces; sem
+    ele, `conteudo` é gravado pelo caminho de sempre."""
     laboratorio = laboratorio.strip()
     if not laboratorio:
         raise ValueError("Informe o laboratório da tabela.")
@@ -172,6 +187,7 @@ def processar_planilha_gruppy(
 
     if df is None:
         df = pd.read_excel(io.BytesIO(conteudo))
+    validar_planilha(df)
     if mapa_confirmado is not None:
         faltando = campos_obrigatorios(modo_custo) - mapa_confirmado.keys()
         if faltando:
@@ -180,9 +196,9 @@ def processar_planilha_gruppy(
     else:
         mapa = mapear_colunas(df, modo_custo)
 
-    node = filesystem.salvar_arquivo(
-        session, pasta_destino_id, nome_arquivo, conteudo, criado_por,
-        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    node = filesystem.guardar_planilha(
+        session, pasta_destino_id, nome_arquivo, criado_por,
+        conteudo=conteudo, storage_key=storage_key, tamanho_bytes=tamanho_bytes,
     )
 
     tabela = TabelaGruppy(
@@ -203,6 +219,7 @@ def processar_planilha_gruppy(
 
     processados = 0
     ignorados_sem_ean = 0
+    linhas_invalidas = 0
     cache_candidatos: dict = {}  # ver reconciliation/motor.py::buscar_candidatos
     cache_eans_resolvidos = reconciliation_motor.carregar_cache_eans_resolvidos(session)
     cache_fila_pendente: dict = {}  # ver reconciliation/motor.py::upsert_fila_resolucao
@@ -221,20 +238,47 @@ def processar_planilha_gruppy(
             if not ean or ean.lower() == "nan":
                 ignorados_sem_ean += 1
                 continue
-            descricao = str(linha.descricao).strip()
+            # pd.notna: célula vazia/NaN vira "" (não a string "nan"), que o
+            # motor de reconciliação já trata como "sem candidato" (score 0.0
+            # -> fila_manual), nunca como match errado nem linha descartada.
+            descricao = str(linha.descricao).strip() if pd.notna(linha.descricao) else ""
 
+            # Mesmo padrão de integrations/gps.py::_processar_linhas: uma
+            # célula ruim (texto não numérico, célula vazia/NaN) não pode
+            # abortar a importação inteira. Antes disso, `float()`/
+            # `normalizar_percentual()` sem tratamento levantavam
+            # ValueError/TypeError direto pra fora de `processar_planilha_gruppy`
+            # — sem nenhum commit ainda feito (session.add_all só roda no
+            # fim), isso derrubava a transação toda e nem as linhas boas já
+            # processadas antes da ruim ficavam salvas ("nada foi
+            # importado" em vez de "4.980 de 5.000 importados, 20
+            # ignoradas"). NaN passa batido pelo float() (não levanta), por
+            # isso o pd.notna correspondente vem antes do try/except, não
+            # dentro dele — mesmo motivo do guard em integrations/gps.py.
             if modo_custo == ModoCustoGruppy.PRONTO:
-                custo = float(linha.custo)
-                preco_bruto = None
-                percentual_desconto = None
-            else:
-                preco_bruto = float(linha.preco_bruto)
-                # normalizar_percentual já devolve fração (0-1), detectando a
-                # escala igual ao % de CMV do GPS — nunca dividir por 100 de
-                # novo aqui, senão uma planilha que já vem em fração (0.84)
-                # sai ~100x menor que o desconto real (vira 0,84%, não 84%).
-                percentual_desconto = normalizar_percentual(linha.desconto)
-                custo = preco_bruto * (1 - percentual_desconto)
+                if not pd.notna(linha.custo):
+                    linhas_invalidas += 1
+                    continue
+            elif not pd.notna(linha.preco_bruto) or not pd.notna(linha.desconto):
+                linhas_invalidas += 1
+                continue
+
+            try:
+                if modo_custo == ModoCustoGruppy.PRONTO:
+                    custo = float(linha.custo)
+                    preco_bruto = None
+                    percentual_desconto = None
+                else:
+                    preco_bruto = float(linha.preco_bruto)
+                    # normalizar_percentual já devolve fração (0-1), detectando a
+                    # escala igual ao % de CMV do GPS — nunca dividir por 100 de
+                    # novo aqui, senão uma planilha que já vem em fração (0.84)
+                    # sai ~100x menor que o desconto real (vira 0,84%, não 84%).
+                    percentual_desconto = normalizar_percentual(linha.desconto)
+                    custo = preco_bruto * (1 - percentual_desconto)
+            except (ValueError, TypeError):
+                linhas_invalidas += 1
+                continue
 
             novos_itens.append(
                 ItemTabelaGruppy(
@@ -265,6 +309,8 @@ def processar_planilha_gruppy(
     msg = f"{processados} itens importados da tabela '{laboratorio}' ({', '.join(ufs)})."
     if ignorados_sem_ean:
         msg += f" {ignorados_sem_ean} linhas ignoradas por EAN vazio."
+    if linhas_invalidas:
+        msg += f" {linhas_invalidas} linhas ignoradas (custo/preço/desconto inválido ou vazio)."
 
     return ResultadoSincronizacao(status=StatusIntegracao.MANUAL, registros_processados=processados, mensagem=msg)
 
@@ -286,6 +332,7 @@ class ResultadoExclusaoTabelaGruppy:
     laboratorio: str
     itens_removidos: int
     coberturas_removidas: int
+    storage_key: str | None
 
 
 def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> ResultadoExclusaoTabelaGruppy:
@@ -300,7 +347,15 @@ def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> 
     FilaCnpjOrfao — mesmo que um EAN desta tabela já tenha sido reconciliado,
     EanGenerico é histórico de decisão (não pertence à tabela de preço em
     si); apagar a tabela não desfaz uma reconciliação já feita, nem mexe em
-    nenhuma outra tabela Gruppy (cada uma só apaga a própria linhagem)."""
+    nenhuma outra tabela Gruppy (cada uma só apaga a própria linhagem).
+
+    Devolve `storage_key` (None se o FSNode já não existia) pra quem chamou
+    apagar o BYTE FÍSICO do Spaces depois — de propósito NÃO faz isso aqui
+    dentro: esta função só mexe no banco, ainda dentro de uma transação que
+    pode dar rollback (ex: erro em outra parte do `with get_session()` do
+    chamador). Apagar o arquivo físico só depois do commit confirmado evita
+    o cenário pior — banco intacto (rollback) mas arquivo já destruído,
+    deixando o FSNode apontando pra um storage_key que não existe mais."""
     tabela = session.execute(
         select(TabelaGruppy).where(TabelaGruppy.upload_fs_node_id == fs_node_id)
     ).scalar_one_or_none()
@@ -321,6 +376,7 @@ def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> 
     session.flush()
 
     node = session.get(FSNode, fs_node_id)
+    storage_key = node.storage_key if node is not None else None
     if node is not None:
         session.delete(node)
 
@@ -331,6 +387,7 @@ def excluir_tabela_gruppy_definitivamente(session: Session, fs_node_id: int) -> 
         laboratorio=laboratorio,
         itens_removidos=itens_removidos,
         coberturas_removidas=coberturas_removidas,
+        storage_key=storage_key,
     )
 
 

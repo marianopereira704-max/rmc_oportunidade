@@ -8,9 +8,9 @@ from __future__ import annotations
 
 import streamlit as st
 
-from core import auth, theme
+from core import auth, monitoramento, theme
 from core.config import settings
-from core.db import init_db
+from core.db import get_session, init_db
 from views import dados, dashboard, login, oportunidade_loja, oportunidade_produto, pedido
 
 st.set_page_config(
@@ -30,6 +30,27 @@ if not usuario_logado:
     st.stop()
 
 usuario = auth.usuario_atual()
+
+
+@st.dialog("Aviso de infraestrutura")
+def _dialog_aviso_ip_streamlit_cloud() -> None:
+    st.write("Os IPs do Streamlit Cloud mudaram — atualize o firewall do servidor.")
+    if st.button("Fechar", type="primary", use_container_width=True):
+        st.session_state["ip_streamlit_aviso_fechado"] = True
+        st.rerun()
+
+
+# Checagem só 1x por sessão do navegador (o resultado em si já é cacheado no
+# banco por settings.streamlit_cloud.intervalo_verificacao_horas — ver
+# core/monitoramento.py — isso aqui evita repetir mesmo o SELECT/commit a
+# cada rerun da página dentro da MESMA sessão). Só pro admin: é decisão de
+# infraestrutura, sem relevância pro consultor.
+if auth.is_admin() and "ip_streamlit_divergente" not in st.session_state:
+    with get_session() as session:
+        st.session_state["ip_streamlit_divergente"] = monitoramento.verificar_e_avisar_se_necessario(session)
+
+if st.session_state.get("ip_streamlit_divergente") and not st.session_state.get("ip_streamlit_aviso_fechado"):
+    _dialog_aviso_ip_streamlit_cloud()
 
 # (chave, rótulo do botão, ícone, grupo da sidebar, função de render, admin-only).
 # O rótulo do botão é curto ("Por Loja") — o título completo ("Análise de

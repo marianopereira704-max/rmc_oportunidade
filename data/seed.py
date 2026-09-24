@@ -255,6 +255,15 @@ def _criar_compras_gps(
 
 
 def rodar() -> None:
+    # Trava: este script APAGA lojas, genéricos, tabelas Gruppy e compras
+    # antes de gerar o exemplo. O `.streamlit/secrets.toml` da máquina de
+    # desenvolvimento aponta para o Postgres de produção — sem esta checagem,
+    # seguir o README ("python -m data.seed") apagaria a base real.
+    if not settings.db.is_sqlite:
+        raise SystemExit(
+            "data.seed só roda contra SQLite (ele apaga lojas, genéricos e compras antes de gerar o exemplo). "
+            "O DATABASE_URL atual não é SQLite — rode com DATABASE_URL=sqlite:///... num secrets de teste."
+        )
     init_db()
     cfg = settings.seed
     random.seed(cfg.semente_aleatoria)

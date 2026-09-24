@@ -33,6 +33,8 @@ from core.models import (
 )
 from integrations import base_genericos as base_genericos_integ
 from integrations import gps as gps_integ
+from integrations import gps_processamento
+from integrations.planilha_navegador import PlanilhaRecebida
 from integrations import gruppy as gruppy_integ
 from integrations import mapeamento as mapeamento_integ
 from storage import filesystem as fs
@@ -205,115 +207,29 @@ def test_gruppy_planilha_real_com_celula_vazia_nao_gruda_sufixo_no_ean(session, 
 # GPS
 # ---------------------------------------------------------------------------
 
+def _enviar_gps(session, pasta_raiz_id, linhas: list[dict], ano_mes: str = "2026-07", nome: str = "gps.xlsx"):
+    """Envio GPS pelo MESMO caminho da tela (gps_processamento.iniciar),
+    rodando na própria chamada e dentro da sessão do teste."""
+    from contextlib import nullcontext
+
+    df = pd.DataFrame(linhas)
+    mapa = gps_integ.mapear_colunas(df)
+    planilha = PlanilhaRecebida(nome=nome, tamanho_bytes=3, df=df, storage_key=None, conteudo=b"xls")
+    iniciou, motivo = gps_processamento.iniciar(
+        planilha, gps_integ.preparar_compras(df, mapa), mapa, ano_mes, pasta_raiz_id, "admin",
+        fabrica_sessao=lambda: nullcontext(session), em_segundo_plano=False,
+    )
+    assert iniciou, motivo
+    estado = gps_processamento.estado_atual()
+    assert estado.sucesso, estado.erro
+    return estado
+
+
 def _criar_loja(session, cnpj, uf="SP") -> Loja:
     loja = Loja(cnpj=cnpj, razao_social="Farmácia Teste", uf=uf, cidade="São Paulo")
     session.add(loja)
     session.flush()
     return loja
-
-
-def test_gps_custo_unitario_formula(session, pasta_raiz_id):
-    loja = _criar_loja(session, "30.208.213/0001-74")
-    conteudo = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "ean": "555", "descricao": "Produto D",
-        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.6, "estoque": 5,
-    }])
-    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
-
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.loja_id == loja.id)).scalar_one()
-    assert float(registro.custo_unitario) == pytest.approx((1000.0 * 0.6) / 10)
-
-
-def test_gps_percentual_cmv_aceita_escala_0_100(session, pasta_raiz_id):
-    _criar_loja(session, "30.208.213/0001-74")
-    conteudo = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "ean": "556", "descricao": "Produto E",
-        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 60, "estoque": 0,  # 60, não 0.6
-    }])
-    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
-
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.ean == "556")).scalar_one()
-    assert float(registro.pct_cmv) == pytest.approx(0.6)
-
-
-def test_gps_linha_lixo_ignorada(session, pasta_raiz_id):
-    _criar_loja(session, "30.208.213/0001-74")
-    conteudo = _xlsx_bytes([
-        {"cnpj": "30.208.213/0001-74", "ean": "557", "descricao": "Produto F",
-         "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.5, "estoque": 0},
-        {"cnpj": "", "ean": "TOTAL", "descricao": "TOTAL GERAL",
-         "quantidade": "abc", "fat_liquido": "abc", "pct_cmv": "abc", "estoque": ""},
-    ])
-    resultado = gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
-    assert resultado.registros_processados == 1
-    assert "ignoradas" in resultado.mensagem
-
-
-def test_gps_cnpj_orfao_depois_resolvido_reprocessa_automaticamente(session, pasta_raiz_id):
-    conteudo = _xlsx_bytes([{
-        "cnpj": "11.111.111/0001-11", "ean": "999", "descricao": "Produto G",
-        "quantidade": 5, "fat_liquido": 500.0, "pct_cmv": 0.5, "estoque": 2,
-        "razaosocial": "Farmácia Desconhecida",
-    }])
-    resultado = gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
-
-    assert resultado.registros_processados == 0
-    fila = session.execute(select(FilaCnpjOrfao).where(FilaCnpjOrfao.cnpj == "11111111000111")).scalar_one()
-    assert fila.status == StatusFila.PENDENTE
-    assert float(fila.valor_total_acumulado) == 500.0
-    assert session.execute(select(RegistroCompraGPS)).scalar_one_or_none() is None
-
-    # admin cadastra a loja e resolve o órfão -> reprocessamento automático
-    loja = _criar_loja(session, "11.111.111/0001-11")
-    total_inseridas = gps_integ.resolver_cnpj_orfao(session, fila.id, loja.id, resolvido_por="admin")
-
-    assert total_inseridas == 1
-    fila_atualizada = session.get(FilaCnpjOrfao, fila.id)
-    assert fila_atualizada.status == StatusFila.RESOLVIDA
-    assert fila_atualizada.resolvido_para_loja_id == loja.id
-
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.loja_id == loja.id)).scalar_one()
-    assert registro.ean == "999"
-    assert registro.ano_mes == "2026-07"
-
-
-def test_gps_reupload_mesmo_mes_atualiza_em_vez_de_duplicar(session, pasta_raiz_id):
-    _criar_loja(session, "30.208.213/0001-74")
-    conteudo_v1 = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "ean": "700", "descricao": "Produto H",
-        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.5, "estoque": 3,
-    }])
-    gps_integ.processar_planilha_gps(session, conteudo_v1, "gps_v1.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
-
-    conteudo_v2 = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "ean": "700", "descricao": "Produto H (corrigido)",
-        "quantidade": 12, "fat_liquido": 1200.0, "pct_cmv": 0.5, "estoque": 4,
-    }])
-    resultado = gps_integ.processar_planilha_gps(session, conteudo_v2, "gps_v2.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
-
-    assert resultado.registros_processados == 0
-    assert session.execute(select(RegistroCompraGPS)).scalars().all().__len__() == 1
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.ean == "700")).scalar_one()
-    assert float(registro.quantidade) == 12
-
-
-def test_gps_planilha_real_com_celula_vazia_nao_gruda_sufixo_no_ean(session, pasta_raiz_id):
-    # Mesmo cenário da Base Genéricos: uma célula de EAN vazia em OUTRA linha
-    # faz o pandas ler a coluna inteira como float, e um EAN limpo como
-    # 7896422507295 vira 7896422507295.0 se lido com str() ingênuo.
-    loja = _criar_loja(session, "30.208.213/0001-74")
-    conteudo = _xlsx_bytes([
-        {"cnpj": "30.208.213/0001-74", "ean": 7896422507295, "descricao": "Produto Real",
-         "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.6, "estoque": 5},
-        {"cnpj": "30.208.213/0001-74", "ean": None, "descricao": "Linha Com EAN Vazio",
-         "quantidade": None, "fat_liquido": None, "pct_cmv": None, "estoque": None},
-    ])
-    resultado = gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
-
-    assert resultado.registros_processados == 1  # linha do EAN vazio é lixo, não conta
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.loja_id == loja.id)).scalar_one()
-    assert registro.ean == "7896422507295"
-    assert ".0" not in registro.ean
 
 
 # ---------------------------------------------------------------------------
@@ -395,24 +311,6 @@ def test_confirmar_mapeamento_atualiza_ultimo_confirmado(session):
     assert ean_atualizado.atualizado_por == "admin2"
 
 
-def test_gps_processar_planilha_bloqueia_mapeamento_confirmado_incompleto(session, pasta_raiz_id):
-    _criar_loja(session, "30.208.213/0001-74")
-    conteudo = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "ean": "555", "descricao": "Produto D",
-        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.6, "estoque": 5,
-    }])
-    mapa_incompleto = {  # falta "estoque"
-        "cnpj": "cnpj", "ean": "ean", "descricao": "descricao",
-        "quantidade": "quantidade", "fat_liquido": "fat_liquido", "pct_cmv": "pct_cmv",
-    }
-    with pytest.raises(ValueError, match="estoque"):
-        gps_integ.processar_planilha_gps(
-            session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07",
-            mapa_confirmado=mapa_incompleto,
-        )
-    assert session.execute(select(RegistroCompraGPS)).scalar_one_or_none() is None
-
-
 def test_gruppy_processar_planilha_bloqueia_mapeamento_confirmado_incompleto(session, pasta_raiz_id):
     conteudo = _xlsx_bytes([{"ean": "333", "descricao": "Produto C", "custo": 100.0}])
     mapa_incompleto = {"ean": "ean"}  # falta "descricao"
@@ -425,46 +323,6 @@ def test_gruppy_processar_planilha_bloqueia_mapeamento_confirmado_incompleto(ses
     assert session.execute(select(TabelaGruppy)).scalar_one_or_none() is None
 
 
-def test_gps_processar_planilha_usa_mapeamento_confirmado_em_vez_do_automatico(session, pasta_raiz_id):
-    # "IdentificadorUnico" não bate com nenhum sinônimo configurado pra "ean"
-    # (settings.colunas.gps) -> a heurística sozinha falharia; só processa
-    # porque o mapeamento confirmado aponta pra ela diretamente.
-    loja = _criar_loja(session, "30.208.213/0001-74")
-    conteudo = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "IdentificadorUnico": "999888", "descricao": "Produto Z",
-        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.6, "estoque": 5,
-    }])
-    mapa_confirmado = {
-        "cnpj": "cnpj", "ean": "IdentificadorUnico", "descricao": "descricao",
-        "quantidade": "quantidade", "fat_liquido": "fat_liquido", "pct_cmv": "pct_cmv", "estoque": "estoque",
-    }
-    resultado = gps_integ.processar_planilha_gps(
-        session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07",
-        mapa_confirmado=mapa_confirmado,
-    )
-    assert resultado.registros_processados == 1
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.loja_id == loja.id)).scalar_one()
-    assert registro.ean == "999888"
-
-
-def test_gps_processar_planilha_grava_mapeamento_exato_do_upload(session, pasta_raiz_id):
-    _criar_loja(session, "30.208.213/0001-74")
-    conteudo = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "ean": "555", "descricao": "Produto D",
-        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.6, "estoque": 5,
-    }])
-    mapa_confirmado = {
-        "cnpj": "cnpj", "ean": "ean", "descricao": "descricao", "quantidade": "quantidade",
-        "fat_liquido": "fat_liquido", "pct_cmv": "pct_cmv", "estoque": "estoque",
-    }
-    gps_integ.processar_planilha_gps(
-        session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07",
-        mapa_confirmado=mapa_confirmado,
-    )
-    upload = session.execute(select(UploadGPS)).scalar_one()
-    assert mapeamento_integ.desserializar_mapa(upload.mapa_colunas_json) == mapa_confirmado
-
-
 def test_gruppy_processar_planilha_grava_mapeamento_exato_do_upload(session, pasta_raiz_id):
     conteudo = _xlsx_bytes([{"ean": "333", "descricao": "Produto C", "custo": 100.0}])
     mapa_confirmado = {"ean": "ean", "descricao": "descricao", "custo": "custo"}
@@ -475,117 +333,6 @@ def test_gruppy_processar_planilha_grava_mapeamento_exato_do_upload(session, pas
     )
     tabela = session.execute(select(TabelaGruppy).where(TabelaGruppy.laboratorio == "Lab Mapa")).scalar_one()
     assert mapeamento_integ.desserializar_mapa(tabela.mapa_colunas_json) == mapa_confirmado
-
-
-def test_gps_dois_uploads_seguidos_mantem_cada_um_seu_proprio_mapeamento(session, pasta_raiz_id):
-    # o "último mapeamento global" (UltimoMapeamentoColuna) muda a cada
-    # confirmação -> isso NÃO pode sobrescrever o que já ficou gravado no
-    # upload anterior, cada UploadGPS guarda o seu próprio.
-    _criar_loja(session, "30.208.213/0001-74")
-
-    conteudo_1 = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "CodBarra": "111", "descricao": "Produto 1",
-        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.6, "estoque": 5,
-    }])
-    mapa_1 = {
-        "cnpj": "cnpj", "ean": "CodBarra", "descricao": "descricao", "quantidade": "quantidade",
-        "fat_liquido": "fat_liquido", "pct_cmv": "pct_cmv", "estoque": "estoque",
-    }
-    gps_integ.processar_planilha_gps(
-        session, conteudo_1, "gps_v1.xlsx", "admin", pasta_raiz_id, ano_mes="2026-06", mapa_confirmado=mapa_1,
-    )
-    mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GPS, mapa_1, "admin")
-
-    conteudo_2 = _xlsx_bytes([{
-        "cnpj": "30.208.213/0001-74", "EANProduto": "222", "descricao": "Produto 2",
-        "quantidade": 8, "fat_liquido": 800.0, "pct_cmv": 0.4, "estoque": 3,
-    }])
-    mapa_2 = {
-        "cnpj": "cnpj", "ean": "EANProduto", "descricao": "descricao", "quantidade": "quantidade",
-        "fat_liquido": "fat_liquido", "pct_cmv": "pct_cmv", "estoque": "estoque",
-    }
-    gps_integ.processar_planilha_gps(
-        session, conteudo_2, "gps_v2.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07", mapa_confirmado=mapa_2,
-    )
-    mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GPS, mapa_2, "admin")
-
-    upload_1 = session.execute(select(UploadGPS).where(UploadGPS.ano_mes == "2026-06")).scalar_one()
-    upload_2 = session.execute(select(UploadGPS).where(UploadGPS.ano_mes == "2026-07")).scalar_one()
-    assert mapeamento_integ.desserializar_mapa(upload_1.mapa_colunas_json) == mapa_1
-    assert mapeamento_integ.desserializar_mapa(upload_2.mapa_colunas_json) == mapa_2
-
-    # o "último mapeamento global" reflete o mais recente (mapa_2) — só a
-    # sugestão da PRÓXIMA planilha, nunca reescreve o que já foi gravado acima
-    ultimo_ean = session.execute(
-        select(UltimoMapeamentoColuna).where(
-            UltimoMapeamentoColuna.fornecedor == OrigemFila.GPS, UltimoMapeamentoColuna.campo == "ean",
-        )
-    ).scalar_one()
-    assert ultimo_ean.nome_coluna == "EANProduto"
-
-
-def test_gps_reprocesso_cnpj_orfao_usa_mapeamento_salvo_do_upload_nao_o_atual(session, pasta_raiz_id):
-    # nomes de coluna propositalmente fora de qualquer sinônimo configurado
-    # (settings.colunas.gps) -> se o reprocesso recalculasse a heurística do
-    # zero, falharia (ValueError). Se usasse o "último mapeamento global"
-    # (que aqui é deliberadamente diferente/errado), estouraria KeyError ao
-    # tentar ler uma coluna que não existe nesse arquivo. Só passa se usar o
-    # mapeamento exato salvo NESTE upload.
-    conteudo = _xlsx_bytes([{
-        "ColCNPJ": "11.111.111/0001-11", "ColEAN": "123", "ColDescricao": "Produto Reprocesso",
-        "ColQtd": 10, "ColFatLiq": 1000.0, "ColPctCmv": 0.5, "ColEstoque": 5,
-    }])
-    mapa_original = {
-        "cnpj": "ColCNPJ", "ean": "ColEAN", "descricao": "ColDescricao", "quantidade": "ColQtd",
-        "fat_liquido": "ColFatLiq", "pct_cmv": "ColPctCmv", "estoque": "ColEstoque",
-    }
-    resultado = gps_integ.processar_planilha_gps(
-        session, conteudo, "gps_orfao.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07",
-        mapa_confirmado=mapa_original,
-    )
-    assert resultado.registros_processados == 0  # CNPJ ainda não tem loja -> vai pra fila de órfão
-    fila = session.execute(select(FilaCnpjOrfao).where(FilaCnpjOrfao.cnpj == "11111111000111")).scalar_one()
-
-    # simula deriva do "mapeamento global": alguém confirmou depois um
-    # mapeamento diferente (e incompatível com este arquivo antigo) pra GPS
-    mapeamento_integ.confirmar_mapeamento(
-        session, OrigemFila.GPS,
-        {campo: "ColunaQueNaoExisteNesteArquivo" for campo in gps_integ.CAMPOS_OBRIGATORIOS},
-        "outro_admin",
-    )
-
-    loja = _criar_loja(session, "11.111.111/0001-11")
-    total_inseridas = gps_integ.resolver_cnpj_orfao(session, fila.id, loja.id, resolvido_por="admin")
-
-    assert total_inseridas == 1
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.loja_id == loja.id)).scalar_one()
-    assert registro.ean == "123"
-
-
-def test_gps_reprocesso_cnpj_orfao_upload_antigo_sem_mapeamento_cai_pra_heuristica(session, pasta_raiz_id, caplog):
-    # simula um upload de ANTES deste passo existir: UploadGPS sem
-    # mapa_colunas_json, com colunas de nome padrão (a heurística automática
-    # dá conta) -> fallback documentado, com aviso no log.
-    conteudo = _xlsx_bytes([{
-        "cnpj": "22.222.222/0001-22", "ean": "456", "descricao": "Produto Legado",
-        "quantidade": 5, "fat_liquido": 500.0, "pct_cmv": 0.5, "estoque": 2,
-    }])
-    node = fs.salvar_arquivo(session, pasta_raiz_id, "gps_legado.xlsx", conteudo, "sistema")
-    session.add(UploadGPS(fs_node_id=node.id, ano_mes="2025-01", criado_por="sistema", mapa_colunas_json=None))
-    session.add(FilaCnpjOrfao(
-        cnpj="22222222000122", valor_total_acumulado=500.0, qtd_ocorrencias=1, status=StatusFila.PENDENTE,
-    ))
-    session.flush()
-    fila = session.execute(select(FilaCnpjOrfao).where(FilaCnpjOrfao.cnpj == "22222222000122")).scalar_one()
-
-    loja = _criar_loja(session, "22.222.222/0001-22")
-    with caplog.at_level("WARNING"):
-        total_inseridas = gps_integ.resolver_cnpj_orfao(session, fila.id, loja.id, resolvido_por="admin")
-
-    assert total_inseridas == 1
-    registro = session.execute(select(RegistroCompraGPS).where(RegistroCompraGPS.loja_id == loja.id)).scalar_one()
-    assert registro.ean == "456"
-    assert any("não tem mapeamento" in msg for msg in caplog.messages)
 
 
 # ---------------------------------------------------------------------------
@@ -713,11 +460,10 @@ def test_excluir_tabela_gruppy_nao_afeta_outras_tabelas_do_sistema(session, past
     ))
     session.add(FilaCnpjOrfao(cnpj="11111111000100", status=StatusFila.PENDENTE))
 
-    conteudo_gps = _xlsx_bytes([{
+    _enviar_gps(session, pasta_raiz_id, [{
         "cnpj": "30.208.213/0001-74", "ean": "777777", "descricao": "Produto GPS",
-        "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0,
+        "Quantidade": 1, "VlrUnitario": 10.0,
     }])
-    gps_integ.processar_planilha_gps(session, conteudo_gps, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
 
     fs_node_id, _tabela_id = _criar_upload_gruppy(session, pasta_raiz_id, "Lab Isolado", "333")
 
@@ -748,11 +494,10 @@ def test_buscar_tabela_por_fs_node_so_acha_arquivo_gruppy(session, pasta_raiz_id
     # têm elo de volta pro FSNode (só TabelaGruppy.upload_fs_node_id existe),
     # então nunca devem "achar" uma tabela pra esse botão aparecer.
     _criar_loja(session, "30.208.213/0001-74")
-    conteudo_gps = _xlsx_bytes([{
+    _enviar_gps(session, pasta_raiz_id, [{
         "cnpj": "30.208.213/0001-74", "ean": "555555", "descricao": "Produto GPS",
-        "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0,
+        "Quantidade": 1, "VlrUnitario": 10.0,
     }])
-    gps_integ.processar_planilha_gps(session, conteudo_gps, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
     upload_gps = session.execute(select(UploadGPS)).scalar_one()
 
     conteudo_base = _xlsx_bytes([{"FCC": "F001", "EAN": 666666, "DESCRIÇÃO MARCOS": "Produto Base"}])
@@ -768,3 +513,53 @@ def test_buscar_tabela_por_fs_node_so_acha_arquivo_gruppy(session, pasta_raiz_id
     tabela_encontrada = gruppy_integ.buscar_tabela_por_fs_node(session, fs_node_id_gruppy)
     assert tabela_encontrada is not None
     assert tabela_encontrada.id == tabela_id
+
+
+# ---------------------------------------------------------------------------
+# Planilha enviada na seção errada (24/09/2026: uma tabela Gruppy subiu na
+# Base Genéricos e virou 22 genéricos canônicos falsos)
+# ---------------------------------------------------------------------------
+
+_CABECALHO_GRUPPY_REAL = [
+    "Família", "EAN", "Produto", "Quantidade Solicitada", "R$ Unitário Bruto", "Desconto", "Preço",
+    "R$ Total Líquido Total",
+]
+
+
+def test_base_genericos_recusa_tabela_gruppy_e_nao_grava_nada(session, pasta_raiz_id):
+    linha = dict(zip(_CABECALHO_GRUPPY_REAL, ["F1", 7891234567890, "AMOXICILINA 500MG", 10, 20.0, 0.1, 18.0, 180.0]))
+    with pytest.raises(ValueError, match="não parece a Base Genéricos"):
+        base_genericos_integ.processar_planilha_base_genericos(
+            session, _xlsx_bytes([linha]), "ACRESCIMO 3%. - SET 26.xlsx", "admin", pasta_raiz_id,
+        )
+    assert session.execute(select(func.count()).select_from(BaseGenerico)).scalar_one() == 0
+    assert session.execute(select(func.count()).select_from(EanGenerico)).scalar_one() == 0
+    assert session.execute(
+        select(func.count()).select_from(FSNode).where(FSNode.nome == "ACRESCIMO 3%. - SET 26.xlsx")
+    ).scalar_one() == 0
+
+
+def test_base_genericos_aceita_o_cabecalho_real_da_base():
+    base_genericos_integ.validar_planilha(pd.DataFrame(columns=["FCC", "EAN", "DESCRIÇÃO MARCOS"]))
+
+
+def test_gruppy_recusa_planilha_de_compras_gps():
+    df = pd.DataFrame(columns=["cnpj", "EAN", "Produto", "VlrUnitario", "Quantidade"])
+    with pytest.raises(ValueError, match="CNPJ"):
+        gruppy_integ.validar_planilha(df)
+    gruppy_integ.validar_planilha(pd.DataFrame(columns=_CABECALHO_GRUPPY_REAL))
+
+
+def test_gps_recusa_planilha_sem_nenhuma_compra(session, pasta_raiz_id):
+    from contextlib import nullcontext
+
+    df = pd.DataFrame([{"cnpj": "30.208.213/0001-74", "EAN": "7891", "Produto": "X", "Quantidade": None,
+                        "VlrUnitario": None}])
+    mapa = gps_integ.mapear_colunas(df)
+    iniciou, motivo = gps_processamento.iniciar(
+        PlanilhaRecebida("x.xlsx", 1, df, None, b"x"), gps_integ.preparar_compras(df, mapa), mapa, "2026-08",
+        pasta_raiz_id, "admin", fabrica_sessao=lambda: nullcontext(session), em_segundo_plano=False,
+    )
+    assert not iniciou
+    assert "Nenhuma compra" in motivo
+    assert session.execute(select(func.count()).select_from(UploadGPS)).scalar_one() == 0

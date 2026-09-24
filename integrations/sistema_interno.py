@@ -34,11 +34,11 @@ from __future__ import annotations
 import datetime as dt
 
 import requests
-from sqlalchemy import select
 
 from core.config import settings
 from core.db import get_session
 from core.models import Loja
+from core.sql import insert_com_atualizacao
 from integrations.base import IntegrationAdapter, ResultadoSincronizacao, StatusIntegracao
 
 # setor do time (item["team"][i]["sector"]) -> campo de Loja que ele preenche.
@@ -49,6 +49,52 @@ _SETOR_PARA_CAMPO = {
     "Consultoria Farma": "consultor_farma",
     "Negócios": "atendente_comercial",
 }
+
+
+# Linhas por instrução. O teto de parâmetros do SQLite (o mais baixo dos dois
+# bancos que o projeto roda) é o que manda aqui: 500 linhas x 9 colunas deixa
+# ~4.500 parâmetros, folgado mesmo nas versões antigas.
+_TAMANHO_BLOCO_LOJAS = 500
+
+# Colunas sobrescritas quando o CNPJ já existe. `grupo_economico` fica de fora
+# DE PROPÓSITO — ver a docstring do módulo e a de `insert_com_atualizacao`.
+_COLUNAS_ATUALIZADAS = [
+    "razao_social", "uf", "cidade",
+    "atendente_comercial", "consultor_farma", "consultor_interno",
+    "fonte", "atualizado_em",
+]
+
+
+def _campos_do_time(item: dict) -> tuple[dict[str, str | None], bool]:
+    """Mapeia `team[]` -> campos de Loja. Primeira ocorrência de cada setor
+    relevante vence; devolve também se houve repetição de setor, pra relatar.
+    """
+    campos: dict[str, str | None] = {}
+    duplicou = False
+    for pessoa in item.get("team") or []:
+        campo = _SETOR_PARA_CAMPO.get(pessoa.get("sector"))
+        if campo is None:
+            continue
+        if campo in campos:
+            duplicou = True
+            continue
+        campos[campo] = pessoa.get("name")
+    return campos, duplicou
+
+
+def _gravar_lojas_em_bloco(session, linhas: list[dict]) -> None:
+    """Uma instrução por bloco, em vez de uma consulta por loja.
+
+    O que havia aqui antes era um SELECT por loja recebida da API ("existe?")
+    seguido de insert ou update — com ~800 lojas ativas, ~800 idas ao banco,
+    e foi isso que fez a sincronização levar minutos. Agora o próprio banco
+    decide inserir ou atualizar, via ON CONFLICT (cnpj) DO UPDATE."""
+    for inicio in range(0, len(linhas), _TAMANHO_BLOCO_LOJAS):
+        bloco = linhas[inicio:inicio + _TAMANHO_BLOCO_LOJAS]
+        if not bloco:
+            continue
+        stmt = insert_com_atualizacao(session, Loja.__table__, ["cnpj"], _COLUNAS_ATUALIZADAS)
+        session.execute(stmt, bloco)
 
 
 class SistemaInternoLojasAdapter(IntegrationAdapter):
@@ -82,50 +128,41 @@ class SistemaInternoLojasAdapter(IntegrationAdapter):
             )
 
         registros = self._buscar_lojas_api()
-        processados = 0
+
+        ativos = [item for item in registros if item.get("active") is True]
         lojas_com_setor_duplicado = 0
 
+        # Deduplicado por CNPJ, mantendo a ÚLTIMA ocorrência — mesmo resultado
+        # final do laço antigo (cada repetição sobrescrevia a anterior), e
+        # necessário por outro motivo: um lote de ON CONFLICT DO UPDATE não
+        # pode conter a mesma chave duas vezes (ver core/sql.py).
+        por_cnpj: dict[str, dict] = {}
+        for item in ativos:
+            campos_time, duplicou = _campos_do_time(item)
+            if duplicou:
+                lojas_com_setor_duplicado += 1
+
+            endereco = item.get("address") or {}
+            por_cnpj[item["cnpj"]] = {
+                "cnpj": item["cnpj"],
+                "razao_social": item["businessName"],
+                "uf": endereco["state"],
+                "cidade": endereco["city"],
+                "atendente_comercial": campos_time.get("atendente_comercial"),
+                "consultor_farma": campos_time.get("consultor_farma"),
+                "consultor_interno": campos_time.get("consultor_interno"),
+                # grupo_economico NÃO entra aqui nem na lista de colunas
+                # atualizadas: é pendente de decisão separada (ver docstring
+                # do módulo) e sobrescrevê-lo apagaria dado que não é desta
+                # origem.
+                "fonte": "sistema_interno",
+                "atualizado_em": dt.datetime.utcnow(),
+            }
+
         with get_session() as session:
-            for item in registros:
-                if item.get("active") is not True:
-                    continue
+            _gravar_lojas_em_bloco(session, list(por_cnpj.values()))
 
-                # Primeira ocorrência de cada setor relevante vence; se
-                # aparecer um segundo "Consultoria Interna" (etc.) na mesma
-                # loja, ele é descartado e contado abaixo pra relatar.
-                campos_time: dict[str, str | None] = {}
-                duplicou = False
-                for pessoa in item.get("team") or []:
-                    campo = _SETOR_PARA_CAMPO.get(pessoa.get("sector"))
-                    if campo is None:
-                        continue
-                    if campo in campos_time:
-                        duplicou = True
-                        continue
-                    campos_time[campo] = pessoa.get("name")
-                if duplicou:
-                    lojas_com_setor_duplicado += 1
-
-                loja = session.execute(
-                    select(Loja).where(Loja.cnpj == item["cnpj"])
-                ).scalar_one_or_none()
-                if loja is None:
-                    loja = Loja(cnpj=item["cnpj"])
-                    session.add(loja)
-
-                endereco = item.get("address") or {}
-                loja.razao_social = item["businessName"]
-                loja.uf = endereco["state"]
-                loja.cidade = endereco["city"]
-                loja.atendente_comercial = campos_time.get("atendente_comercial")
-                loja.consultor_farma = campos_time.get("consultor_farma")
-                loja.consultor_interno = campos_time.get("consultor_interno")
-                # grupo_economico: pendente de decisão separada (ver
-                # docstring do módulo) — nunca inventar um valor aqui.
-                loja.fonte = "sistema_interno"
-                loja.atualizado_em = dt.datetime.utcnow()
-                processados += 1
-
+        processados = len(ativos)
         mensagem = (
             f"{processados} lojas ativas sincronizadas com sucesso "
             f"(de {len(registros)} recebidas da API, só active=true)."
@@ -134,6 +171,12 @@ class SistemaInternoLojasAdapter(IntegrationAdapter):
             mensagem += (
                 f" {lojas_com_setor_duplicado} loja(s) tinham mais de uma pessoa no mesmo "
                 "setor relevante — usada a primeira ocorrência."
+            )
+        repetidos = len(ativos) - len(por_cnpj)
+        if repetidos:
+            mensagem += (
+                f" {repetidos} registro(s) repetiam um CNPJ já recebido — "
+                "valeu a última ocorrência."
             )
 
         return ResultadoSincronizacao(
