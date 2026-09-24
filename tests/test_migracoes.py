@@ -164,3 +164,26 @@ def test_revisao_de_adocao_existe_no_historico():
     script = ScriptDirectory.from_config(core_db._config_alembic())
     revisoes = {r.revision for r in script.walk_revisions()}
     assert core_db._REVISAO_ESQUEMA_PRE_ALEMBIC in revisoes
+
+
+def test_banco_adotado_sem_tabela_da_revisao_inicial_ganha_a_tabela(tmp_path):
+    """Regressão de 24/09/2026 (banco do app publicado): um banco criado por
+    código anterior à revisão inicial não tinha `verificacoes_ips_streamlit_cloud`.
+    A adoção carimbou a revisão inicial, que dava a tabela por existente, e o
+    login do admin quebrava com UndefinedTable. Depois de preparar o esquema,
+    TODA tabela do modelo precisa existir — sem mexer nas que já existiam."""
+    engine = _engine_descartavel(tmp_path, "legado_incompleto.db")
+    _criar_esquema_legado(engine)
+    with engine.begin() as conexao:
+        conexao.exec_driver_sql("DROP TABLE verificacoes_ips_streamlit_cloud")
+        conexao.exec_driver_sql(
+            "INSERT INTO base_genericos (nome_canonico, ativo, criado_em) VALUES ('X', 1, '2026-01-01 00:00:00')"
+        )
+
+    core_db._preparar_esquema(engine_alvo=engine)
+
+    tabelas = set(inspect(engine).get_table_names())
+    assert "verificacoes_ips_streamlit_cloud" in tabelas
+    assert not (set(Base.metadata.tables) - tabelas)
+    with engine.connect() as conexao:
+        assert conexao.exec_driver_sql("SELECT nome_canonico FROM base_genericos").scalar_one() == "X"

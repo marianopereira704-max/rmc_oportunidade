@@ -6,6 +6,8 @@ se tem, mostra a sidebar de navegação e renderiza a seção escolhida.
 """
 from __future__ import annotations
 
+import logging
+
 import streamlit as st
 
 from core import auth, monitoramento, theme
@@ -46,8 +48,15 @@ def _dialog_aviso_ip_streamlit_cloud() -> None:
 # cada rerun da página dentro da MESMA sessão). Só pro admin: é decisão de
 # infraestrutura, sem relevância pro consultor.
 if auth.is_admin() and "ip_streamlit_divergente" not in st.session_state:
-    with get_session() as session:
-        st.session_state["ip_streamlit_divergente"] = monitoramento.verificar_e_avisar_se_necessario(session)
+    # A checagem é só informativa: qualquer falha nela (rede, banco, tabela)
+    # vira aviso no log e nunca derruba o login — em 24/09/2026 uma tabela
+    # ausente no banco publicado travava o admin logo após entrar.
+    try:
+        with get_session() as session:
+            st.session_state["ip_streamlit_divergente"] = monitoramento.verificar_e_avisar_se_necessario(session)
+    except Exception:
+        logging.getLogger(__name__).warning("Falha na checagem de IPs do Streamlit Cloud", exc_info=True)
+        st.session_state["ip_streamlit_divergente"] = False
 
 if st.session_state.get("ip_streamlit_divergente") and not st.session_state.get("ip_streamlit_aviso_fechado"):
     _dialog_aviso_ip_streamlit_cloud()
