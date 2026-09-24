@@ -22,8 +22,8 @@ Visão geral do domínio:
   agora) é controlada por UF, não pela tabela inteira — por isso a cobertura
   geográfica é uma tabela própria, com status ativa/inativa por UF.
 - RegistroCompraGPS: o que a loja efetivamente comprou (de qualquer
-  fornecedor) num determinado mês, incluindo o estoque daquele mês (o arquivo
-  GPS real traz estoque na mesma linha da compra — não é upload separado).
+  fornecedor) num determinado mês — quantidade e custo unitário sem ST.
+  CompraGPSOrfa guarda as mesmas compras enquanto o CNPJ não bate com loja.
   "Economia" nunca é uma coluna gravada aqui: é sempre calculada cruzando isto
   com ItemTabelaGruppy em core/queries.py, pra nunca ficar desatualizada
   quando o preço da RMC mudar.
@@ -43,6 +43,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -195,6 +196,13 @@ class FilaCnpjOrfao(Base):
     qtd_ocorrencias: Mapped[int] = mapped_column(Integer, default=0)
     status: Mapped[StatusFila] = mapped_column(Enum(StatusFila), default=StatusFila.PENDENTE)
     resolvido_para_loja_id: Mapped[int | None] = mapped_column(ForeignKey("lojas.id"), nullable=True)
+    # JSON (lista de int) dos FSNode.id dos uploads GPS em que este CNPJ
+    # apareceu — só nesses arquivos vale a pena reler na hora de resolver o
+    # órfão (ver integrations/gps.py::_reprocessar_cnpjs), em vez de reler
+    # TODOS os uploads GPS já enviados. Nulo em fila criada antes deste campo
+    # existir -> fallback pro comportamento antigo (relê tudo), pois não tem
+    # como saber em quais arquivos aquele CNPJ apareceu.
+    uploads_fs_node_ids_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
     atualizado_em: Mapped[dt.datetime] = mapped_column(
         DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
@@ -268,10 +276,25 @@ class ItemTabelaGruppy(Base):
 
 
 # ---------------------------------------------------------------------------
-# Compras GPS (inclui estoque — mesma linha/arquivo, não é upload separado)
+# Compras GPS
 # ---------------------------------------------------------------------------
 
 class RegistroCompraGPS(Base):
+    """Uma linha por (loja, EAN, mês). Regra de custo desde 09/2026: o
+    `custo_unitario` é o `VlrUnitario` da planilha (preço de compra SEM ST,
+    comparável à tabela Gruppy, que também não tem imposto) e `quantidade` é a
+    `Quantidade` comprada no mês.
+
+    Campos de RECUO de preço (opcionais, preenchidos quando a planilha traz):
+    `fat_liquido`, `pct_cmv` e `qtd_vendida` (QTD, quantidade VENDIDA) geram
+    `custo_cmv_unitario` = Fat × %CMV ÷ QTD, já calculado no upload; e
+    `custo_medio_planilha` é o "R$ Custo médio". A análise (core/analise.py)
+    só usa esses valores quando o VlrUnitario destoa mais de ±50% do preço do
+    laboratório escolhido — a regra depende do laboratório, por isso fica na
+    consulta, e não no upload.
+
+    `estoque` é da regra antiga: fica no banco, opcional e sem uso. Não foi
+    removido porque o app publicado (código antigo) lê o mesmo banco."""
     __tablename__ = "registros_compra_gps"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -283,10 +306,13 @@ class RegistroCompraGPS(Base):
     ano_mes: Mapped[str] = mapped_column(String(7), index=True)  # "2026-07", vem do popup de upload
 
     quantidade: Mapped[float] = mapped_column(Numeric(14, 3))
-    fat_liquido: Mapped[float] = mapped_column(Numeric(14, 4))
-    pct_cmv: Mapped[float] = mapped_column(Numeric(7, 4))
-    custo_unitario: Mapped[float] = mapped_column(Numeric(14, 4))  # (fat_liquido*pct_cmv)/quantidade, calculado 1x na importação
-    estoque: Mapped[float] = mapped_column(Numeric(14, 3))  # QtdEstoque da mesma linha do arquivo GPS
+    custo_unitario: Mapped[float] = mapped_column(Numeric(14, 4))  # VlrUnitario da planilha (sem ST)
+    fat_liquido: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)  # Fat. líquido (recuo)
+    pct_cmv: Mapped[float | None] = mapped_column(Numeric(7, 4), nullable=True)  # % CMV em fração (recuo)
+    qtd_vendida: Mapped[float | None] = mapped_column(Numeric(14, 3), nullable=True)  # QTD vendida (recuo)
+    custo_cmv_unitario: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)  # Fat×%CMV÷QTD
+    custo_medio_planilha: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)  # R$ Custo médio
+    estoque: Mapped[float | None] = mapped_column(Numeric(14, 3), nullable=True)  # regra antiga, sem uso
 
     upload_fs_node_id: Mapped[int | None] = mapped_column(ForeignKey("fs_nodes.id"), nullable=True)
     criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
@@ -294,6 +320,44 @@ class RegistroCompraGPS(Base):
     loja: Mapped["Loja"] = relationship(back_populates="compras")
 
     __table_args__ = (UniqueConstraint("loja_id", "ean", "ano_mes", name="uq_compra_loja_ean_mes"),)
+
+
+class CompraGPSOrfa(Base):
+    """Compra do GPS cujo CNPJ ainda não bate com nenhuma Loja cadastrada —
+    guardada com o CNPJ (só dígitos) no lugar do `loja_id`, e com a MESMA
+    regra de substituição de `RegistroCompraGPS`: reenviar o mesmo CNPJ no
+    mesmo mês troca as linhas dele.
+
+    É a fonte de verdade da fila de CNPJ órfão (`FilaCnpjOrfao` é recalculada
+    a partir daqui, nunca somada envio a envio) e o que é movido para
+    `RegistroCompraGPS` quando alguém vincula o CNPJ a uma loja — sem reabrir
+    nenhum .xlsx."""
+    __tablename__ = "compras_gps_orfas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    cnpj: Mapped[str] = mapped_column(String(18))
+    razao_social: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    ean: Mapped[str] = mapped_column(String(40))
+    descricao_origem: Mapped[str] = mapped_column(String(250))
+    laboratorio_compra: Mapped[str | None] = mapped_column(String(150), nullable=True)
+    ano_mes: Mapped[str] = mapped_column(String(7))
+    quantidade: Mapped[float] = mapped_column(Numeric(14, 3))
+    custo_unitario: Mapped[float] = mapped_column(Numeric(14, 4))
+    # Mesmos campos de recuo de RegistroCompraGPS — viajam junto quando a
+    # compra é movida pra loja vinculada.
+    fat_liquido: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)
+    pct_cmv: Mapped[float | None] = mapped_column(Numeric(7, 4), nullable=True)
+    qtd_vendida: Mapped[float | None] = mapped_column(Numeric(14, 3), nullable=True)
+    custo_cmv_unitario: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)
+    custo_medio_planilha: Mapped[float | None] = mapped_column(Numeric(14, 4), nullable=True)
+    upload_fs_node_id: Mapped[int | None] = mapped_column(ForeignKey("fs_nodes.id"), nullable=True, index=True)
+    criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+    __table_args__ = (
+        UniqueConstraint("cnpj", "ean", "ano_mes", name="uq_compra_orfa_cnpj_ean_mes"),
+        Index("ix_compras_gps_orfas_ano_mes_cnpj", "ano_mes", "cnpj"),
+        Index("ix_compras_gps_orfas_ean", "ean"),
+    )
 
 
 class UltimoMapeamentoColuna(Base):
@@ -340,8 +404,74 @@ class UploadGPS(Base):
     # de recalcular a heurística de novo (que pode já ter mudado); nulo em
     # uploads de antes deste campo existir -> ver _reprocessar_cnpjs.
     mapa_colunas_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Chave, no mesmo storage do .xlsx, do ATALHO com as linhas deste upload
+    # que caíram em CNPJ órfão — ver integrations/gps_cache_orfaos.py. NULL
+    # significa "não tem atalho, relê o Excel" (upload antigo, upload sem
+    # nenhuma linha órfã, ou gravação do atalho que falhou), nunca "erro".
+    storage_key_orfaos: Mapped[str | None] = mapped_column(String(500), nullable=True)
     criado_por: Mapped[str] = mapped_column(String(120))
     criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Monitoramento de infraestrutura
+# ---------------------------------------------------------------------------
+
+class VerificacaoIpsStreamlitCloud(Base):
+    """Um registro por checagem feita (ver core/monitoramento.py) se a lista
+    de IPs de saída do Streamlit Community Cloud publicada oficialmente
+    ainda bate com `settings.streamlit_cloud.ips_conhecidos` (a lista usada
+    pra liberar o firewall do servidor de persistência). Guardado no banco
+    — não em st.session_state — pra sobreviver a reinícios do processo
+    Streamlit e pra não precisar bater na rede a cada rerun da página."""
+    __tablename__ = "verificacoes_ips_streamlit_cloud"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    verificado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    ips_publicados_snapshot: Mapped[str] = mapped_column(Text)  # JSON, só para auditoria
+    divergente: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+# ---------------------------------------------------------------------------
+# Controle de rotinas automáticas
+# ---------------------------------------------------------------------------
+
+class ControleRotina(Base):
+    """Uma linha por rotina automática do sistema (sincronização de lojas,
+    reprocessamento da fila de EAN, sincronização de compras do GPS...).
+
+    Existe pra responder uma pergunta só, mas que nenhum outro lugar do
+    sistema sabia responder: "isso já rodou hoje?". Sem esse registro não há
+    como disparar nada por tempo — todo processo automático viraria de novo
+    um botão que alguém precisa lembrar de clicar.
+
+    Fica no BANCO, não em `st.session_state` nem em arquivo: o Streamlit
+    reexecuta o script inteiro a cada interação e reinicia o processo de vez
+    em quando, então qualquer estado em memória se perderia; e com mais de um
+    usuário usando o app ao mesmo tempo, cada um teria a sua própria ideia de
+    "já rodou", que é exatamente o que causa rodar duas vezes em paralelo.
+
+    Três carimbos separados de propósito:
+    - `ultima_tentativa_em` é o que IMPEDE duas execuções simultâneas (ver
+      `core/rotinas.py::reivindicar`): quem consegue gravá-lo ganha o direito
+      de rodar, e quem chega junto vê que já foi reivindicado há pouco.
+    - `ultimo_sucesso_em` é o que decide se precisa rodar de novo hoje. Uma
+      falha NUNCA o altera — senão um erro transitório da API viraria "já
+      rodou hoje" e a rotina só voltaria a tentar no dia seguinte.
+    - `ultimo_erro` guarda a última falha pra tela poder mostrar o que houve
+      sem inventar texto; é limpo no próximo sucesso.
+    """
+    __tablename__ = "controle_rotinas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    nome: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    ultima_tentativa_em: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    ultimo_sucesso_em: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    ultima_mensagem: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ultimo_erro: Mapped[str | None] = mapped_column(Text, nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow
+    )
 
 
 # ---------------------------------------------------------------------------
