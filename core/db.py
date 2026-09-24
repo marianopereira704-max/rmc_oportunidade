@@ -2,6 +2,7 @@
 esquema + seed dos 2 usuários fixos + estrutura mínima de pastas)."""
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from sqlalchemy.orm import Session, sessionmaker
 from core.config import BASE_DIR, settings
 from core.models import Base, Papel, Usuario
 from core.security import hash_senha
+
+logger = logging.getLogger(__name__)
 
 if settings.db.is_sqlite:
     _connect_args = {"check_same_thread": False}
@@ -170,6 +173,28 @@ def _preparar_esquema(engine_alvo=None) -> None:
         if precisa_adotar:
             command.stamp(cfg, _REVISAO_ESQUEMA_PRE_ALEMBIC)
         command.upgrade(cfg, "head")
+
+    _criar_tabelas_faltantes(alvo)
+
+
+def _criar_tabelas_faltantes(alvo) -> None:
+    """Cria as tabelas do modelo que ainda não existem no banco — só as
+    que faltam, sem alterar nem apagar nenhuma que já existe.
+
+    Por que existe: a adoção de um banco anterior ao Alembic CARIMBA a
+    revisão inicial, que presume todas as tabelas daquela revisão. Um banco
+    criado por uma versão ainda mais antiga do código não tinha algumas delas
+    — e o carimbo as dava por existentes, então nenhuma migração as criava.
+    Aconteceu em 24/09/2026 no banco do app publicado: faltava
+    `verificacoes_ips_streamlit_cloud`, e o login do admin quebrava com
+    UndefinedTable. Tabela ausente é seguro criar a partir do modelo (não há
+    dado a preservar); coluna ausente em tabela existente continua sendo
+    trabalho de migração, não daqui."""
+    existentes = set(inspect(alvo).get_table_names())
+    faltando = [tabela for nome, tabela in Base.metadata.tables.items() if nome not in existentes]
+    if faltando:
+        logger.warning("Criando tabelas que faltavam no banco: %s", ", ".join(t.name for t in faltando))
+        Base.metadata.create_all(bind=alvo, tables=faltando)
 
 
 def init_db() -> None:

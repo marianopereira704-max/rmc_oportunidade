@@ -30,8 +30,13 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
   firewall libera os IPs de saída do Streamlit Cloud (`core/config.py`,
   `core/monitoramento.py` avisa se mudarem). Latência daqui até ele: ~138 ms por
   ida e volta — **toda consulta dentro de laço vira minutos**.
-- **`.streamlit/secrets.toml` local aponta para o Postgres e o Spaces DE PRODUÇÃO.**
-  `streamlit run app.py` local escreve no mesmo banco que o cliente vê — e
+- **Dois bancos no mesmo servidor Postgres** (descoberto em 24/09/2026):
+  `rmc_oportunidades_dev` é o do `.streamlit/secrets.toml` **local**;
+  `rmc_oportunidades` é o do **app publicado** (Secrets do Streamlit Cloud, com
+  outro usuário — o usuário do dev não tem permissão nele). Tudo que foi enviado
+  pelo app local (GPS, Gruppy, Base) está no banco **dev**, não no publicado.
+- **`.streamlit/secrets.toml` local aponta para o banco DEV e o Spaces real.**
+  `streamlit run app.py` local escreve no banco dev compartilhado — e
   `alembic`, `data.seed` ou qualquer script também. Para NÃO tocar em
   produção: `RMC_IGNORAR_SECRETS=1` (o `_get` de `core/config.py` pula o
   secrets.toml; sem outras variáveis, cai em SQLite `data/app.db` + disco
@@ -39,6 +44,10 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
   `streamlit run app.py --secrets.files=<secrets de teste>`.
   `data.seed` apaga lojas/genéricos/compras e por isso se recusa a rodar fora de SQLite.
 - **Migrações rodam sozinhas** no start do app (`core/db.py::_preparar_esquema`).
+  Depois das migrações, `_criar_tabelas_faltantes` cria qualquer tabela do
+  modelo que ainda não exista (só cria, nunca altera): um banco "adotado" pode
+  ter ficado sem tabelas da revisão inicial — foi o que quebrou o login do
+  admin no app publicado em 24/09/2026.
   Como o app antigo publicado e o app local usam o mesmo banco, migração nunca
   pode apagar/renomear coluna nem tabela enquanto o `main` estiver atrasado —
   só acrescentar ou afrouxar (ex.: NOT NULL → NULL). Última: `0005_campos_recuo_preco_gps`.
