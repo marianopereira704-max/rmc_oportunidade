@@ -1,20 +1,27 @@
-"""Engine/Session do SQLAlchemy, além do bootstrap do banco (criação de
-tabelas + seed dos 2 usuários fixos + estrutura mínima de pastas)."""
+"""Engine/Session do SQLAlchemy, além do bootstrap do banco (migração do
+esquema + seed dos 2 usuários fixos + estrutura mínima de pastas)."""
 from __future__ import annotations
 
 from contextlib import contextmanager
 from pathlib import Path
 
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import create_engine, event, inspect, select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
-from core.config import settings
+from core.config import BASE_DIR, settings
 from core.models import Base, Papel, Usuario
 from core.security import hash_senha
 
 if settings.db.is_sqlite:
     _connect_args = {"check_same_thread": False}
+    # SQLite é um arquivo local, sem servidor do outro lado da rede — não há
+    # conexão pra ficar "morta" nem custo de abrir uma nova, então as opções
+    # de pool abaixo (pensadas pra Postgres atrás de rede) nem se aplicam:
+    # QueuePool aceitaria, mas SingletonThreadPool (usado por sqlite:///:memory:,
+    # como nos testes que criam engine própria fora deste módulo) rejeita
+    # pool_size/max_overflow/pool_recycle com erro na hora de criar o engine.
+    _opcoes_pool: dict = {}
 else:
     # Sem isso, um problema de rede entre o app e o Postgres (ex: firewall
     # descartando pacote em silêncio, em vez de recusar a conexão na hora)
@@ -22,6 +29,27 @@ else:
     # com connect_timeout curto, falha rápido com um erro claro em vez de
     # travar a tela inteira do Streamlit.
     _connect_args = {"connect_timeout": 10}
+    _opcoes_pool = {
+        # Testa a conexão (SELECT 1 leve) antes de entregá-la pro chamador, e
+        # descarta em silêncio se estiver morta, abrindo outra no lugar. Sem
+        # isso, com app e banco em servidores diferentes, uma conexão ociosa
+        # derrubada pelo firewall ou por um restart do Postgres só é
+        # descoberta quando o app tenta USAR ela — e aparece pro usuário como
+        # "server closed the connection unexpectedly" numa tela qualquer, sem
+        # relação com o que ele estava fazendo.
+        "pool_pre_ping": True,
+        # Recicla toda conexão com mais de 30 min de vida, mesmo que pareça
+        # saudável — evita depender só do pre_ping pra pegar um firewall/
+        # load balancer que fecha conexão ociosa por tempo (comum em managed
+        # Postgres), e mantém a idade das conexões abertas previsível.
+        "pool_recycle": 1800,
+        # Conexões mantidas abertas em espera + até quantas extras o pool
+        # pode abrir sob pico — um valor explícito, não o default genérico do
+        # SQLAlchemy, dimensionado pra um Streamlit de poucos usuários
+        # simultâneos (a equipe RMC), não pra uma API de alto tráfego.
+        "pool_size": 5,
+        "max_overflow": 10,
+    }
 
 if settings.db.is_sqlite:
     # SQLite não cria diretórios sozinho — só o arquivo, e só se a pasta pai já
@@ -34,7 +62,7 @@ if settings.db.is_sqlite:
     if _caminho_db:
         Path(_caminho_db).resolve().parent.mkdir(parents=True, exist_ok=True)
 
-engine = create_engine(settings.db.url, connect_args=_connect_args, future=True)
+engine = create_engine(settings.db.url, connect_args=_connect_args, future=True, **_opcoes_pool)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
@@ -68,11 +96,86 @@ def get_session():
 
 _ja_inicializado = False
 
+# Revisão que representa o esquema exatamente como `Base.metadata.create_all`
+# o criava antes do Alembic existir neste projeto. É o ponto de adoção: um
+# banco que já estava em produção naquele formato é CARIMBADO nesta revisão
+# (nada é recriado) e só então recebe as migrações seguintes.
+_REVISAO_ESQUEMA_PRE_ALEMBIC = "0001_esquema_inicial"
+
+
+def _config_alembic(conexao=None, url: str | None = None):
+    """Configuração do Alembic apontando pro alembic.ini da raiz do projeto.
+
+    `configure_logger=False`: sem isso o `fileConfig` do alembic.ini
+    reconfiguraria o logging do processo inteiro — aceitável no CLI, ruim
+    dentro do Streamlit, que perderia a própria configuração de log.
+
+    Quando recebe `conexao`, o env.py reaproveita a conexão do engine deste
+    módulo em vez de abrir outra: as migrações rodam com os mesmos
+    parâmetros de conexão (timeout, SSL, pool) que o app usa no resto do
+    tempo, e não com um segundo conjunto criado só pra elas.
+    """
+    from alembic.config import Config as _ConfigAlembic
+
+    cfg = _ConfigAlembic(str(BASE_DIR / "alembic.ini"))
+    cfg.set_main_option("script_location", str(BASE_DIR / "alembic"))
+    cfg.attributes["configure_logger"] = False
+    cfg.attributes["url_banco"] = url or settings.db.url
+    if conexao is not None:
+        cfg.attributes["connection"] = conexao
+    return cfg
+
+
+def _preparar_esquema(engine_alvo=None) -> None:
+    """Deixa o esquema do banco na última revisão — o substituto de
+    `Base.metadata.create_all`, que criava tabela faltante mas NUNCA
+    alterava tabela existente (uma coluna nova simplesmente não chegava ao
+    banco, e o app só descobria isso quebrando na primeira consulta que a
+    usasse).
+
+    Três cenários, todos resolvidos aqui sem intervenção manual:
+
+    - Banco vazio (ambiente novo, teste manual, máquina de desenvolvimento):
+      não há nada pra adotar, o `upgrade` cria tudo do zero.
+    - Banco que já existia ANTES do Alembic (o caso de produção hoje: criado
+      por `create_all`, sem tabela `alembic_version`): tentar `upgrade`
+      direto falharia, porque a primeira migração mandaria criar tabelas que
+      já existem. Então ele é carimbado na revisão de adoção — que descreve
+      exatamente o esquema que ele já tem, sem executar nenhum DDL — e só
+      depois recebe as migrações posteriores.
+    - Banco já sob Alembic: aplica só o que estiver pendente (`upgrade` é
+      no-op quando já está em `head`).
+
+    Falha aqui NUNCA é silenciada: se a migração não passa, o app não sobe.
+    Subir com o esquema errado é exatamente o problema que este código
+    existe pra impedir.
+
+    `engine_alvo` existe só pra os testes poderem exercitar esta função
+    contra um banco descartável (ver tests/test_migracoes.py) sem precisar
+    recarregar este módulo; em produção é sempre o engine deste módulo.
+    """
+    from alembic import command
+
+    alvo = engine_alvo if engine_alvo is not None else engine
+    inspetor = inspect(alvo)
+    tabelas_no_banco = set(inspetor.get_table_names())
+    tabelas_do_modelo = set(Base.metadata.tables)
+
+    with alvo.begin() as conexao:
+        cfg = _config_alembic(conexao, url=str(alvo.url))
+        precisa_adotar = (
+            "alembic_version" not in tabelas_no_banco
+            and bool(tabelas_no_banco & tabelas_do_modelo)
+        )
+        if precisa_adotar:
+            command.stamp(cfg, _REVISAO_ESQUEMA_PRE_ALEMBIC)
+        command.upgrade(cfg, "head")
+
 
 def init_db() -> None:
-    """Cria as tabelas (se não existirem), garante os 2 usuários fixos
-    definidos (mesmo CNPJ de login, senha diferente por papel) e a estrutura
-    mínima de pastas do Explorador de Arquivos.
+    """Deixa o esquema na última revisão (ver `_preparar_esquema`), garante
+    os 2 usuários fixos definidos (mesmo CNPJ de login, senha diferente por
+    papel) e a estrutura mínima de pastas do Explorador de Arquivos.
 
     Importante: o Streamlit reexecuta app.py inteiro a cada interação do
     usuário (cada clique, cada rerun), e `app.py` chama `init_db()` no topo do
@@ -84,7 +187,7 @@ def init_db() -> None:
     if _ja_inicializado:
         return
 
-    Base.metadata.create_all(engine)
+    _preparar_esquema()
 
     cnpj_login = "30.208.213/0001-74"
     usuarios_fixos = [

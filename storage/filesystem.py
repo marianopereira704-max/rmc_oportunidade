@@ -49,6 +49,20 @@ class _BackendArmazenamento:
         demanda", nunca como erro."""
         return None
 
+    def url_envio_direto(self, storage_key: str, content_type: str, expira_em: int = 3600) -> str | None:
+        """URL temporária pra o NAVEGADOR enviar o arquivo direto ao backend
+        (PUT), sem os bytes passarem pela memória do processo Streamlit — o
+        caminho dos uploads de planilha grandes. `None` quando o backend não
+        tem endpoint HTTP (disco local): quem chama manda os bytes pelo app,
+        como sempre foi."""
+        return None
+
+    def tamanho(self, storage_key: str) -> int | None:
+        """Tamanho em bytes do objeto guardado, ou None se ele não existe —
+        usado pra confirmar que um envio direto do navegador chegou mesmo
+        antes de registrar o arquivo no Explorador."""
+        raise NotImplementedError
+
 
 class _BackendLocal(_BackendArmazenamento):
     def __init__(self) -> None:
@@ -70,6 +84,10 @@ class _BackendLocal(_BackendArmazenamento):
         caminho = self._path(storage_key)
         if caminho.exists():
             caminho.unlink()
+
+    def tamanho(self, storage_key: str) -> int | None:
+        caminho = self._path(storage_key)
+        return caminho.stat().st_size if caminho.exists() else None
 
 
 class _BackendDigitalOceanSpaces(_BackendArmazenamento):
@@ -101,6 +119,26 @@ class _BackendDigitalOceanSpaces(_BackendArmazenamento):
             Params={"Bucket": self.bucket, "Key": storage_key},
             ExpiresIn=expira_em,
         )
+
+    def url_envio_direto(self, storage_key: str, content_type: str, expira_em: int = 3600) -> str | None:
+        # O navegador PRECISA mandar o mesmo Content-Type assinado aqui, senão
+        # o Spaces recusa a assinatura (403). O bucket também precisa de uma
+        # regra de CORS liberando PUT a partir do endereço do app.
+        return self.client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": self.bucket, "Key": storage_key, "ContentType": content_type},
+            ExpiresIn=expira_em,
+        )
+
+    def tamanho(self, storage_key: str) -> int | None:
+        from botocore.exceptions import ClientError
+
+        try:
+            return int(self.client.head_object(Bucket=self.bucket, Key=storage_key)["ContentLength"])
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+                return None
+            raise
 
 
 _backend_instancia: _BackendArmazenamento | None = None
@@ -209,7 +247,7 @@ def criar_pasta(session: Session, parent_id: int, nome: str, criado_por: str) ->
 def salvar_arquivo(
     session: Session, parent_id: int, nome_arquivo: str, conteudo: bytes, criado_por: str, mime_type: str | None = None
 ) -> FSNode:
-    storage_key = f"{uuid.uuid4().hex}_{nome_arquivo}"
+    storage_key = nova_chave_armazenamento(nome_arquivo)
     backend().salvar(storage_key, conteudo)
     node = FSNode(
         parent_id=parent_id,
@@ -224,6 +262,66 @@ def salvar_arquivo(
     session.add(node)
     session.flush()
     return node
+
+
+def nova_chave_armazenamento(nome_arquivo: str) -> str:
+    """Mesmo formato de chave de `salvar_arquivo` — pra quem precisa da chave
+    ANTES de ter os bytes (envio direto do navegador ao Spaces)."""
+    return f"{uuid.uuid4().hex}_{nome_arquivo}"
+
+
+def registrar_arquivo(
+    session: Session, parent_id: int, nome_arquivo: str, storage_key: str, tamanho_bytes: int, criado_por: str,
+    mime_type: str | None = None,
+) -> FSNode:
+    """Cria o FSNode de um arquivo cujos bytes JÁ estão no backend (enviado
+    direto pelo navegador) — a contraparte de `salvar_arquivo` que não recebe
+    nem grava o conteúdo."""
+    node = FSNode(
+        parent_id=parent_id,
+        nome=nome_arquivo,
+        tipo=TipoNode.ARQUIVO,
+        status=StatusNode.ATIVO,
+        storage_key=storage_key,
+        tamanho_bytes=tamanho_bytes,
+        mime_type=mime_type,
+        criado_por=criado_por,
+    )
+    session.add(node)
+    session.flush()
+    return node
+
+
+MIME_XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+def guardar_planilha(
+    session: Session, parent_id: int, nome_arquivo: str, criado_por: str,
+    conteudo: bytes | None = None, storage_key: str | None = None, tamanho_bytes: int | None = None,
+) -> FSNode:
+    """Registra no Explorador a planilha original de um upload, venha ela de
+    onde vier:
+
+    - `storage_key` informado: o navegador já enviou o arquivo direto pro
+      Spaces (ver views/leitor_planilha.py). Confere que ele está lá de fato
+      antes de registrar — um FSNode apontando pra um objeto inexistente só
+      seria descoberto no dia em que alguém tentasse baixar o arquivo.
+    - senão, `conteudo` (bytes): grava pelo caminho de sempre.
+    """
+    if storage_key:
+        tamanho_real = backend().tamanho(storage_key)
+        if tamanho_real is None:
+            raise ValueError(
+                "O arquivo original não chegou ao armazenamento (envio direto do navegador falhou). "
+                "Selecione a planilha de novo."
+            )
+        return registrar_arquivo(
+            session, parent_id, nome_arquivo, storage_key, tamanho_bytes or tamanho_real, criado_por,
+            mime_type=MIME_XLSX,
+        )
+    if conteudo is None:
+        raise ValueError("Informe o conteúdo do arquivo ou a chave de um envio direto.")
+    return salvar_arquivo(session, parent_id, nome_arquivo, conteudo, criado_por, mime_type=MIME_XLSX)
 
 
 def ler_arquivo(node: FSNode) -> bytes:

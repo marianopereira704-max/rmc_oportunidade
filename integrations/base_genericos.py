@@ -35,6 +35,25 @@ def _normalizar_coluna(col: str) -> str:
     return re.sub(r"[^a-z0-9]", "", col.strip().lower())
 
 
+def validar_planilha(df: pd.DataFrame) -> None:
+    """Recusa planilha que não é uma Base Genéricos curada. A Base tem só EAN
+    + nome canônico (ex: FCC | EAN | DESCRIÇÃO MARCOS); uma tabela de preços
+    Gruppy também tem EAN e "Produto", e por isso PASSAVA no mapeamento — e
+    cada descrição dela virava um genérico canônico (aconteceu em 24/09/2026:
+    22 genéricos falsos). Colunas de preço, custo, desconto, quantidade ou
+    CNPJ denunciam que é Gruppy ou GPS. Levanta ValueError antes de qualquer
+    gravação."""
+    proibidas = settings.colunas.proibidas_base_genericos
+    suspeitas = [str(c) for c in df.columns if any(t in _normalizar_coluna(c) for t in proibidas)]
+    if suspeitas:
+        raise ValueError(
+            "Esta planilha não parece a Base Genéricos: ela tem colunas de preço/quantidade/CNPJ "
+            f"({', '.join(suspeitas)}), típicas de tabela Gruppy ou compras GPS. A Base Genéricos deve "
+            "ter só EAN e o nome canônico do genérico. Nada foi importado — envie esta planilha na "
+            "seção certa."
+        )
+
+
 def mapear_colunas(df: pd.DataFrame) -> dict[str, str]:
     colunas = settings.colunas.base_genericos
     mapa: dict[str, str] = {}
@@ -55,14 +74,20 @@ def mapear_colunas(df: pd.DataFrame) -> dict[str, str]:
 
 
 def processar_planilha_base_genericos(
-    session: Session, conteudo: bytes, nome_arquivo: str, criado_por: str, pasta_destino_id: int,
+    session: Session, conteudo: bytes | None, nome_arquivo: str, criado_por: str, pasta_destino_id: int,
+    df: pd.DataFrame | None = None, storage_key: str | None = None, tamanho_bytes: int | None = None,
 ) -> ResultadoSincronizacao:
-    df = pd.read_excel(io.BytesIO(conteudo))
+    """`df` (planilha já lida no navegador) e `storage_key` (original já no
+    Spaces) vêm da tela — ver views/leitor_planilha.py. Sem eles, lê e grava
+    `conteudo` como antes."""
+    if df is None:
+        df = pd.read_excel(io.BytesIO(conteudo))
+    validar_planilha(df)
     mapa = mapear_colunas(df)
 
-    filesystem.salvar_arquivo(
-        session, pasta_destino_id, nome_arquivo, conteudo, criado_por,
-        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    filesystem.guardar_planilha(
+        session, pasta_destino_id, nome_arquivo, criado_por,
+        conteudo=conteudo, storage_key=storage_key, tamanho_bytes=tamanho_bytes,
     )
 
     df_norm = pd.DataFrame({"ean": df[mapa["ean"]], "descricao": df[mapa["descricao"]]})

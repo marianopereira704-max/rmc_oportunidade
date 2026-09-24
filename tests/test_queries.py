@@ -1,5 +1,5 @@
-"""Testes do motor de oportunidade (core/queries.py) contra um SQLite em
-memória.
+"""Testes das consultas de apoio (core/queries.py) contra um SQLite em
+memória. O cálculo da oportunidade é testado em tests/test_analise.py.
 
 Cenário usado na maior parte dos testes:
 - BaseGenerico "DIPIRONA 500MG" com dois EAN mapeados pra ele (111 e 222) —
@@ -31,14 +31,9 @@ from core.models import (
 )
 from core.models import ModoCustoGruppy
 from core.queries import (
-    Filtros,
-    detalhe_produtos_da_loja,
     historico_compras,
     listar_ultimos_ano_meses,
-    oportunidade_por_loja,
-    oportunidade_por_produto,
     precos_por_laboratorio,
-    soma_economia_conjunto,
 )
 
 
@@ -120,73 +115,6 @@ def test_listar_ultimos_ano_meses(session, cenario):
     assert listar_ultimos_ano_meses(session, 6) == ["2026-07", "2026-06"]  # não existem mais que 2
 
 
-def test_escopo_por_uf_exclui_loja_sem_cobertura_ativa(session, cenario):
-    """Loja do RJ não tem cobertura Gruppy ativa pra RJ -> some do resultado
-    (INNER JOIN), nunca aparece com placeholder."""
-    resultado = oportunidade_por_loja(session, Filtros(periodo_meses=2), pagina=1, tamanho_pagina=50)
-    lojas = {linha["razao_social"] for linha in resultado.linhas}
-    assert "Farmácia SP" in lojas
-    assert "Farmácia RJ" not in lojas
-
-
-def test_consolidacao_multiplos_ean_e_media_ponderada(session, cenario):
-    """EAN 111 (jun, qtd 10, custo 12) + EAN 222 (jul, qtd 5, custo 14), mesmo
-    genérico -> consolida numa linha só: qtd 15, custo médio ponderado por
-    quantidade = (12*10 + 14*5) / 15 = 12.6667. Menor preço RMC em SP = 8.0
-    (LabX). Economia = (12.6667 - 8.0) * 15 = 70.0."""
-    resultado = oportunidade_por_produto(session, Filtros(periodo_meses=2), pagina=1, tamanho_pagina=50)
-    assert resultado.total_linhas == 1  # uma única linha (loja SP, genérico consolidado)
-
-    linha = resultado.linhas[0]
-    assert linha["quantidade_total"] == pytest.approx(15)
-    # tolerância mais larga aqui: a coluna é Numeric(14,4) no banco, então o
-    # SQLite/SQLAlchemy arredonda o resultado da divisão a poucas casas
-    # decimais ao converter pra Python -- irrelevante na prática (exibido
-    # sempre como moeda, 2 casas), então não vale travar no valor exato.
-    assert float(linha["custo_medio_ponderado"]) == pytest.approx(190 / 15, rel=1e-3)
-    assert float(linha["menor_preco"]) == pytest.approx(8.0)
-    assert float(linha["economia"]) == pytest.approx(70.0, rel=1e-2)
-    # EAN 111 e EAN 222 são apresentações DIFERENTES do mesmo genérico, cada
-    # uma com seu próprio histórico -- o snapshot "mais recente" é por
-    # (loja, EAN), não por genérico, então aqui cada EAN só tem 1 mês
-    # carregado (é o próprio "mais recente" dele) e os dois somam: 5 + 2 = 7.
-    assert float(linha["estoque_total"]) == pytest.approx(7)
-
-
-def test_resolucao_periodo_1_mes_considera_so_o_mes_mais_recente(session, cenario):
-    """Com período=1 mês, só julho entra -> só o EAN 222 (qtd 5, custo 14).
-    Economia = (14 - 8) * 5 = 30.0."""
-    resultado = oportunidade_por_produto(session, Filtros(periodo_meses=1), pagina=1, tamanho_pagina=50)
-    assert resultado.total_linhas == 1
-    linha = resultado.linhas[0]
-    assert linha["quantidade_total"] == pytest.approx(5)
-    assert float(linha["economia"]) == pytest.approx(30.0)
-
-
-def test_oportunidade_por_loja_soma_economia_de_todos_os_genericos(session, cenario):
-    resultado = oportunidade_por_loja(session, Filtros(periodo_meses=2), pagina=1, tamanho_pagina=50)
-    assert resultado.total_linhas == 1
-    assert float(resultado.linhas[0]["economia"]) == pytest.approx(70.0)
-    assert resultado.linhas[0]["qtd_produtos"] == 1
-
-
-def test_soma_economia_conjunto_nao_depende_da_paginacao(session, cenario):
-    total = soma_economia_conjunto(session, Filtros(periodo_meses=2))
-    assert total == pytest.approx(70.0)
-
-    # mesmo com tamanho_pagina=1 (que limitaria a listagem), a soma do conjunto
-    # inteiro não muda -- ela nunca pagina.
-    pagina = oportunidade_por_produto(session, Filtros(periodo_meses=2), pagina=1, tamanho_pagina=1)
-    assert pagina.total_linhas == 1
-    assert total == pytest.approx(70.0)
-
-
-def test_detalhe_produtos_da_loja(session, cenario):
-    detalhe = detalhe_produtos_da_loja(session, cenario["loja_sp_id"], Filtros(periodo_meses=2))
-    assert len(detalhe) == 1
-    assert detalhe[0]["nome_canonico"] == "DIPIRONA 500MG"
-
-
 def test_historico_compras_por_mes(session, cenario):
     historico = historico_compras(session, cenario["loja_sp_id"], cenario["bg_id"])
     assert [h["ano_mes"] for h in historico] == ["2026-06", "2026-07"]
@@ -200,41 +128,3 @@ def test_precos_por_laboratorio(session, cenario):
     assert precos[("LabY", cenario["bg_id"])] == pytest.approx(9.0)
 
 
-def test_filtro_busca_por_nome_de_generico(session, cenario):
-    resultado = oportunidade_por_produto(
-        session, Filtros(periodo_meses=2, busca="dipirona"), pagina=1, tamanho_pagina=50
-    )
-    assert resultado.total_linhas == 1
-
-    vazio = oportunidade_por_produto(
-        session, Filtros(periodo_meses=2, busca="produto_inexistente"), pagina=1, tamanho_pagina=50
-    )
-    assert vazio.total_linhas == 0
-
-
-def test_estoque_usa_sempre_o_snapshot_mais_recente_do_mesmo_ean(session, cenario):
-    """Diferente do teste de consolidação (que junta EANs DIFERENTES), aqui é
-    o MESMO EAN em dois meses -- o estoque tem que ser o do mês mais
-    recente, nunca a soma do histórico."""
-    session.add(
-        RegistroCompraGPS(
-            loja_id=cenario["loja_sp_id"], ean="222", descricao_origem="Dipirona", ano_mes="2026-05",
-            quantidade=1, fat_liquido=100, pct_cmv=0.5, custo_unitario=13.0, estoque=99,
-        )
-    )
-    session.flush()
-
-    resultado = oportunidade_por_produto(session, Filtros(periodo_meses=6), pagina=1, tamanho_pagina=50)
-    linha = resultado.linhas[0]
-    # EAN 111 (jun, estoque 5) + EAN 222 (mais recente = jul, estoque 2, não
-    # o de maio que tinha 99) = 7, igual ao teste de consolidação.
-    assert float(linha["estoque_total"]) == pytest.approx(7)
-
-
-def test_sem_gps_carregado_devolve_pagina_vazia(session):
-    """Sem nenhum RegistroCompraGPS (banco vazio), o motor não deve
-    quebrar — só devolver uma página vazia."""
-    resultado = oportunidade_por_loja(session, Filtros(periodo_meses=1), pagina=1, tamanho_pagina=50)
-    assert resultado.total_linhas == 0
-    assert resultado.linhas == []
-    assert soma_economia_conjunto(session, Filtros(periodo_meses=1)) == 0.0

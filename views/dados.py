@@ -12,15 +12,13 @@ Quatro responsabilidades:
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
-import io
 import logging
 
 import pandas as pd
 import streamlit as st
 from sqlalchemy import func, select
 
-from core import auth, theme, ui
+from core import auth, rotinas, theme, ui
 from core.config import settings
 from core.db import get_session
 from core.models import (
@@ -36,40 +34,25 @@ from core.models import (
 )
 from integrations import base_genericos as base_genericos_integ
 from integrations import gps as gps_integ
+from integrations import gps_processamento
 from integrations import gruppy as gruppy_integ
 from integrations import mapeamento as mapeamento_integ
 from integrations import sistema_interno as loja_integ
 from integrations.base import StatusIntegracao
+from integrations.planilha_navegador import ler_rodape
 from reconciliation import motor as reconciliation_motor
 from storage import filesystem as fs
+from views import analise_comum
+from views import leitor_planilha as leitor
 
 logger = logging.getLogger(__name__)
 
 _SEM_SELECAO = "— selecione —"
 
-_CACHE_DF_GRUPPY = "_cache_df_gruppy"
-_CACHE_DF_GPS = "_cache_df_gps"
+_LEITOR_GPS = "gps_leitor"
+_LEITOR_GRUPPY = "gruppy_leitor"
+_LEITOR_BASE = "base_genericos_leitor"
 
-
-def _ler_planilha_cacheada(chave_cache: str, arquivo_bytes: bytes) -> pd.DataFrame:
-    """Evita reparsear a mesma planilha do zero toda vez que o popup de
-    mapeamento rerenderiza (a cada interação — trocar uma coluna no
-    selectbox, por exemplo) e de novo dentro do `processar_planilha_*`
-    (ver chamada abaixo, que agora passa `df=` em vez de deixar reler) —
-    numa planilha GPS real de 150 mil linhas, só o parse já custa ~19s.
-
-    Cache de slot ÚNICO por tipo (`chave_cache`), guardado com o fingerprint
-    (hash) do conteúdo: um upload de arquivo DIFERENTE não acumula no
-    session_state, só substitui o slot — sem isso, cada novo upload dentro
-    da mesma sessão do navegador ia empilhando DataFrames grandes na memória
-    do processo Streamlit indefinidamente."""
-    fingerprint = hashlib.md5(arquivo_bytes).hexdigest()
-    cache = st.session_state.get(chave_cache)
-    if cache is not None and cache[0] == fingerprint:
-        return cache[1]
-    df = pd.read_excel(io.BytesIO(arquivo_bytes))
-    st.session_state[chave_cache] = (fingerprint, df)
-    return df
 
 _ROTULOS_CAMPOS_GRUPPY = {
     "ean": "EAN",
@@ -83,10 +66,8 @@ _ROTULOS_CAMPOS_GPS = {
     "cnpj": "CNPJ da loja",
     "ean": "EAN",
     "descricao": "Descrição",
-    "quantidade": "Quantidade comprada",
-    "fat_liquido": "Faturamento líquido",
-    "pct_cmv": "% de CMV",
-    "estoque": "Estoque atual",
+    "quantidade": "Quantidade comprada (ex: Quantidade)",
+    "custo_unitario": "Valor unitário sem ST (ex: VlrUnitario)",
 }
 
 _STATUS_BADGE = {
@@ -211,7 +192,14 @@ def _dialog_excluir_upload_gps(nome_arquivo: str, fs_node_id: int, ano_mes: str)
     ):
         with get_session() as session:
             resultado = gps_integ.excluir_upload_gps_definitivamente(session, fs_node_id)
-        aviso_purga = _purgar_arquivo_fisico(resultado.storage_key)
+        # Dois bytes físicos: o .xlsx e o atalho de linhas órfãs gravado ao
+        # lado dele (ver integrations/gps_cache_orfaos.py). Um aviso só é
+        # suficiente — a causa de falha é a mesma (storage fora do ar) e o
+        # desfecho também (arquivo órfão até uma limpeza manual).
+        aviso_purga = (
+            _purgar_arquivo_fisico(resultado.storage_key)
+            or _purgar_arquivo_fisico(resultado.storage_key_orfaos)
+        )
         st.session_state["explorador_exclusao_gps_resultado"] = resultado
         if aviso_purga:
             st.session_state["explorador_exclusao_aviso_purga"] = aviso_purga
@@ -412,10 +400,13 @@ def _selecionar_mapeamento(
 
 @st.dialog("Confirmar mapeamento de colunas — Gruppy", width="large")
 def _dialog_mapeamento_gruppy(
-    usuario: dict, arquivo_bytes: bytes, nome_arquivo: str, laboratorio: str, ufs: list[str],
-    modo_custo: ModoCustoGruppy,
+    usuario: dict, laboratorio: str, ufs: list[str], modo_custo: ModoCustoGruppy,
 ) -> None:
-    df_preview = _ler_planilha_cacheada(_CACHE_DF_GRUPPY, arquivo_bytes)
+    recebida = leitor.planilha_recebida(_LEITOR_GRUPPY)
+    if recebida is None:
+        st.info("Selecione a planilha de novo.")
+        return
+    df_preview = recebida.df
     colunas_planilha = [str(c) for c in df_preview.columns]
     mapa_automatico = gruppy_integ.detectar_colunas_automatico(df_preview, modo_custo)
     campos = gruppy_integ.campos_obrigatorios(modo_custo)
@@ -439,69 +430,108 @@ def _dialog_mapeamento_gruppy(
         "Confirmar e processar", key="map_gruppy_confirmar", type="primary", use_container_width=True
     ):
         try:
-            with get_session() as session:
-                pasta_id = _subpasta(session, "Ofertas", "Gruppy")
-                resultado = gruppy_integ.processar_planilha_gruppy(
-                    session, arquivo_bytes, nome_arquivo, usuario["nome"], pasta_id,
-                    laboratorio=laboratorio, ufs=ufs, modo_custo=modo_custo, mapa_confirmado=mapa_escolhido,
-                    df=df_preview,
-                )
-                mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GRUPPY, mapa_escolhido, usuario["nome"])
-            st.session_state.pop(_CACHE_DF_GRUPPY, None)
+            with st.spinner("Processando a tabela..."):
+                with get_session() as session:
+                    pasta_id = _subpasta(session, "Ofertas", "Gruppy")
+                    resultado = gruppy_integ.processar_planilha_gruppy(
+                        session, recebida.conteudo, recebida.nome, usuario["nome"], pasta_id,
+                        laboratorio=laboratorio, ufs=ufs, modo_custo=modo_custo, mapa_confirmado=mapa_escolhido,
+                        df=df_preview, storage_key=recebida.storage_key, tamanho_bytes=recebida.tamanho_bytes,
+                    )
+                    mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GRUPPY, mapa_escolhido, usuario["nome"])
+            leitor.consumir(_LEITOR_GRUPPY)
             st.session_state["gruppy_upload_sucesso"] = resultado.mensagem
             st.rerun()
         except Exception as exc:
             st.error(f"Erro ao processar planilha: {exc}")
 
 
-@st.dialog("Confirmar mapeamento de colunas — GPS", width="large")
-def _dialog_mapeamento_gps(usuario: dict, arquivo_bytes: bytes, nome_arquivo: str, ano_mes: str) -> None:
-    df_preview = _ler_planilha_cacheada(_CACHE_DF_GPS, arquivo_bytes)
-    colunas_planilha = [str(c) for c in df_preview.columns]
-    mapa_automatico = gps_integ.detectar_colunas_automatico(df_preview)
+def _rotulo_ano_mes(ano_mes: str) -> str:
+    return f"{_MESES.get(ano_mes[5:7], ano_mes[5:7])}/{ano_mes[:4]}"
+
+
+@st.dialog("Confirmar envio — Compras GPS", width="large")
+def _dialog_mapeamento_gps(usuario: dict, ano_mes: str) -> None:
+    recebida = leitor.planilha_recebida(_LEITOR_GPS)
+    if recebida is None:
+        st.info("Selecione a planilha de novo.")
+        return
+    df = recebida.df
+    colunas_planilha = [str(c) for c in df.columns]
+    mapa_automatico = gps_integ.detectar_colunas_automatico(df)
     campos = gps_integ.CAMPOS_OBRIGATORIOS
 
     with get_session() as session:
-        sugestao = mapeamento_integ.sugerir_mapeamento(
-            session, OrigemFila.GPS, campos, colunas_planilha, mapa_automatico,
+        sugestao = mapeamento_integ.sugerir_mapeamento(session, OrigemFila.GPS, campos, colunas_planilha, mapa_automatico)
+        uploads_existentes = gps_integ.listar_uploads_gps_no_mes(session, ano_mes)
+
+    # Mês: quem envia informa; o rodapé do BI é só a conferência. Divergência
+    # exige confirmação explícita — com a substituição por CNPJ, o mês errado
+    # sobrescreveria em silêncio os dados bons de outro mês.
+    rodape = ler_rodape(df)
+    mes_confirmado = True
+    if rodape.ano_mes and rodape.ano_mes != ano_mes:
+        st.error(
+            f"**Divergência de mês.** O rodapé do arquivo indica **{_rotulo_ano_mes(rodape.ano_mes)}**, "
+            f"mas o mês escolhido foi **{_rotulo_ano_mes(ano_mes)}**. Se confirmar, as compras dos CNPJs "
+            f"deste arquivo em {_rotulo_ano_mes(ano_mes)} serão substituídas por estas."
+        )
+        mes_confirmado = st.checkbox(
+            f"Confirmo que este arquivo é de {_rotulo_ano_mes(ano_mes)}", key=f"gps_confirma_mes_{ano_mes}",
+        )
+    if rodape.exportacao_cortada:
+        st.warning(
+            "O rodapé do arquivo avisa que a exportação do BI **passou do limite de linhas e foi cortada** "
+            "(\"Exported data exceeded the allowed volume\"). Pode estar faltando compra de alguma loja — "
+            "confira o filtro da exportação. Dá pra continuar mesmo assim."
+        )
+    if uploads_existentes:
+        st.info(
+            f"{_rotulo_ano_mes(ano_mes)} já tem {len(uploads_existentes)} envio(s). Os CNPJs presentes neste "
+            "arquivo terão as compras desse mês **substituídas**; os demais CNPJs continuam como estão."
         )
 
     st.caption("Confira qual coluna da planilha corresponde a cada campo antes de processar.")
     mapa_escolhido = _selecionar_mapeamento(campos, _ROTULOS_CAMPOS_GPS, colunas_planilha, sugestao, "map_gps")
-
-    completo = len(mapa_escolhido) == len(campos)
-    if not completo:
+    if len(mapa_escolhido) != len(campos):
         st.caption("Selecione uma coluna para todo campo obrigatório antes de confirmar.")
+        return
 
-    if completo and st.button(
-        "Confirmar e processar", key="map_gps_confirmar", type="primary", use_container_width=True
+    # Campos opcionais (laboratório, razão social) não passam pelo popup: vêm
+    # da detecção automática, e o que a pessoa escolheu vence em conflito.
+    mapa = {**mapa_automatico, **mapa_escolhido}
+    try:
+        preparadas = gps_integ.preparar_compras(df, mapa)
+    except Exception as exc:
+        st.error(f"Não consegui interpretar a planilha com esse mapeamento: {exc}")
+        return
+    st.markdown(
+        f"**{len(preparadas.compras):,} compras** de **{len(preparadas.cnpjs_no_arquivo)} CNPJs** "
+        f"serão gravadas em {_rotulo_ano_mes(ano_mes)}. "
+        f"Ignoradas: {preparadas.linhas_sem_compra:,} linhas só de venda, "
+        f"{preparadas.linhas_invalidas} com quantidade ou valor ≤ 0, "
+        f"{preparadas.linhas_sem_chave} sem CNPJ/EAN (rodapé/total).".replace(",", ".")
+    )
+
+    if preparadas.compras.empty:
+        st.error(
+            "Nenhuma compra encontrada com esse mapeamento (linhas com CNPJ, EAN, VlrUnitario e Quantidade). "
+            "Confira se esta é a exportação de compras do GPS — tabela Gruppy e Base Genéricos têm seções próprias."
+        )
+        return
+
+    if st.button(
+        "Confirmar e processar", key="map_gps_confirmar", type="primary", use_container_width=True,
+        disabled=not mes_confirmado,
     ):
-        try:
-            # A planilha GPS pode ter ~150 mil linhas e o processamento agora
-            # roda em blocos (ver `_TAMANHO_BLOCO` em integrations/gps.py) —
-            # a barra dá visibilidade real do progresso em vez da tela travada
-            # até o fim, sem este módulo de views precisar saber COMO o
-            # processamento é feito por dentro.
-            barra_progresso = st.progress(0.0, text="Processando planilha...")
-
-            def _atualizar_progresso(linhas_feitas: int, total_linhas: int) -> None:
-                fracao = min(1.0, linhas_feitas / total_linhas) if total_linhas else 1.0
-                texto = f"Processando planilha... {linhas_feitas:,}/{total_linhas:,} linhas".replace(",", ".")
-                barra_progresso.progress(fracao, text=texto)
-
-            with get_session() as session:
-                pasta_id = _subpasta(session, "Compras", "GPS", ano_mes)
-                resultado = gps_integ.processar_planilha_gps(
-                    session, arquivo_bytes, nome_arquivo, usuario["nome"], pasta_id,
-                    ano_mes=ano_mes, mapa_confirmado=mapa_escolhido, df=df_preview,
-                    progresso_callback=_atualizar_progresso,
-                )
-                mapeamento_integ.confirmar_mapeamento(session, OrigemFila.GPS, mapa_escolhido, usuario["nome"])
-            st.session_state.pop(_CACHE_DF_GPS, None)
-            st.session_state["gps_upload_sucesso"] = resultado.mensagem
-            st.rerun()
-        except Exception as exc:
-            st.error(f"Erro ao processar planilha: {exc}")
+        with get_session() as session:
+            pasta_id = _subpasta(session, "Compras", "GPS", ano_mes)
+        iniciou, motivo = gps_processamento.iniciar(recebida, preparadas, mapa, ano_mes, pasta_id, usuario["nome"])
+        if not iniciou:
+            st.error(motivo)
+            return
+        leitor.consumir(_LEITOR_GPS)
+        st.rerun()
 
 
 def _importar_gruppy(usuario: dict) -> None:
@@ -538,25 +568,106 @@ def _importar_gruppy(usuario: dict) -> None:
     )
     modo_custo = ModoCustoGruppy.PRONTO if modo_label.startswith("Custo") else ModoCustoGruppy.BRUTO_DESCONTO
 
-    arquivo = st.file_uploader("Planilha Gruppy (.xlsx)", type=["xlsx", "xls"], key="gruppy_upload")
+    leitor.leitor_planilha(_LEITOR_GRUPPY, "Selecionar planilha Gruppy (.xlsx)")
+    _mostrar_planilha_recebida(_LEITOR_GRUPPY)
+    recebida = leitor.planilha_recebida(_LEITOR_GRUPPY)
+    if recebida and not _planilha_valida(gruppy_integ.validar_planilha, recebida.df):
+        return
 
-    pronto = bool(arquivo and laboratorio and ufs)
-    if arquivo and not (laboratorio and ufs):
+    if recebida and not (laboratorio and ufs):
         st.caption("Selecione o laboratório e ao menos uma UF antes de processar.")
+    if recebida and laboratorio and ufs and st.button("Processar planilha Gruppy", key="gruppy_processar"):
+        _dialog_mapeamento_gruppy(usuario, laboratorio, ufs, modo_custo)
 
-    if pronto and st.button("Processar planilha Gruppy", key="gruppy_processar"):
-        _dialog_mapeamento_gruppy(usuario, arquivo.getvalue(), arquivo.name, laboratorio, ufs, modo_custo)
+
+def _planilha_valida(validar, df) -> bool:
+    """Mostra na hora, antes do botão de processar, quando a planilha escolhida
+    é de outro tipo (ex: tabela Gruppy na seção da Base Genéricos). O
+    processamento valida de novo — isto só evita o clique e deixa claro o erro."""
+    try:
+        validar(df)
+    except ValueError as exc:
+        st.error(str(exc))
+        return False
+    return True
+
+
+def _mostrar_planilha_recebida(chave_leitor: str) -> None:
+    erro = leitor.erro_recebido(chave_leitor)
+    if erro:
+        st.error(erro)
+    recebida = leitor.planilha_recebida(chave_leitor)
+    if recebida is not None:
+        tempo = (
+            f" em {recebida.segundos_leitura_navegador:.1f}s" if recebida.segundos_leitura_navegador else ""
+        )
+        st.caption(f"**{recebida.nome}** — {len(recebida.df):,} linhas lidas no seu navegador{tempo}.".replace(",", "."))
+
+
+@st.fragment(run_every=2)
+def _acompanhar_processamento_gps() -> None:
+    """Só existe na tela ENQUANTO há processamento: se refaz sozinho a cada
+    2s (só este trecho, lendo o estado da memória, sem banco). Quando o
+    processamento termina, refaz a página inteira uma vez e some — deixar a
+    atualização periódica ligada o tempo todo faria um arquivo escolhido no
+    meio de uma dessas atualizações parciais ter o evento descartado."""
+    estado = gps_processamento.estado_atual()
+    if estado is None or estado.concluido:
+        st.rerun()
+        return
+    fracao = min(1.0, estado.feito / estado.total) if estado.total else 0.0
+    detalhe = f" — {estado.feito:,}/{estado.total:,}".replace(",", ".") if estado.total > 1 else ""
+    st.progress(
+        fracao,
+        text=f"Processando **{estado.nome_arquivo}** ({_rotulo_ano_mes(estado.ano_mes)}): {estado.fase}{detalhe}",
+    )
+    st.caption("Pode fechar esta aba ou mudar de tela — o processamento continua e o resultado fica registrado aqui.")
+
+
+def _painel_processamento_gps() -> None:
+    estado = gps_processamento.estado_atual()
+    if estado is None or estado.lido_na_tela:
+        return
+    if not estado.concluido:
+        _acompanhar_processamento_gps()
+        return
+    if estado.sucesso:
+        st.success(estado.mensagem)
+    else:
+        st.error(
+            f"O processamento de **{estado.nome_arquivo}** falhou e **nada foi alterado** "
+            f"(os dados anteriores continuam valendo). Erro: {estado.erro}"
+        )
+    if st.button("Ok, entendi", key="gps_resultado_ok"):
+        gps_processamento.marcar_resultado_visto()
+        st.rerun()
+
+
+def _ultimo_envio_gps() -> None:
+    with get_session() as session:
+        controle = rotinas.obter(session, rotinas.ROTINA_UPLOAD_GPS)
+    if controle is None:
+        return
+    if controle.ultimo_sucesso_em is not None:
+        st.caption(
+            f"Último envio concluído: {controle.ultimo_sucesso_em:%d/%m/%Y %H:%M} (UTC) — "
+            f"{controle.ultima_mensagem or ''}"
+        )
+    if controle.ultimo_erro:
+        st.caption(f"Última falha registrada: {controle.ultimo_erro}")
 
 
 def _importar_gps(usuario: dict) -> None:
     st.markdown("##### Compras das Lojas (GPS)")
     st.caption(
-        "Cada upload cobre um mês de compras. O arquivo já traz o estoque atual na mesma linha "
-        "da compra (QtdEstoque) — não é um upload separado."
+        "Cada envio cobre um mês e **substitui, nesse mês, as compras dos CNPJs presentes no arquivo** — "
+        "os demais CNPJs continuam como estão (dá pra dividir a exportação por UF e enviar em partes). "
+        "Entram as linhas com VlrUnitario e Quantidade preenchidos (valor de compra sem ST); linhas só de "
+        "venda são ignoradas."
     )
 
-    if "gps_upload_sucesso" in st.session_state:
-        st.success(st.session_state.pop("gps_upload_sucesso"))
+    _painel_processamento_gps()
+    _ultimo_envio_gps()
 
     col_mes, col_ano = st.columns(2)
     with col_mes:
@@ -566,24 +677,92 @@ def _importar_gps(usuario: dict) -> None:
     mes_num = next(k for k, v in _MESES.items() if v == mes_label)
     ano_mes = f"{int(ano):04d}-{mes_num}"
 
-    arquivo = st.file_uploader("Planilha GPS (.xlsx)", type=["xlsx", "xls"], key="gps_upload")
+    leitor.leitor_planilha(_LEITOR_GPS, "Selecionar planilha GPS (.xlsx)")
+    _mostrar_planilha_recebida(_LEITOR_GPS)
 
-    if arquivo and st.button("Processar planilha GPS", key="gps_processar"):
-        _dialog_mapeamento_gps(usuario, arquivo.getvalue(), arquivo.name, ano_mes)
+    estado = gps_processamento.estado_atual()
+    em_andamento = estado is not None and not estado.concluido
+    if leitor.planilha_recebida(_LEITOR_GPS) is not None and st.button(
+        "Processar planilha GPS", key="gps_processar", disabled=em_andamento,
+    ):
+        _dialog_mapeamento_gps(usuario, ano_mes)
+
+
+@st.dialog("Sincronização automática de lojas falhou", width="large")
+def _dialog_falha_sincronizacao_lojas(erro: str) -> None:
+    """Falha da API externa vira aviso em pop-up, NUNCA erro no meio da tela:
+    a aba continua utilizável e as lojas que já estavam no banco continuam
+    visíveis — só não foram atualizadas hoje."""
+    st.error(erro)
+    st.markdown(
+        "As lojas que já estavam cadastradas continuam disponíveis normalmente — "
+        "o que não aconteceu foi a atualização de hoje. Você pode tentar de novo pelo "
+        "botão **Forçar sincronização agora**, na aba Importar Planilhas."
+    )
+    if st.button("Entendi", key="lojas_falha_fechar", use_container_width=True):
+        st.rerun()
+
+
+def _sincronizar_lojas_automatico() -> None:
+    """Item 16/18 do plano: ao abrir a aba Dados, sincroniza as lojas se ainda
+    não sincronizou hoje — sem depender de alguém lembrar de clicar.
+
+    A trava em `st.session_state` evita consultar o controle de rotina a cada
+    rerun do Streamlit (que acontece a cada clique em qualquer lugar da tela);
+    a trava de verdade contra execução dupla é do lado do banco, em
+    `rotinas.reivindicar`."""
+    if st.session_state.get("_lojas_auto_ja_verificado"):
+        return
+    st.session_state["_lojas_auto_ja_verificado"] = True
+
+    adaptador = loja_integ.SistemaInternoLojasAdapter()
+    if adaptador.status() != StatusIntegracao.DISPONIVEL:
+        # Sem credenciais configuradas não há o que sincronizar — e marcar
+        # "sucesso" aqui faria a rotina se considerar feita pelo resto do dia.
+        return
+
+    # O spinner não é enfeite: enquanto o item 17 (N+1 da sincronização de
+    # lojas) não for corrigido, essa chamada leva alguns minutos, e ela roda
+    # sozinha — sem o aviso, a primeira pessoa a abrir a aba no dia ficaria
+    # olhando uma tela parada sem saber por quê.
+    with st.spinner("Sincronizando a base de lojas (primeira abertura do dia)..."):
+        resultado = rotinas.executar_se_necessario(
+            rotinas.ROTINA_SINCRONIZACAO_LOJAS,
+            lambda: adaptador.sincronizar().mensagem,
+        )
+    if resultado.executou and not resultado.sucesso and resultado.erro:
+        _dialog_falha_sincronizacao_lojas(resultado.erro)
 
 
 def _sincronizar_lojas() -> None:
     st.markdown("##### Base de Lojas (sistema interno)")
     st.caption(
         "Traz CNPJ, razão social, UF, cidade e time de atendimento direto da API do sistema "
-        "interno — precisa rodar antes do upload do GPS pra ter loja cadastrada pra bater o CNPJ."
+        "interno. CNPJ do GPS que ainda não tem loja fica na fila de CNPJ órfão e passa pra loja quando "
+        "ela for vinculada — a ordem entre sincronizar lojas e enviar o GPS não importa."
     )
-    if st.button("Sincronizar lojas", key="lojas_sincronizar"):
-        try:
-            resultado = loja_integ.SistemaInternoLojasAdapter().sincronizar()
-            st.success(resultado.mensagem)
-        except Exception as exc:
-            st.error(f"Erro ao sincronizar lojas: {exc}")
+
+    with get_session() as session:
+        controle = rotinas.obter(session, rotinas.ROTINA_SINCRONIZACAO_LOJAS)
+        ultimo_sucesso = controle.ultimo_sucesso_em if controle else None
+        ultimo_erro = controle.ultimo_erro if controle else None
+
+    if ultimo_sucesso is not None:
+        st.caption(f"Última sincronização bem-sucedida: {ultimo_sucesso:%d/%m/%Y %H:%M} (UTC).")
+    else:
+        st.caption("Ainda não há registro de sincronização bem-sucedida.")
+    if ultimo_erro:
+        st.caption(f"Última falha registrada: {ultimo_erro}")
+
+    if st.button("Forçar sincronização agora", key="lojas_sincronizar"):
+        resultado = rotinas.executar_forcado(
+            rotinas.ROTINA_SINCRONIZACAO_LOJAS,
+            lambda: loja_integ.SistemaInternoLojasAdapter().sincronizar().mensagem,
+        )
+        if resultado.sucesso:
+            st.success(resultado.mensagem or "Sincronização concluída.")
+        else:
+            st.error(f"Erro ao sincronizar lojas: {resultado.erro}")
 
 
 def _importar_base_genericos(usuario: dict) -> None:
@@ -594,17 +773,22 @@ def _importar_base_genericos(usuario: dict) -> None:
         "ou de uma importação anterior) nunca é sobrescrito, só pulado."
     )
 
-    arquivo = st.file_uploader(
-        "Planilha Base Genéricos (.xlsx)", type=["xlsx", "xls"], key="base_genericos_upload"
-    )
+    leitor.leitor_planilha(_LEITOR_BASE, "Selecionar planilha Base Genéricos (.xlsx)")
+    _mostrar_planilha_recebida(_LEITOR_BASE)
+    recebida = leitor.planilha_recebida(_LEITOR_BASE)
+    if recebida and not _planilha_valida(base_genericos_integ.validar_planilha, recebida.df):
+        return
 
-    if arquivo and st.button("Processar planilha Base Genéricos", key="base_genericos_processar"):
+    if recebida and st.button("Processar planilha Base Genéricos", key="base_genericos_processar"):
         try:
-            with get_session() as session:
-                pasta_id = _subpasta(session, "Base Genéricos")
-                resultado = base_genericos_integ.processar_planilha_base_genericos(
-                    session, arquivo.getvalue(), arquivo.name, usuario["nome"], pasta_id,
-                )
+            with st.spinner("Processando a Base Genéricos..."):
+                with get_session() as session:
+                    pasta_id = _subpasta(session, "Base Genéricos")
+                    resultado = base_genericos_integ.processar_planilha_base_genericos(
+                        session, recebida.conteudo, recebida.nome, usuario["nome"], pasta_id,
+                        df=recebida.df, storage_key=recebida.storage_key, tamanho_bytes=recebida.tamanho_bytes,
+                    )
+            leitor.consumir(_LEITOR_BASE)
             st.success(resultado.mensagem)
         except Exception as exc:
             st.error(f"Erro ao processar planilha: {exc}")
@@ -629,8 +813,8 @@ def _fila_ean() -> None:
     usuario = auth.usuario_atual()
     st.markdown("##### Fila de Resolução de EAN")
     st.caption(
-        "Priorizada por: aparece em estoque agora (risco de contradição — dizer pra loja que ela "
-        "não tem o produto quando na verdade tem) e, dentro disso, por valor acumulado."
+        "Priorizada pelo valor de compra em jogo (quantidade × valor unitário nas compras vigentes) — "
+        "recalculado a cada envio, nunca somado envio a envio."
     )
 
     if "fila_ean_reprocesso_resultado" in st.session_state:
@@ -642,7 +826,8 @@ def _fila_ean() -> None:
             f"{r.limpeza.fila_resolucao_ean_corrigidos} na própria fila "
             f"({r.limpeza.fila_resolucao_ean_colisoes_mescladas} mesclados por colisão). "
             f"Reprocessamento: {r.itens_avaliados} itens pendentes avaliados — "
-            f"{r.resolvidos_automaticamente} resolvidos automaticamente, "
+            f"{r.resolvidos_por_ean_existente} resolvidos por EAN já cadastrado na Base Genéricos, "
+            f"{r.resolvidos_automaticamente} resolvidos automaticamente (fuzzy-match), "
             f"{r.sugestao_atualizada} com sugestão nova, {r.sem_mudanca} sem mudança relevante."
         )
 
@@ -675,13 +860,18 @@ def _fila_ean() -> None:
             return
 
         for item in itens:
-            marcador_estoque = " · " + theme.badge("em estoque", "alterado") if item.aparece_em_estoque else ""
-            with st.expander(f"{item.descricao_observada}  —  EAN {item.ean}"):
+            # Expander preguiçoso: o seletor com todos os genéricos (milhares
+            # de opções) só é montado no item aberto — antes era montado em
+            # TODOS os itens listados, a cada clique na tela.
+            painel = st.expander(
+                f"{item.descricao_observada}  —  EAN {item.ean}", key=f"exp_fila_ean_{item.id}", on_change="rerun",
+            )
+            if not painel.open:
+                continue
+            with painel:
                 st.markdown(
                     f"{ui.formatar_moeda(float(item.valor_total_acumulado))} acumulado · "
                     f"{item.qtd_ocorrencias} ocorrência(s) · origem {item.origem.value.upper()}"
-                    f"{marcador_estoque}",
-                    unsafe_allow_html=True,
                 )
 
                 if item.sugestao_base_generico_id is not None:
@@ -730,7 +920,8 @@ def _fila_cnpj_orfao() -> None:
     st.markdown("##### Fila de CNPJ Órfão")
     st.caption(
         "CNPJs que apareceram numa compra do GPS mas não batem com nenhuma loja cadastrada. "
-        "Vincular a uma loja reprocessa automaticamente as compras que tinham ficado de fora."
+        "Vincular a uma loja passa na hora as compras desse CNPJ para a loja — e os próximos envios "
+        "já reconhecem o vínculo."
     )
 
     with get_session() as session:
@@ -761,7 +952,10 @@ def _fila_cnpj_orfao() -> None:
 
         for item in itens:
             titulo = f"{item.razao_social_observada or 'Razão social não informada'} — CNPJ {item.cnpj}"
-            with st.expander(titulo):
+            painel = st.expander(titulo, key=f"exp_fila_cnpj_{item.id}", on_change="rerun")
+            if not painel.open:
+                continue
+            with painel:
                 st.markdown(
                     f"{ui.formatar_moeda(float(item.valor_total_acumulado))} acumulado · "
                     f"{item.qtd_ocorrencias} ocorrência(s)"
@@ -775,13 +969,13 @@ def _fila_cnpj_orfao() -> None:
                         key=f"select_loja_{item.id}",
                     )
                     if escolha != "—" and st.button(
-                        "Vincular e reprocessar", key=f"vincular_cnpj_{item.id}", use_container_width=True
+                        "Vincular à loja", key=f"vincular_cnpj_{item.id}", use_container_width=True
                     ):
                         with get_session() as s2:
                             total = gps_integ.resolver_cnpj_orfao(
                                 s2, item.id, opcoes_loja_id_por_nome[escolha], usuario["nome"]
                             )
-                        st.success(f"{total} compra(s) reprocessada(s) e importada(s).")
+                        st.success(f"{total} compra(s) passada(s) para a loja.")
                         st.rerun()
 
                 if st.button("Ignorar este CNPJ", key=f"ignorar_cnpj_{item.id}", use_container_width=True):
@@ -792,17 +986,30 @@ def _fila_cnpj_orfao() -> None:
 
 def render() -> None:
     theme.cabecalho("Dados", "Status das integrações, importação de planilhas e filas de pendência.")
+    # Toda ação que muda os dados da análise (envios, EAN/CNPJ resolvido,
+    # exclusões) acontece nesta aba: descartar o cálculo guardado aqui faz
+    # as telas de análise sempre refletirem o que acabou de mudar.
+    analise_comum.invalidar()
+    _sincronizar_lojas_automatico()
     _painel_integracoes()
     st.markdown(f'<p class="rmc-muted">Armazenamento: {fs.modo_storage()}</p>', unsafe_allow_html=True)
 
+    # Abas preguiçosas: só a aba aberta é calculada. Sem isso, qualquer clique
+    # (inclusive escolher uma planilha) redesenhava as quatro — e as filas,
+    # com centenas de itens, custavam segundos por clique.
     aba_explorador, aba_importar, aba_fila_ean, aba_fila_cnpj = st.tabs(
-        ["Explorador de Arquivos", "Importar Planilhas", "Fila de Resolução de EAN", "Fila de CNPJ Órfão"]
+        ["Explorador de Arquivos", "Importar Planilhas", "Fila de Resolução de EAN", "Fila de CNPJ Órfão"],
+        key="dados_abas", on_change="rerun",
     )
-    with aba_explorador:
-        _explorador()
-    with aba_importar:
-        _importar_planilhas()
-    with aba_fila_ean:
-        _fila_ean()
-    with aba_fila_cnpj:
-        _fila_cnpj_orfao()
+    if aba_explorador.open:
+        with aba_explorador:
+            _explorador()
+    if aba_importar.open:
+        with aba_importar:
+            _importar_planilhas()
+    if aba_fila_ean.open:
+        with aba_fila_ean:
+            _fila_ean()
+    if aba_fila_cnpj.open:
+        with aba_fila_cnpj:
+            _fila_cnpj_orfao()

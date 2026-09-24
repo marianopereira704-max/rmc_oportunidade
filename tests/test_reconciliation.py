@@ -185,13 +185,15 @@ def test_ignorar_fila(session):
     assert fila_atualizada.status == StatusFila.IGNORADA
 
 
-def test_listar_fila_priorizada_ordem_estoque_depois_valor(session):
+def test_listar_fila_priorizada_ordena_so_por_valor(session):
+    """O estoque saiu da análise (09/2026): "aparece em estoque" não passa
+    mais ninguém na frente — só o valor de compra em jogo decide."""
     motor.upsert_fila_resolucao(session, ean="A", descricao_observada="a", origem=OrigemFila.GPS, valor=1000, aparece_em_estoque=False)
     motor.upsert_fila_resolucao(session, ean="B", descricao_observada="b", origem=OrigemFila.GPS, valor=10, aparece_em_estoque=True)
     motor.upsert_fila_resolucao(session, ean="C", descricao_observada="c", origem=OrigemFila.GPS, valor=500, aparece_em_estoque=True)
 
     resultado = motor.listar_fila_priorizada(session)
-    assert [f.ean for f in resultado] == ["C", "B", "A"]
+    assert [f.ean for f in resultado] == ["A", "C", "B"]
 
 
 # ---------------------------------------------------------------------------
@@ -538,3 +540,78 @@ def test_reprocessar_fila_rodar_duas_vezes_na_faixa_media_nao_conta_como_nova_su
     assert segundo.itens_avaliados == 1  # ainda pendente, entra de novo
     assert segundo.sugestao_atualizada == 0  # mesma sugestão de antes -> sem mudança
     assert segundo.sem_mudanca == 1
+
+
+def test_reprocessar_fila_resolve_por_ean_ja_existente_sem_precisar_de_fuzzy_match(session, monkeypatch):
+    """Cenário real do pedido do cliente: a Base Genéricos curada foi
+    importada (criando EanGenerico direto pelo EAN, via
+    `importar_base_genericos`) DEPOIS que este item já tinha caído na fila
+    com uma descrição observada que não bate em nada por fuzzy-match. O
+    reprocessamento tem que resolver pela correspondência exata do EAN,
+    sem nem precisar tentar o fuzzy-match."""
+    generico = _criar_generico(session, "Cloridrato de Metformina 850mg")
+    fila = motor.upsert_fila_resolucao(
+        session, ean="7891000000099", descricao_observada="descrição de origem, nada parecida",
+        origem=OrigemFila.GPS, valor=250,
+    )
+    # Simula a importação da Base Genéricos curada acontecendo depois: cria
+    # o EanGenerico direto, sem passar pela fila (igual a
+    # `importar_base_genericos` faz).
+    session.add(
+        EanGenerico(
+            ean="7891000000099",
+            base_generico_id=generico.id,
+            origem_resolucao=OrigemResolucao.IMPORTADA,
+            descricao_origem_snapshot="Cloridrato de Metformina 850mg",
+            resolvido_por="planilha curada",
+        )
+    )
+    session.flush()
+
+    def _buscar_candidatos_nao_deveria_ser_chamado(*args, **kwargs):
+        raise AssertionError(
+            "buscar_candidatos (fuzzy-match) não deveria ser chamado quando o "
+            "EAN já tem uma resolução exata em EanGenerico."
+        )
+
+    monkeypatch.setattr(motor, "buscar_candidatos", _buscar_candidatos_nao_deveria_ser_chamado)
+
+    resultado = motor.reprocessar_fila_resolucao(session)
+
+    assert resultado.itens_avaliados == 1
+    assert resultado.resolvidos_por_ean_existente == 1
+    assert resultado.resolvidos_automaticamente == 0
+    assert resultado.sugestao_atualizada == 0
+    assert resultado.sem_mudanca == 0
+    fila_atualizada = session.get(FilaResolucaoEAN, fila.id)
+    assert fila_atualizada.status == StatusFila.RESOLVIDA
+    # não duplicou o EanGenerico que já existia
+    assert session.query(EanGenerico).filter_by(ean="7891000000099").count() == 1
+
+
+def test_reprocessar_fila_por_ean_existente_e_idempotente(session, monkeypatch):
+    generico = _criar_generico(session, "Sinvastatina 40mg")
+    motor.upsert_fila_resolucao(
+        session, ean="7891000000098", descricao_observada="nada a ver",
+        origem=OrigemFila.GPS, valor=100,
+    )
+    session.add(
+        EanGenerico(
+            ean="7891000000098", base_generico_id=generico.id,
+            origem_resolucao=OrigemResolucao.IMPORTADA,
+            descricao_origem_snapshot="Sinvastatina 40mg",
+            resolvido_por="planilha curada",
+        )
+    )
+    session.flush()
+    monkeypatch.setattr(
+        motor, "buscar_candidatos",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("não deveria chamar fuzzy-match")),
+    )
+
+    primeiro = motor.reprocessar_fila_resolucao(session)
+    segundo = motor.reprocessar_fila_resolucao(session)
+
+    assert primeiro.resolvidos_por_ean_existente == 1
+    assert segundo.itens_avaliados == 0  # já resolvido, nem entra na segunda passada
+    assert segundo.resolvidos_por_ean_existente == 0

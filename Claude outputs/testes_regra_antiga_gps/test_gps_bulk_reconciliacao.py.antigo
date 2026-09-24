@@ -1,0 +1,308 @@
+"""Testes do item 4/5 da reforma: o upload de GPS para de chamar
+`reconciliation_motor.resolver_ean` por LINHA (o bug real: um EAN pendente
+repetido em N linhas custava N idas ao banco, medido como a causa dominante
+da lentidão de upload — não o rapidfuzz) e passa a reconciliar em bloco, uma
+vez por EAN DISTINTO ainda pendente, depois que todas as linhas já foram
+lidas.
+
+Dois grupos de prova:
+
+1. `test_nenhuma_consulta_de_reconciliacao_escala_com_numero_de_linhas` —
+   conta as consultas SQL feitas contra `ean_genericos`/`fila_resolucao_ean`
+   durante um upload com muitas linhas repetindo poucos EANs distintos, e
+   prova que o número de consultas acompanha a quantidade de EANs
+   DISTINTOS, não a quantidade de LINHAS. É a prova negativa: se alguém
+   reintroduzir uma consulta dentro do laço principal, este teste detecta
+   pelo contador de queries subir junto com o número de linhas.
+
+2. Os demais testes provam que agregar em memória e reconciliar depois
+   produz o MESMO resultado final que resolver_ean sendo chamado uma vez
+   por linha produziria — soma de valor, contagem de ocorrências,
+   descrição mais recente, e o comportamento de "aparece em estoque".
+"""
+from __future__ import annotations
+
+import io
+
+import pandas as pd
+import pytest
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.orm import Session
+
+from core.models import (
+    Base,
+    BaseGenerico,
+    EanGenerico,
+    FilaResolucaoEAN,
+    Loja,
+    OrigemFila,
+    OrigemResolucao,
+    StatusFila,
+)
+from integrations import gps as gps_integ
+from storage import filesystem as fs
+
+
+def _xlsx_bytes(linhas: list[dict]) -> bytes:
+    df = pd.DataFrame(linhas)
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False)
+    return buffer.getvalue()
+
+
+@pytest.fixture()
+def session(tmp_path, monkeypatch):
+    from core import config as core_config
+
+    monkeypatch.setattr(core_config.settings, "local_storage_dir", tmp_path)
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    with Session(engine) as s:
+        yield s
+
+
+@pytest.fixture()
+def pasta_raiz_id(session):
+    return fs.garantir_raiz(session).id
+
+
+def _criar_lojas(session, quantidade: int, uf="SP") -> list[Loja]:
+    lojas = []
+    for i in range(quantidade):
+        loja = Loja(
+            cnpj=f"{i:014d}", razao_social=f"Farmácia {i}", uf=uf, cidade="São Paulo",
+        )
+        session.add(loja)
+        lojas.append(loja)
+    session.flush()
+    return lojas
+
+
+class _ContadorDeConsultas:
+    """Conta, por tabela, quantas vezes um SELECT/INSERT/UPDATE foi emitido
+    — usado pra provar que o número de consultas de reconciliação escala
+    com EANs distintos, não com linhas do arquivo."""
+
+    def __init__(self, engine):
+        self.selects_ean_genericos = 0
+        self.consultas_fila = 0  # SELECT ou INSERT/UPDATE em fila_resolucao_ean
+        self._engine = engine
+
+    def _ouvir(self, conn, cursor, statement, parameters, context, executemany):
+        sql = statement.lower()
+        if "ean_genericos" in sql and sql.strip().startswith("select"):
+            self.selects_ean_genericos += 1
+        if "fila_resolucao_ean" in sql:
+            self.consultas_fila += 1
+
+    def __enter__(self):
+        event.listen(self._engine, "before_cursor_execute", self._ouvir)
+        return self
+
+    def __exit__(self, *exc):
+        event.remove(self._engine, "before_cursor_execute", self._ouvir)
+
+
+def test_nenhuma_consulta_de_reconciliacao_escala_com_numero_de_linhas(session, pasta_raiz_id):
+    """O teste central deste item. 400 linhas, todas do MESMO EAN nunca
+    visto antes (sem BaseGenerico cadastrado -> cai na fila, sem sugestão),
+    espalhadas por 400 lojas diferentes (pra cada linha ser uma compra
+    DISTINTA de verdade, não uma atualização da mesma chave).
+
+    Antes da correção: 1 SELECT em EanGenerico por LINHA pra este EAN (bug
+    medido, ver docstring do módulo) -> 400 consultas.
+    Depois: no máximo poucas consultas fixas, independente de serem 400 ou
+    40.000 linhas — o número de EANs DISTINTOS pendentes é 1.
+    """
+    _criar_lojas(session, 400)
+    linhas = [
+        {
+            "cnpj": f"{i:014d}", "ean": "7891234567890", "descricao": "GENERICO NUNCA VISTO 500MG",
+            "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0,
+        }
+        for i in range(400)
+    ]
+    conteudo = _xlsx_bytes(linhas)
+
+    with _ContadorDeConsultas(session.get_bind()) as contador:
+        gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
+
+    # 1 EAN distinto pendente -> um número PEQUENO e FIXO de consultas, bem
+    # abaixo das 400 linhas do arquivo. Uma margem generosa (10) cobre o
+    # SELECT de EanGenerico dentro de resolver_ean + o SELECT/INSERT da
+    # fila, sem prender o teste a um número exato de baixo nível.
+    assert contador.selects_ean_genericos < 10, (
+        f"esperava poucas consultas a ean_genericos (independente de 400 linhas), "
+        f"achei {contador.selects_ean_genericos} — sinal de que a reconciliação "
+        f"voltou a rodar por linha, não por EAN distinto"
+    )
+    assert contador.consultas_fila < 10, (
+        f"esperava poucas consultas a fila_resolucao_ean, achei {contador.consultas_fila}"
+    )
+
+    fila = session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "7891234567890")).scalar_one()
+    assert fila.qtd_ocorrencias == 400
+    assert float(fila.valor_total_acumulado) == pytest.approx(400 * 10.0)
+    assert fila.aparece_em_estoque is False
+
+
+def test_consultas_crescem_com_eans_distintos_nao_com_linhas(session, pasta_raiz_id):
+    """Complemento do teste acima: com 5 EANs distintos pendentes (e 200
+    linhas no total), o número de consultas acompanha os 5 EANs, não as
+    200 linhas — prova que o limite é por EAN distinto, não uma constante
+    artificial que mascare uma regressão pequena."""
+    _criar_lojas(session, 200)
+    eans_distintos = [f"78900000{i}0" for i in range(5)]
+    linhas = [
+        {
+            "cnpj": f"{i:014d}", "ean": eans_distintos[i % 5], "descricao": f"PRODUTO PENDENTE {i % 5}",
+            "quantidade": 1, "fat_liquido": 5.0, "pct_cmv": 0.5, "estoque": 0,
+        }
+        for i in range(200)
+    ]
+    conteudo = _xlsx_bytes(linhas)
+
+    with _ContadorDeConsultas(session.get_bind()) as contador:
+        gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
+
+    assert contador.selects_ean_genericos < 5 + 8
+    for ean in eans_distintos:
+        fila = session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == ean)).scalar_one()
+        assert fila.qtd_ocorrencias == 40
+        assert float(fila.valor_total_acumulado) == pytest.approx(40 * 5.0)
+
+
+def test_ean_ja_resolvido_nao_gera_nenhuma_entrada_na_fila(session, pasta_raiz_id):
+    """EAN que já tem `EanGenerico` ANTES do upload nunca deveria aparecer
+    na fila — a checagem em memória contra `cache_eans_resolvidos` (bulk,
+    1 SELECT no início) tem que filtrar ele antes mesmo da fase de
+    reconciliação em lote rodar."""
+    generico = BaseGenerico(nome_canonico="DIPIRONA 500MG 10CPR")
+    session.add(generico)
+    session.flush()
+    session.add(EanGenerico(
+        ean="111222333", base_generico_id=generico.id, origem_resolucao=OrigemResolucao.MANUAL,
+        descricao_origem_snapshot="DIPIRONA", resolvido_por="admin",
+    ))
+    session.flush()
+
+    _criar_lojas(session, 50)
+    linhas = [
+        {
+            "cnpj": f"{i:014d}", "ean": "111222333", "descricao": "DIPIRONA 500MG 10CPR",
+            "quantidade": 1, "fat_liquido": 20.0, "pct_cmv": 0.5, "estoque": 1,
+        }
+        for i in range(50)
+    ]
+    conteudo = _xlsx_bytes(linhas)
+
+    with _ContadorDeConsultas(session.get_bind()) as contador:
+        gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
+
+    assert session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "111222333")).scalar_one_or_none() is None
+    # zero EANs pendentes -> a fase de reconciliação nem chega a rodar
+    assert contador.consultas_fila == 0
+
+
+def test_descricao_final_na_fila_e_a_ultima_do_arquivo_por_ordem(session, pasta_raiz_id):
+    """Mesmo critério que `upsert_fila_resolucao` já aplicava chamada a
+    chamada (sobrescreve a descrição se a nova for não-vazia) — agregando
+    em memória em vez de em N chamadas, o resultado final tem que ser
+    idêntico: a ÚLTIMA descrição não-vazia na ordem do arquivo."""
+    _criar_lojas(session, 3)
+    linhas = [
+        {"cnpj": "00000000000000", "ean": "555000111", "descricao": "PRODUTO X (descricao antiga)",
+         "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0},
+        {"cnpj": "00000000000001", "ean": "555000111", "descricao": "",
+         "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0},
+        {"cnpj": "00000000000002", "ean": "555000111", "descricao": "PRODUTO X (descricao corrigida)",
+         "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0},
+    ]
+    conteudo = _xlsx_bytes(linhas)
+    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
+
+    fila = session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "555000111")).scalar_one()
+    assert fila.descricao_observada == "PRODUTO X (descricao corrigida)"
+    assert fila.qtd_ocorrencias == 3
+
+
+def test_aparece_em_estoque_e_verdadeiro_se_qualquer_linha_do_arquivo_tiver_estoque(session, pasta_raiz_id):
+    """OR entre as ocorrências, igual ao comportamento anterior — uma única
+    loja com estoque > 0 entre várias sem estoque já marca o item da fila
+    como "aparece em estoque"."""
+    _criar_lojas(session, 3)
+    linhas = [
+        {"cnpj": "00000000000000", "ean": "555000222", "descricao": "PRODUTO Y",
+         "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0},
+        {"cnpj": "00000000000001", "ean": "555000222", "descricao": "PRODUTO Y",
+         "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 5},
+        {"cnpj": "00000000000002", "ean": "555000222", "descricao": "PRODUTO Y",
+         "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0},
+    ]
+    conteudo = _xlsx_bytes(linhas)
+    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
+
+    fila = session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "555000222")).scalar_one()
+    assert fila.aparece_em_estoque is True
+
+
+def test_upload_com_generico_cadastrado_ainda_auto_aceita_em_lote(session, pasta_raiz_id, monkeypatch):
+    """A fase 1 (este item) NÃO muda a política de aceite automático — só
+    onde/quando `resolver_ean` é chamado. Um EAN novo cuja descrição bate
+    forte com um BaseGenerico ativo ainda deve ser auto-aceito (criar
+    `EanGenerico`), só que numa única chamada em lote, não mais uma vez
+    por linha. (A política de exigir confirmação humana sempre é a
+    Fase 2 — item 12 — ainda não implementada.)"""
+    from reconciliation.motor import settings as motor_settings
+
+    monkeypatch.setattr(motor_settings.reconciliacao, "limiar_auto_aceite", 90)
+    monkeypatch.setattr(motor_settings.reconciliacao, "limiar_fila_media", 70)
+
+    generico = BaseGenerico(nome_canonico="AMOXICILINA 500MG 21CPR")
+    session.add(generico)
+    session.flush()
+
+    _criar_lojas(session, 10)
+    linhas = [
+        {"cnpj": f"{i:014d}", "ean": "999888777", "descricao": "AMOXICILINA 500MG 21CPR",
+         "quantidade": 1, "fat_liquido": 30.0, "pct_cmv": 0.5, "estoque": 0}
+        for i in range(10)
+    ]
+    conteudo = _xlsx_bytes(linhas)
+    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
+
+    vinculo = session.execute(select(EanGenerico).where(EanGenerico.ean == "999888777")).scalar_one()
+    assert vinculo.base_generico_id == generico.id
+    assert vinculo.origem_resolucao == OrigemResolucao.AUTOMATICA
+    assert session.execute(
+        select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "999888777")
+    ).scalar_one_or_none() is None
+
+
+def test_reprocesso_de_cnpj_orfao_tambem_reconcilia_em_lote(session, pasta_raiz_id):
+    """`_reprocessar_cnpjs` reaproveita `_processar_linhas` — a mesma
+    reforma tem que valer pra ele também, sem um segundo caminho de código
+    fazendo reconciliação por linha."""
+    conteudo = _xlsx_bytes([
+        {"cnpj": "11.111.111/0001-11", "ean": "444555666", "descricao": "PRODUTO ORFAO",
+         "quantidade": 5, "fat_liquido": 500.0, "pct_cmv": 0.5, "estoque": 2,
+         "razaosocial": "Farmácia Desconhecida"},
+    ])
+    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-07")
+
+    loja = Loja(cnpj="11.111.111/0001-11", razao_social="Farmácia Agora Cadastrada", uf="SP", cidade="SP")
+    session.add(loja)
+    session.flush()
+
+    from core.models import FilaCnpjOrfao
+
+    fila_orfao = session.execute(
+        select(FilaCnpjOrfao).where(FilaCnpjOrfao.cnpj == "11111111000111")
+    ).scalar_one()
+
+    total_inseridas = gps_integ.resolver_cnpj_orfao(session, fila_orfao.id, loja.id, resolvido_por="admin")
+    assert total_inseridas == 1
+
+    fila_ean = session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "444555666")).scalar_one()
+    assert fila_ean.qtd_ocorrencias == 1
+    assert float(fila_ean.valor_total_acumulado) == pytest.approx(500.0)

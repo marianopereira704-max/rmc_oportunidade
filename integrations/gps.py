@@ -1,95 +1,109 @@
-"""Integração com o GPS (compras das lojas) — 100% manual (upload de
-planilha pelo admin), sem API prevista.
+"""Integração com o GPS (compras das lojas) — upload manual da planilha
+exportada do BI.
 
-Cada upload cobre UM mês de compras (`ano_mes`, escolhido pelo admin no
-popup — a planilha real não traz isso numa coluna própria). O arquivo já traz
-o estoque atual junto (coluna `QtdEstoque` na mesma linha da compra — não é
-upload separado, ver core/models.py).
+Regra de negócio (decidida em 09/2026):
+- Uma linha vale como COMPRA quando tem `VlrUnitario > 0` e `Quantidade > 0`.
+  O custo unitário é o `VlrUnitario` (preço de compra SEM ST — comparável à
+  tabela Gruppy, que também não tem imposto) e a quantidade é a `Quantidade`
+  comprada no mês. A exportação traz também linhas só de VENDA (sem esses
+  dois campos): elas são ignoradas. Estoque não faz mais parte da análise.
+- Cada envio cobre um mês (`ano_mes`, informado por quem envia) e SUBSTITUI,
+  naquele mês, os dados de todos os CNPJs presentes no arquivo — e só deles.
+  Um CNPJ que não veio no arquivo continua como estava. É o que permite
+  dividir a exportação do BI em vários arquivos (por UF, por exemplo) e
+  reenviar um deles depois pra atualizar os dados.
+- A substituição é TUDO OU NADA: apaga e regrava numa única transação. Se
+  qualquer coisa falhar no meio, o banco fica exatamente como antes do envio.
+- CNPJ que não bate com nenhuma loja vai para `compras_gps_orfas` (mesma
+  regra de substituição) e a fila de CNPJ órfão é recalculada a partir de lá.
+  Vincular o CNPJ a uma loja MOVE essas compras para a loja — sem reabrir
+  nenhum .xlsx — e o vínculo vale para os envios seguintes também.
+- A fila de EAN é recalculada a partir das compras vigentes (nunca somada
+  envio a envio — reenviar o mesmo mês não infla a prioridade).
 
-Três coisas acontecem por linha:
-1. Linha de lixo (CNPJ vazio, campo numérico que não parseia) é ignorada e
-   contada — nunca processada como se fosse dado real.
-2. CNPJ que não bate com nenhuma Loja cadastrada vai pra fila de CNPJ órfão
-   (nunca é descartado). Vincular um item da fila a uma loja (manual, 1 por
-   vez) reprocessa automaticamente via `resolver_cnpj_orfao` — relê os
-   arquivos GPS já enviados e insere as linhas daquele CNPJ que tinham
-   ficado de fora. `resolver_cnpjs_orfaos_identicos_em_lote` faz o mesmo pra
-   todos os CNPJs cujo texto bate exato com uma Loja já cadastrada, de uma
-   vez só — os dois reaproveitam `_reprocessar_cnpjs`, que lê cada arquivo
-   uma única vez independente de quantos CNPJs estão sendo resolvidos.
-3. EAN da linha é reconciliado contra a Base Genéricos via
-   `reconciliation.motor.resolver_ean` (side-effect: resolve ou enfileira).
-
-Planilha esperada (nomes de coluna flexíveis, sem acento/maiúscula):
-  cnpj                         -> CNPJ da loja
-  ean | codigo | sku           -> EAN do produto
-  descricao | produto          -> descrição de origem
-  quantidade | qtd             -> quantidade comprada no mês
-  faturamentoliquido | fatliquido -> valor total pago no mês (Fat_liquido)
-  pctcmv | percentualcmv       -> % de CMV (fração 0-1 ou percentual 0-100,
-                                   normalizado automaticamente)
-  qtdestoque | estoque         -> estoque atual (mesma linha/arquivo)
-  laboratorio | fornecedor (opcional) -> pode ficar vazio, nunca "não informado"
-  razaosocial (opcional)       -> só usada se o CNPJ cair na fila de órfãos
+A leitura do .xlsx não acontece aqui: o navegador lê a planilha e entrega um
+DataFrame (ver integrations/planilha_navegador.py). Este módulo recebe esse
+DataFrame, prepara as compras (`preparar_compras`, puro e rápido) e grava
+(`aplicar_compras`, uma transação) — sem nenhuma consulta ao banco dentro de
+laço: tudo em lote.
 """
 from __future__ import annotations
 
-import io
-import json
+import datetime as dt
 import logging
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
+import numpy as np
 import pandas as pd
-from sqlalchemy import bindparam, delete, insert, select, update
+from sqlalchemy import delete, func, insert, select
 from sqlalchemy.orm import Session
 
 from core.config import settings
-from core.models import FilaCnpjOrfao, FSNode, Loja, OrigemFila, RegistroCompraGPS, StatusFila, StatusNode, UploadGPS
-from integrations import mapeamento as mapeamento_integ
+from core.models import (
+    CompraGPSOrfa,
+    FilaCnpjOrfao,
+    FilaResolucaoEAN,
+    FSNode,
+    Loja,
+    OrigemFila,
+    RegistroCompraGPS,
+    StatusFila,
+    UploadGPS,
+)
+from core.sql import insert_com_atualizacao
+from integrations import gps_cache_orfaos
 from integrations.base import IntegrationAdapter, ResultadoSincronizacao, StatusIntegracao
 from reconciliation import motor as reconciliation_motor
-from reconciliation.normalizador import normalizar_ean, normalizar_percentual
-from storage import filesystem
+from reconciliation.normalizador import normalizar_ean
 
 logger = logging.getLogger(__name__)
 
-# Sinônimos de coluna aceitos na planilha não ficam mais fixos aqui — vêm de
-# `settings.colunas.gps` (core/config.py), configuráveis via secrets/env
-# sem precisar editar código.
+# Campo -> rótulo exibido no popup de mapeamento.
+CAMPOS_OBRIGATORIOS = {"cnpj", "ean", "descricao", "quantidade", "custo_unitario"}
+CAMPOS_OPCIONAIS = ("laboratorio", "razao_social", "fat_liquido", "pct_cmv", "qtd_vendida", "custo_medio")
+
+# Campos de RECUO de preço guardados em cada compra (ver core/analise.py):
+# usados só quando o VlrUnitario destoa do preço do laboratório escolhido.
+CAMPOS_RECUO = ("fat_liquido", "pct_cmv", "qtd_vendida", "custo_cmv_unitario", "custo_medio_planilha")
+
+_TAMANHO_BLOCO = 5000  # linhas por INSERT em lote
+_TAMANHO_BLOCO_CHAVES = 1000  # itens por cláusula IN
 
 
 def _normalizar_coluna(col: str) -> str:
-    """Só letras e dígitos sobrevivem — não só espaço/underscore. Planilha
-    real trouxe "Fat. líquido" (ponto) e "% CMV" (o "%cmv" só batia com o
-    sinônimo por coincidência); qualquer pontuação no cabeçalho (ponto, %,
-    hífen, barra) precisa cair fora pra comparar de forma robusta contra os
-    sinônimos de settings.colunas.gps, em vez de exigir um sinônimo novo
-    toda vez que aparece uma variação de pontuação."""
+    """Só letras e dígitos sobrevivem ("Fat. líquido" -> "fatliquido",
+    "% CMV" -> "cmv"), pra comparar cabeçalhos contra os sinônimos de
+    `settings.colunas.gps` sem depender de pontuação."""
     col = unicodedata.normalize("NFKD", str(col)).encode("ascii", "ignore").decode()
     return re.sub(r"[^a-z0-9]", "", col.strip().lower())
 
 
-CAMPOS_OBRIGATORIOS = {"cnpj", "ean", "descricao", "quantidade", "fat_liquido", "pct_cmv", "estoque"}
-
-
 def detectar_colunas_automatico(df: pd.DataFrame) -> dict[str, str]:
     """Sugestão por sinônimo, sem validar se todo campo obrigatório foi
-    encontrado — usada tanto por `mapear_colunas` (que valida) quanto pelo
-    popup de confirmação de mapeamento (que precisa da sugestão mesmo
-    incompleta, pro usuário preencher manualmente o que faltar)."""
-    colunas = settings.colunas.gps
-    mapa: dict[str, str] = {}
+    encontrado (o popup precisa da sugestão mesmo incompleta).
+
+    A PRIORIDADE é a ordem dos sinônimos de cada campo, não a ordem das
+    colunas na planilha. Isso importa de verdade: a exportação do BI traz
+    `QTD` (quantidade VENDIDA) antes de `Quantidade` (quantidade COMPRADA) —
+    varrendo pela ordem das colunas, a quantidade vendida ganhava. Uma coluna
+    também nunca é sugerida para dois campos."""
+    sinonimos = settings.colunas.gps
+    colunas_por_nome: dict[str, str] = {}
     for col in df.columns:
-        norm = _normalizar_coluna(col)
-        for chave in (
-            "cnpj", "ean", "descricao", "quantidade", "fat_liquido",
-            "pct_cmv", "estoque", "laboratorio", "razao_social",
-        ):
-            if norm in set(colunas.get(chave, [])) and chave not in mapa:
-                mapa[chave] = col
+        colunas_por_nome.setdefault(_normalizar_coluna(col), col)
+
+    mapa: dict[str, str] = {}
+    usadas: set[str] = set()
+    for campo in (*sorted(CAMPOS_OBRIGATORIOS), *CAMPOS_OPCIONAIS):
+        for sinonimo in sinonimos.get(campo, []):
+            coluna = colunas_por_nome.get(sinonimo)
+            if coluna is not None and coluna not in usadas:
+                mapa[campo] = coluna
+                usadas.add(coluna)
+                break
     return mapa
 
 
@@ -104,11 +118,22 @@ def mapear_colunas(df: pd.DataFrame) -> dict[str, str]:
     return mapa
 
 
+def listar_uploads_gps_no_mes(session: Session, ano_mes: str) -> list[UploadGPS]:
+    return list(
+        session.execute(
+            select(UploadGPS).where(UploadGPS.ano_mes == ano_mes).order_by(UploadGPS.criado_em)
+        ).scalars().all()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Normalização de valores
+# ---------------------------------------------------------------------------
+
 def _somente_digitos(valor) -> str:
     """CNPJ pode chegar formatado ("30.208.213/0001-74"), como texto puro de
-    dígitos, ou (perigo comum de Excel) como número que perdeu zeros à
-    esquerda — normalizamos tudo pra 14 dígitos com zero-padding antes de
-    comparar/gravar, nunca comparando string formatada contra string crua."""
+    dígitos, ou como número que perdeu zeros à esquerda — normaliza tudo pra
+    14 dígitos com zero-padding, nunca comparando string formatada com crua."""
     if valor is None:
         return ""
     if isinstance(valor, float):
@@ -119,59 +144,425 @@ def _somente_digitos(valor) -> str:
     return texto.zfill(14) if texto else ""
 
 
-def _linha_e_lixo(cnpj_digitos: str, ean: str) -> bool:
-    return not cnpj_digitos or not ean or ean.lower() == "nan"
+def _texto_ou_vazio(valor) -> str:
+    return str(valor).strip() if pd.notna(valor) else ""
 
 
-def _serializar_ids(ids: set[int]) -> str:
-    return json.dumps(sorted(ids))
+def _texto_ou_nulo(valor) -> str | None:
+    """Ausência é None (NULL no banco), nunca "" nem o texto "nan"."""
+    if not pd.notna(valor):
+        return None
+    texto = str(valor).strip()
+    return texto if texto and texto.lower() != "nan" else None
 
 
-def _desserializar_ids(texto: str | None) -> set[int]:
-    """`set()` tanto pra texto vazio/nulo (fila de antes deste campo existir)
-    quanto pra JSON inválido — nunca levanta, o chamador trata um resultado
-    vazio como "não sei em quais uploads apareceu" (ver
-    `_reprocessar_cnpjs`), igual ao padrão de
-    `integrations/mapeamento.py::desserializar_mapa`."""
-    if not texto:
-        return set()
-    try:
-        carregado = json.loads(texto)
-    except (TypeError, ValueError):
-        return set()
-    return set(carregado) if isinstance(carregado, list) else set()
+def _mapear_por_valor_distinto(serie: pd.Series, funcao: Callable) -> pd.Series:
+    """Aplica `funcao` uma vez por valor DISTINTO da coluna (centenas de CNPJs,
+    alguns milhares de EANs), não uma vez por linha (150 mil), e expande de
+    volta por indexação de array. Nulo vira `funcao(None)`, na última posição
+    — onde cai o código -1 do `factorize`. `dtype=object` impede o pandas de
+    converter os `None` devolvidos em NaN."""
+    codigos, unicos = pd.factorize(serie, use_na_sentinel=True)
+    saidas = np.empty(len(unicos) + 1, dtype=object)
+    for posicao, valor in enumerate(unicos):
+        saidas[posicao] = funcao(valor)
+    saidas[-1] = funcao(None)
+    return pd.Series(saidas[codigos], index=serie.index, dtype=object)
 
 
-def upsert_fila_cnpj_orfao(
-    session: Session, cnpj_digitos: str, razao_social: str | None, valor: float, fs_node_id: int,
-) -> FilaCnpjOrfao:
-    """`fs_node_id` é o upload GPS (FSNode) onde esta ocorrência do CNPJ
-    órfão apareceu — acumulado em `uploads_fs_node_ids_json` pra, na hora de
-    resolver o CNPJ, `_reprocessar_cnpjs` releia só os uploads relevantes em
-    vez de TODOS os uploads GPS já enviados."""
-    fila = session.execute(select(FilaCnpjOrfao).where(FilaCnpjOrfao.cnpj == cnpj_digitos)).scalar_one_or_none()
-    if fila is None:
-        fila = FilaCnpjOrfao(
-            cnpj=cnpj_digitos,
-            razao_social_observada=razao_social,
-            valor_total_acumulado=valor or 0,
-            qtd_ocorrencias=1,
-            status=StatusFila.PENDENTE,
-            uploads_fs_node_ids_json=_serializar_ids({fs_node_id}),
+def _fracao_de_percentual(numeros: pd.Series) -> pd.Series:
+    """% CMV pode vir em fração (0,61) ou em percentual (61). A escala é
+    decidida pela COLUNA inteira, nunca valor a valor: CMV acima de 100%
+    existe (1,12 = 112% numa coluna em fração) e dividir esse valor solto por
+    100 sumiria com ele. Maioria dos valores não-zero em [0, 1] = fração."""
+    validos = numeros[numeros.notna() & (numeros != 0)]
+    if validos.empty or (validos.abs() <= 1).mean() >= 0.5:
+        return numeros
+    return numeros / 100
+
+
+def _valor_ou_nulo(valor) -> float | None:
+    return None if valor is None or pd.isna(valor) else float(valor)
+
+
+def _numeros(serie: pd.Series) -> pd.Series:
+    """Número em C pra coluna inteira; só o que sobrar como texto ("1.234,56",
+    "R$ 12,50") paga a limpeza de string. Inconversível vira NaN."""
+    numeros = pd.to_numeric(serie, errors="coerce").astype(float)
+    resto = numeros.isna() & serie.notna()
+    if resto.any():
+        texto = (
+            serie[resto].astype(str).str.strip()
+            .str.replace(r"[R$\s]", "", regex=True)
+            .str.replace(".", "", regex=False)
+            .str.replace(",", ".", regex=False)
         )
-        session.add(fila)
-    else:
-        fila.valor_total_acumulado = float(fila.valor_total_acumulado or 0) + float(valor or 0)
-        fila.qtd_ocorrencias = (fila.qtd_ocorrencias or 0) + 1
-        if razao_social and not fila.razao_social_observada:
-            fila.razao_social_observada = razao_social
-        ids_existentes = _desserializar_ids(fila.uploads_fs_node_ids_json)
-        if fs_node_id not in ids_existentes:
-            ids_existentes.add(fs_node_id)
-            fila.uploads_fs_node_ids_json = _serializar_ids(ids_existentes)
-    session.flush()
-    return fila
+        numeros.loc[resto] = pd.to_numeric(texto, errors="coerce")
+    return numeros
 
+
+# ---------------------------------------------------------------------------
+# Preparação (pura, sem banco)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ComprasPreparadas:
+    # Uma linha por (cnpj, ean): cnpj, ean, descricao, laboratorio,
+    # razao_social, quantidade, custo_unitario.
+    compras: pd.DataFrame
+    # TODO CNPJ presente no arquivo, inclusive os que só tinham linhas de
+    # venda — é o conjunto que o envio substitui naquele mês.
+    cnpjs_no_arquivo: set[str]
+    linhas_total: int
+    linhas_sem_chave: int  # sem CNPJ ou EAN: rodapé, linha de total, lixo
+    linhas_sem_compra: int  # só venda: quantidade e valor de compra vazios
+    linhas_invalidas: int  # compra com quantidade ou valor <= 0 / inconversível
+    linhas_somadas: int = 0  # (cnpj, ean) repetido no arquivo, somado numa linha só
+
+
+def preparar_compras(df: pd.DataFrame, mapa: dict[str, str]) -> ComprasPreparadas:
+    faltando = CAMPOS_OBRIGATORIOS - mapa.keys()
+    if faltando:
+        raise ValueError(f"Mapeamento incompleto — faltam colunas para: {', '.join(sorted(faltando))}.")
+
+    def _coluna(campo: str) -> pd.Series:
+        if campo in mapa:
+            return df[mapa[campo]]
+        return pd.Series([None] * len(df), index=df.index, dtype=object)
+
+    cnpj = _mapear_por_valor_distinto(_coluna("cnpj"), _somente_digitos)
+    ean = _mapear_por_valor_distinto(_coluna("ean"), normalizar_ean)
+    bruto_quantidade = _coluna("quantidade")
+    bruto_custo = _coluna("custo_unitario")
+    quantidade = _numeros(bruto_quantidade)
+    custo = _numeros(bruto_custo)
+
+    tem_chave = cnpj.ne("") & ean.ne("")
+    sem_compra = tem_chave & bruto_quantidade.isna() & bruto_custo.isna()
+    valida = tem_chave & (quantidade > 0) & (custo > 0)
+    invalida = tem_chave & ~sem_compra & ~valida
+
+    selecao = valida.to_numpy()
+    compras = pd.DataFrame({
+        "cnpj": cnpj[selecao].to_numpy(),
+        "ean": ean[selecao].to_numpy(),
+        "descricao": _mapear_por_valor_distinto(_coluna("descricao")[selecao], _texto_ou_vazio).to_numpy(),
+        "laboratorio": _mapear_por_valor_distinto(_coluna("laboratorio")[selecao], _texto_ou_nulo).to_numpy(),
+        "razao_social": _mapear_por_valor_distinto(_coluna("razao_social")[selecao], _texto_ou_nulo).to_numpy(),
+        "quantidade": quantidade[selecao].to_numpy(),
+        "custo_unitario": custo[selecao].to_numpy(),
+    })
+    # Recuo de preço (opcional): custo CMV por unidade vendida = Fat × %CMV
+    # ÷ QTD, só quando os três existem e QTD > 0; e o "R$ Custo médio".
+    fat = _numeros(_coluna("fat_liquido"))[selecao].to_numpy()
+    pct = _fracao_de_percentual(_numeros(_coluna("pct_cmv")))[selecao].to_numpy()
+    qtd_vendida = _numeros(_coluna("qtd_vendida"))[selecao].to_numpy()
+    compras["fat_liquido"] = fat
+    compras["pct_cmv"] = pct
+    compras["qtd_vendida"] = qtd_vendida
+    compras["custo_cmv_unitario"] = _custo_cmv(fat, pct, qtd_vendida)
+    compras["custo_medio_planilha"] = _numeros(_coluna("custo_medio"))[selecao].to_numpy()
+    antes = len(compras)
+    compras = _somar_repetidas(compras, ["cnpj", "ean"])
+
+    return ComprasPreparadas(
+        compras=compras,
+        cnpjs_no_arquivo=set(cnpj[cnpj.ne("")].unique()),
+        linhas_total=len(df),
+        linhas_sem_chave=int((~tem_chave).sum()),
+        linhas_sem_compra=int(sem_compra.sum()),
+        linhas_invalidas=int(invalida.sum()),
+        linhas_somadas=antes - len(compras),
+    )
+
+
+def _custo_cmv(fat, pct, qtd_vendida):
+    """Fat × %CMV ÷ QTD por linha; NaN quando falta algum dos três ou QTD ≤ 0."""
+    fat, pct, qtd_vendida = (
+        pd.to_numeric(pd.Series(x), errors="coerce").to_numpy(dtype=float) for x in (fat, pct, qtd_vendida)
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(qtd_vendida > 0, fat * pct / qtd_vendida, np.nan)
+
+
+def _somar_repetidas(compras: pd.DataFrame, chave: list[str]) -> pd.DataFrame:
+    """A mesma chave repetida vira uma linha: quantidades somadas e custo
+    unitário MÉDIO PONDERADO pela quantidade (valor total ÷ quantidade total),
+    nunca a média simples. Textos, % CMV e Custo médio: fica o último. Fat e
+    QTD vendida somam, e o custo CMV por unidade é recalculado a partir deles.
+    Sem repetição (o caso normal), devolve o próprio DataFrame sem custo."""
+    if not compras.duplicated(chave).any():
+        return compras.reset_index(drop=True)
+    trabalho = compras.assign(_valor=compras["quantidade"] * compras["custo_unitario"])
+    ultimos = [
+        c for c in ("descricao", "laboratorio", "razao_social", "pct_cmv", "custo_medio_planilha", "upload_fs_node_id")
+        if c in compras.columns and c not in chave
+    ]
+    somados = [c for c in ("fat_liquido", "qtd_vendida") if c in compras.columns]
+    agregado = trabalho.groupby(chave, sort=False, dropna=False).agg(
+        quantidade=("quantidade", "sum"), _valor=("_valor", "sum"),
+        **{c: (c, "last") for c in ultimos},
+        **{c: (c, lambda serie: serie.sum(min_count=1)) for c in somados},
+    ).reset_index()
+    agregado["custo_unitario"] = agregado["_valor"] / agregado["quantidade"]
+    if "custo_cmv_unitario" in compras.columns:
+        agregado["custo_cmv_unitario"] = _custo_cmv(agregado["fat_liquido"], agregado["pct_cmv"], agregado["qtd_vendida"])
+    return agregado.drop(columns="_valor")[list(compras.columns)]
+
+
+# ---------------------------------------------------------------------------
+# Gravação (uma transação)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ResultadoAplicacao:
+    compras_gravadas: int = 0
+    compras_removidas: int = 0
+    lojas_atualizadas: int = 0
+    compras_orfas: int = 0
+    cnpjs_orfaos: int = 0
+    eans_novos_na_fila: int = 0
+    eans_resolvidos_automaticamente: int = 0
+    tempos: dict[str, float] = field(default_factory=dict)
+
+
+ProgressoCallback = Callable[[str, int, int], None]
+
+
+def lojas_por_cnpj(session: Session) -> dict[str, int]:
+    """CNPJ (só dígitos) -> loja_id, incluindo os CNPJs órfãos que alguém já
+    vinculou a uma loja — sem isso, o mesmo CNPJ voltaria a ser órfão no
+    envio seguinte."""
+    mapa = {_somente_digitos(cnpj): loja_id for loja_id, cnpj in session.execute(select(Loja.id, Loja.cnpj))}
+    vinculados = session.execute(
+        select(FilaCnpjOrfao.cnpj, FilaCnpjOrfao.resolvido_para_loja_id).where(
+            FilaCnpjOrfao.status == StatusFila.RESOLVIDA, FilaCnpjOrfao.resolvido_para_loja_id.is_not(None),
+        )
+    )
+    for cnpj, loja_id in vinculados:
+        mapa.setdefault(_somente_digitos(cnpj), loja_id)
+    return mapa
+
+
+def _texto_limitado(valor, limite: int, vazio=None):
+    """Texto pronto pra coluna do banco: NaN/None/"" viram `vazio`, e o resto
+    é cortado no tamanho da coluna (o Postgres recusa texto maior)."""
+    if valor is None or (isinstance(valor, float) and pd.isna(valor)):
+        return vazio
+    texto = str(valor).strip()
+    return texto[:limite] if texto else vazio
+
+
+def _inserir_em_lote(session: Session, modelo, linhas: list[dict]) -> None:
+    """INSERT em lote pela camada Core (a TABELA, não a entidade ORM).
+
+    Pela entidade (`session.execute(insert(Modelo), linhas)`), o SQLAlchemy
+    usa o "bulk insert" do ORM, que omite as colunas com None e AGRUPA as
+    linhas pelo conjunto de colunas preenchidas — e ainda pede RETURNING id.
+    Com os campos de recuo (Fat, %CMV, QTD, Custo médio) ora vazios, ora não,
+    intercalados, os grupos viravam de uma linha só: medido em 24/09/2026,
+    uma planilha de ~36 mil compras levava ~80 min (uma ida e volta de
+    ~140 ms até o Postgres por linha). Pela tabela, o lote sai em instruções
+    de muitas linhas, com os vazios gravados como NULL."""
+    session.execute(insert(modelo.__table__), linhas)
+
+
+def _em_blocos(itens: list, tamanho: int):
+    for inicio in range(0, len(itens), tamanho):
+        yield itens[inicio:inicio + tamanho]
+
+
+def aplicar_compras(
+    session: Session,
+    preparadas: ComprasPreparadas,
+    ano_mes: str,
+    upload_fs_node_id: int | None,
+    progresso: ProgressoCallback | None = None,
+) -> ResultadoAplicacao:
+    """Substitui, em `ano_mes`, as compras de todos os CNPJs presentes no
+    arquivo pelas do arquivo, e recalcula as duas filas.
+
+    NÃO faz commit: quem chama controla a transação (ver
+    integrations/gps_processamento.py), e é isso que torna o envio tudo ou
+    nada — nenhum commit intermediário, então uma falha em qualquer etapa
+    desfaz tudo, inclusive o DELETE."""
+    import time
+
+    resultado = ResultadoAplicacao()
+    marcar = time.perf_counter()
+
+    def _tempo(etapa: str) -> None:
+        nonlocal marcar
+        agora = time.perf_counter()
+        resultado.tempos[etapa] = round(agora - marcar, 2)
+        marcar = agora
+
+    def _avisar(fase: str, feito: int, total: int) -> None:
+        if progresso is not None:
+            progresso(fase, feito, total)
+
+    compras = preparadas.compras
+    mapa_lojas = lojas_por_cnpj(session)
+
+    loja_ids = compras["cnpj"].map(mapa_lojas)
+    casadas = compras[loja_ids.notna()].assign(loja_id=loja_ids[loja_ids.notna()].astype(int))
+    orfas = compras[loja_ids.isna()]
+    # Dois CNPJs do arquivo podem apontar pra mesma loja (um deles vinculado
+    # manualmente na fila de órfãos): somar antes, senão (loja, EAN) repetido
+    # violaria a chave única.
+    casadas = _somar_repetidas(casadas.drop(columns="cnpj"), ["loja_id", "ean"])
+
+    lojas_substituidas = sorted({mapa_lojas[c] for c in preparadas.cnpjs_no_arquivo if c in mapa_lojas})
+    cnpjs_orfaos_substituidos = sorted(c for c in preparadas.cnpjs_no_arquivo if c not in mapa_lojas)
+    resultado.lojas_atualizadas = len(lojas_substituidas)
+    _tempo("preparo")
+
+    # 1. Apaga o que o arquivo substitui.
+    _avisar("Removendo os dados anteriores dessas lojas", 0, 1)
+    for bloco in _em_blocos(lojas_substituidas, _TAMANHO_BLOCO_CHAVES):
+        resultado.compras_removidas += session.execute(
+            delete(RegistroCompraGPS).where(RegistroCompraGPS.ano_mes == ano_mes, RegistroCompraGPS.loja_id.in_(bloco))
+        ).rowcount
+    for bloco in _em_blocos(cnpjs_orfaos_substituidos, _TAMANHO_BLOCO_CHAVES):
+        session.execute(delete(CompraGPSOrfa).where(CompraGPSOrfa.ano_mes == ano_mes, CompraGPSOrfa.cnpj.in_(bloco)))
+    _tempo("remocao")
+
+    # 2. Grava as compras novas.
+    linhas = [
+        {
+            "loja_id": int(linha.loja_id), "ean": linha.ean,
+            "descricao_origem": _texto_limitado(linha.descricao, 250, ""),
+            "laboratorio_compra": _texto_limitado(linha.laboratorio, 150), "ano_mes": ano_mes,
+            "quantidade": float(linha.quantidade), "custo_unitario": float(linha.custo_unitario),
+            **{campo: _valor_ou_nulo(getattr(linha, campo)) for campo in CAMPOS_RECUO},
+            "upload_fs_node_id": upload_fs_node_id,
+        }
+        for linha in casadas.itertuples(index=False)
+    ]
+    _avisar("Gravando compras", 0, len(linhas))
+    for feito, bloco in enumerate(_em_blocos(linhas, _TAMANHO_BLOCO), start=1):
+        _inserir_em_lote(session, RegistroCompraGPS, bloco)
+        _avisar("Gravando compras", min(feito * _TAMANHO_BLOCO, len(linhas)), len(linhas))
+    resultado.compras_gravadas = len(linhas)
+
+    linhas_orfas = [
+        {
+            "cnpj": linha.cnpj, "razao_social": _texto_limitado(linha.razao_social, 200), "ean": linha.ean,
+            "descricao_origem": _texto_limitado(linha.descricao, 250, ""),
+            "laboratorio_compra": _texto_limitado(linha.laboratorio, 150),
+            "ano_mes": ano_mes, "quantidade": float(linha.quantidade), "custo_unitario": float(linha.custo_unitario),
+            **{campo: _valor_ou_nulo(getattr(linha, campo)) for campo in CAMPOS_RECUO},
+            "upload_fs_node_id": upload_fs_node_id,
+        }
+        for linha in orfas.itertuples(index=False)
+    ]
+    for bloco in _em_blocos(linhas_orfas, _TAMANHO_BLOCO):
+        _inserir_em_lote(session, CompraGPSOrfa, bloco)
+    resultado.compras_orfas = len(linhas_orfas)
+    resultado.cnpjs_orfaos = int(orfas["cnpj"].nunique())
+    _tempo("gravacao")
+
+    # 3. Filas.
+    _avisar("Atualizando a fila de CNPJ órfão", 0, 1)
+    recalcular_fila_cnpj_orfao(session, set(cnpjs_orfaos_substituidos))
+    _tempo("fila_cnpj")
+
+    _avisar("Reconciliando EANs com a Base Genéricos", 0, 1)
+    novos, automaticos = _enfileirar_eans_novos(session, compras)
+    resultado.eans_novos_na_fila = novos
+    resultado.eans_resolvidos_automaticamente = automaticos
+    reconciliation_motor.recalcular_valores_fila_ean(session)
+    _tempo("fila_ean")
+    return resultado
+
+
+def _enfileirar_eans_novos(session: Session, compras: pd.DataFrame) -> tuple[int, int]:
+    """EAN do arquivo que não está resolvido nem na fila ainda: passa pelo
+    fuzzy-match (uma vez por EAN DISTINTO) e vai pra fila ou é aceito
+    automaticamente. Valor/ocorrências NÃO são gravados aqui — quem grava é
+    `recalcular_valores_fila_ean`, logo depois, a partir das compras vigentes.
+    Devolve (enfileirados, resolvidos automaticamente)."""
+    descricao_por_ean = dict(zip(compras["ean"], compras["descricao"]))
+    resolvidos: dict[str, int] = {}
+    reconciliation_motor.completar_cache_eans_resolvidos(session, set(descricao_por_ean), resolvidos)
+    pendentes = sorted(set(descricao_por_ean) - resolvidos.keys())
+
+    ja_na_fila: set[str] = set()
+    for bloco in _em_blocos(pendentes, _TAMANHO_BLOCO_CHAVES):
+        ja_na_fila.update(session.execute(select(FilaResolucaoEAN.ean).where(FilaResolucaoEAN.ean.in_(bloco))).scalars())
+
+    buffer_fila: list[dict] = []
+    cache_candidatos: dict = {}
+    automaticos = 0
+    with session.no_autoflush:
+        for ean in pendentes:
+            if ean in ja_na_fila:
+                continue
+            base_id = reconciliation_motor.resolver_ean(
+                session, ean=ean, descricao_origem=descricao_por_ean[ean], origem=OrigemFila.GPS,
+                valor=0, criado_por="sistema", cache_candidatos=cache_candidatos,
+                cache_eans_resolvidos=resolvidos, cache_eans_completo=True, ocorrencias=0,
+                buffer_fila=buffer_fila,
+            )
+            if base_id is not None:
+                automaticos += 1
+    reconciliation_motor.upsert_fila_resolucao_em_lote(session, buffer_fila)
+    return len(buffer_fila), automaticos
+
+
+def recalcular_fila_cnpj_orfao(session: Session, cnpjs: set[str] | None = None) -> None:
+    """Valor e ocorrências da fila de CNPJ órfão a partir das compras órfãs
+    VIGENTES (todos os meses) — nunca somados envio a envio. Cria o item da
+    fila se o CNPJ é novo; mantém o status dos existentes (um CNPJ ignorado
+    continua ignorado). `cnpjs=None` recalcula a fila inteira."""
+    agregado = (
+        select(
+            CompraGPSOrfa.cnpj,
+            func.max(CompraGPSOrfa.razao_social),
+            func.sum(CompraGPSOrfa.quantidade * CompraGPSOrfa.custo_unitario),
+            func.count(),
+        )
+        .group_by(CompraGPSOrfa.cnpj)
+    )
+    alvos = sorted(cnpjs) if cnpjs is not None else None
+    linhas = []
+    blocos = _em_blocos(alvos, _TAMANHO_BLOCO_CHAVES) if alvos is not None else [None]
+    for bloco in blocos:
+        stmt = agregado if bloco is None else agregado.where(CompraGPSOrfa.cnpj.in_(bloco))
+        linhas.extend(session.execute(stmt).all())
+
+    agora = dt.datetime.utcnow()
+    valores = [
+        {
+            "cnpj": cnpj, "razao_social_observada": razao, "valor_total_acumulado": float(valor or 0),
+            "qtd_ocorrencias": int(qtd), "status": StatusFila.PENDENTE, "criado_em": agora, "atualizado_em": agora,
+        }
+        for cnpj, razao, valor, qtd in linhas
+    ]
+    for bloco in _em_blocos(valores, _TAMANHO_BLOCO):
+        stmt = insert_com_atualizacao(
+            session, FilaCnpjOrfao.__table__, ["cnpj"],
+            ["razao_social_observada", "valor_total_acumulado", "qtd_ocorrencias", "atualizado_em"],
+        )
+        session.execute(stmt, bloco)
+
+    # CNPJ pendente que deixou de ter compra órfã (o envio novo não trouxe
+    # mais nada dele): zera em vez de manter o valor antigo.
+    com_compras = {cnpj for cnpj, *_ in linhas}
+    zerar = (set(alvos) if alvos is not None else set(
+        session.execute(select(FilaCnpjOrfao.cnpj).where(FilaCnpjOrfao.status == StatusFila.PENDENTE)).scalars()
+    )) - com_compras
+    for bloco in _em_blocos(sorted(zerar), _TAMANHO_BLOCO_CHAVES):
+        session.execute(
+            FilaCnpjOrfao.__table__.update()
+            .where(FilaCnpjOrfao.cnpj.in_(bloco), FilaCnpjOrfao.status == StatusFila.PENDENTE)
+            .values(valor_total_acumulado=0, qtd_ocorrencias=0, atualizado_em=agora)
+        )
+
+
+# ---------------------------------------------------------------------------
+# Fila de CNPJ órfão
+# ---------------------------------------------------------------------------
 
 def listar_fila_cnpj_orfao_priorizada(session: Session, apenas_pendentes: bool = True, limite: int = 200) -> list[FilaCnpjOrfao]:
     stmt = select(FilaCnpjOrfao)
@@ -189,305 +580,96 @@ def ignorar_cnpj_orfao(session: Session, fila_id: int) -> None:
     session.flush()
 
 
-def _dataframe_normalizado(df: pd.DataFrame, mapa: dict[str, str]) -> pd.DataFrame:
-    """Monta um DataFrame com uma coluna por CAMPO (não por nome de coluna da
-    planilha original) — 'cnpj', 'ean', 'laboratorio' etc., sempre presentes
-    (as opcionais viram None quando não mapeadas). Isso permite iterar com
-    `itertuples` (atributo por nome fixo do domínio, ex: `linha.cnpj`) em vez
-    de `iterrows` (que materializa uma Series inteira, com coerção de dtype,
-    a cada linha — o gargalo medido em profiling real pra 150 mil linhas)."""
-    colunas = {campo: df[coluna] for campo, coluna in mapa.items()}
-    for campo_opcional in ("laboratorio", "razao_social"):
-        colunas.setdefault(campo_opcional, None)
-    return pd.DataFrame(colunas)
-
-
-_TAMANHO_BLOCO = 5000  # linhas ESCANEADAS (não só inseridas) entre cada commit/atualização de progresso.
-
-
-def _processar_linhas(
-    session: Session,
-    df: pd.DataFrame,
-    mapa: dict[str, str],
-    ano_mes: str,
-    upload_fs_node_id: int,
-    lojas_por_cnpj: dict[str, Loja],
-    apenas_cnpjs: set[str] | None = None,
-    cache_candidatos: dict | None = None,
-    cache_eans_resolvidos: dict[str, int] | None = None,
-    cache_fila_pendente: dict | None = None,
-    cache_descricao_pendente: dict | None = None,
-    progresso_callback: Callable[[int, int], None] | None = None,
-) -> dict[str, int]:
-    """Núcleo compartilhado entre upload normal e reprocessamento de CNPJ
-    órfão (manual — 1 item — ou em lote — N itens de uma vez, ver
-    `_reprocessar_cnpjs`). `apenas_cnpjs` filtra pra só esses CNPJs; `None`
-    processa a planilha inteira (fluxo de upload original).
-
-    `cache_candidatos`/`cache_eans_resolvidos` (opcionais) repassam pra
-    `reconciliation_motor.resolver_ean` (ver lá) — medido via profiling real
-    (planilha de ~150 mil linhas): sem esses caches, resolver_ean sozinho
-    dominava o tempo de processamento, muito à frente de leitura de arquivo
-    ou inserts. Os chamadores passam o MESMO dict pra toda a duração de um
-    upload/reprocesso — ver `processar_planilha_gps` e `_reprocessar_cnpjs`.
-
-    `chaves_existentes` é pré-carregado abaixo (1 SELECT enxuto — só
-    `loja_id`/`ean`, sem materializar a linha inteira — pra todo o `ano_mes`,
-    não 1 SELECT por linha).
-
-    `session.no_autoflush`: sem isso, toda SELECT feita dentro do loop (em
-    `resolver_ean`/`upsert_fila_resolucao`, pra EAN ainda não resolvido)
-    dispara um flush do SQLAlchemy de todos os objetos pendentes na sessão
-    antes de rodar. Seguro desligar aqui porque todo ponto do código que
-    grava e depois RELÊ o que gravou (`resolver_ean`, `upsert_fila_resolucao`,
-    `upsert_fila_cnpj_orfao`) já dá `session.flush()` explícito logo após
-    escrever; `RegistroCompraGPS` em si nunca é reconsultado dentro do loop
-    (só via `chaves_existentes`, um set em memória, não uma query). Não
-    interfere nos commits por bloco abaixo: `session.commit()` sempre faz
-    flush antes de committar, independente da flag de autoflush automático.
-
-    `progresso_callback(linhas_escaneadas, total_linhas)`, se informado, é
-    chamado a cada bloco de `_TAMANHO_BLOCO` linhas ESCANEADAS da planilha
-    (não linhas gravadas — assim a barra de progresso continua avançando de
-    forma previsível mesmo num trecho longo de linhas de lixo/CNPJ órfão) —
-    usado pela tela pra mostrar progresso real durante o upload.
-
-    Grava em blocos via Core (`insert(RegistroCompraGPS)` / `update(...)`
-    executados com uma lista de dicts, não `session.add_all` de objetos ORM
-    acumulados a planilha inteira), com `session.commit()` a cada bloco.
-    Antes disso, a planilha inteira (até ~150 mil linhas) virava uma lista de
-    objetos ORM acumulada em memória do início ao fim, e só ia pro banco — e
-    só aparecia pro usuário, sem nenhuma barra de progresso — no único commit
-    que `get_session()` dá ao sair do `with`, lá na tela. Memória (~150 mil
-    objetos ORM vivos ao mesmo tempo), tempo (um INSERT gigante só no fim) e
-    visibilidade (tela travada até terminar) eram o mesmo problema, com a
-    mesma causa. Trade-off aceito conscientemente: a importação deixa de ser
-    tudo-ou-nada por planilha — se falhar no meio, os blocos já commitados
-    ficam gravados (o upload e a linha de `UploadGPS`, salvos antes deste
-    loop em `processar_planilha_gps`, também já estão commitados nesse
-    ponto)."""
-    contadores = {"processados": 0, "atualizados": 0, "linhas_lixo": 0, "cnpj_orfao": 0}
-
-    chaves_existentes: set[tuple[int, str]] = {
-        (loja_id, ean)
-        for loja_id, ean in session.execute(
-            select(RegistroCompraGPS.loja_id, RegistroCompraGPS.ean).where(RegistroCompraGPS.ano_mes == ano_mes)
-        )
-    }
-
-    df_norm = _dataframe_normalizado(df, mapa)
-    total_linhas = len(df_norm)
-
-    buffer_inserir: list[dict] = []
-    pendentes_inserir_por_chave: dict[tuple[int, str], dict] = {}
-    buffer_atualizar: list[dict] = []
-
-    def _flush() -> None:
-        if buffer_inserir:
-            session.execute(insert(RegistroCompraGPS), buffer_inserir)
-        if buffer_atualizar:
-            session.execute(
-                update(RegistroCompraGPS).where(
-                    RegistroCompraGPS.loja_id == bindparam("_loja_id"),
-                    RegistroCompraGPS.ean == bindparam("_ean"),
-                    RegistroCompraGPS.ano_mes == bindparam("_ano_mes"),
-                ),
-                buffer_atualizar,
+def _mover_compras_orfas(session: Session, loja_por_cnpj: dict[str, int]) -> int:
+    """Move as compras órfãs destes CNPJs pra loja vinculada: grava em
+    `registros_compra_gps` (substituindo, se a loja já tiver o mesmo EAN no
+    mesmo mês) e apaga de `compras_gps_orfas`. Devolve quantas compras
+    foram movidas."""
+    cnpjs = sorted(loja_por_cnpj)
+    if not cnpjs:
+        return 0
+    registros = []
+    for bloco in _em_blocos(cnpjs, _TAMANHO_BLOCO_CHAVES):
+        registros.extend(session.execute(select(CompraGPSOrfa).where(CompraGPSOrfa.cnpj.in_(bloco))).scalars())
+    if registros:
+        df = pd.DataFrame({
+            "loja_id": [loja_por_cnpj[r.cnpj] for r in registros],
+            "ean": [r.ean for r in registros],
+            "ano_mes": [r.ano_mes for r in registros],
+            "descricao": [r.descricao_origem for r in registros],
+            "laboratorio": [r.laboratorio_compra for r in registros],
+            "quantidade": [float(r.quantidade) for r in registros],
+            "custo_unitario": [float(r.custo_unitario) for r in registros],
+            **{campo: [_valor_ou_nulo(getattr(r, campo)) for r in registros] for campo in CAMPOS_RECUO},
+            "upload_fs_node_id": [r.upload_fs_node_id for r in registros],
+        })
+        df = _somar_repetidas(df, ["loja_id", "ean", "ano_mes"])
+        valores = [
+            {
+                "loja_id": int(linha.loja_id), "ean": linha.ean, "ano_mes": linha.ano_mes,
+                "descricao_origem": _texto_limitado(linha.descricao, 250, ""),
+                "laboratorio_compra": _texto_limitado(linha.laboratorio, 150),
+                "quantidade": float(linha.quantidade), "custo_unitario": float(linha.custo_unitario),
+                **{campo: _valor_ou_nulo(getattr(linha, campo)) for campo in CAMPOS_RECUO},
+                "upload_fs_node_id": None if pd.isna(linha.upload_fs_node_id) else int(linha.upload_fs_node_id),
+                "criado_em": dt.datetime.utcnow(),
+            }
+            for linha in df.itertuples(index=False)
+        ]
+        for bloco in _em_blocos(valores, _TAMANHO_BLOCO):
+            stmt = insert_com_atualizacao(
+                session, RegistroCompraGPS.__table__, ["loja_id", "ean", "ano_mes"],
+                ["descricao_origem", "laboratorio_compra", "quantidade", "custo_unitario", *CAMPOS_RECUO,
+                 "upload_fs_node_id"],
             )
-        session.commit()
-        buffer_inserir.clear()
-        pendentes_inserir_por_chave.clear()
-        buffer_atualizar.clear()
-
-    with session.no_autoflush:
-        for i, linha in enumerate(df_norm.itertuples(index=False), start=1):
-            cnpj_digitos = _somente_digitos(linha.cnpj)
-            ean = normalizar_ean(linha.ean)
-
-            if apenas_cnpjs is not None and cnpj_digitos not in apenas_cnpjs:
-                continue
-            if _linha_e_lixo(cnpj_digitos, ean):
-                contadores["linhas_lixo"] += 1
-                continue
-
-            # quantidade/fat_liquido/pct_cmv NaN passariam batido pelo float()
-            # (float(nan) não levanta) e viram NaN silencioso no banco —
-            # tratamos como linha_lixo igual a qualquer outro dado ruim, antes
-            # mesmo de tentar converter.
-            if not pd.notna(linha.quantidade) or not pd.notna(linha.fat_liquido) or not pd.notna(linha.pct_cmv):
-                contadores["linhas_lixo"] += 1
-                continue
-
-            try:
-                quantidade = float(linha.quantidade)
-                fat_liquido = float(linha.fat_liquido)
-                pct_cmv = normalizar_percentual(linha.pct_cmv)
-                estoque = float(linha.estoque) if pd.notna(linha.estoque) else 0.0
-            except (ValueError, TypeError):
-                contadores["linhas_lixo"] += 1
-                continue
-
-            loja = lojas_por_cnpj.get(cnpj_digitos)
-            if loja is None:
-                if apenas_cnpjs is None:  # reprocesso já filtrou pelos CNPJs resolvidos — não deveria cair aqui
-                    razao_social = (
-                        str(linha.razao_social).strip() if pd.notna(linha.razao_social) else None
-                    )
-                    upsert_fila_cnpj_orfao(session, cnpj_digitos, razao_social, fat_liquido, upload_fs_node_id)
-                    contadores["cnpj_orfao"] += 1
-                continue
-
-            # pd.notna: célula vazia/NaN vira "" (não a string "nan"), que o
-            # motor de reconciliação já trata como "sem candidato" (score 0.0
-            # -> fila_manual), nunca como match errado nem linha descartada.
-            descricao = str(linha.descricao).strip() if pd.notna(linha.descricao) else ""
-            laboratorio_compra = None
-            if pd.notna(linha.laboratorio):
-                texto = str(linha.laboratorio).strip()
-                laboratorio_compra = texto if texto and texto.lower() != "nan" else None
-
-            custo_unitario = (fat_liquido * pct_cmv) / quantidade if quantidade else 0.0
-
-            chave = (loja.id, ean)
-            pendente = pendentes_inserir_por_chave.get(chave)
-
-            if pendente is not None:
-                # Mesma chave repetida MAIS ADIANTE no arquivo, ainda dentro
-                # do bloco atual (bufferizada, ainda não commitada) — atualiza
-                # o dict já enfileirado em vez de inserir de novo (senão
-                # violaria a UniqueConstraint (loja_id, ean, ano_mes) no commit).
-                pendente.update(
-                    descricao_origem=descricao, laboratorio_compra=laboratorio_compra, quantidade=quantidade,
-                    fat_liquido=fat_liquido, pct_cmv=pct_cmv, custo_unitario=custo_unitario, estoque=estoque,
-                )
-                contadores["atualizados"] += 1
-            elif chave in chaves_existentes:
-                # Já existe no banco — de antes deste processamento OU
-                # commitada num bloco anterior deste mesmo processamento
-                # (chaves_existentes recebe a chave assim que ela é
-                # inserida, no ramo `else` abaixo). UPDATE por chave natural
-                # (loja_id, ean, ano_mes), não por id — dispensa descobrir o
-                # id gerado pelo insert em massa (sem precisar de RETURNING,
-                # que não se comporta igual em todo driver/banco).
-                buffer_atualizar.append({
-                    "_loja_id": loja.id, "_ean": ean, "_ano_mes": ano_mes,
-                    "descricao_origem": descricao, "laboratorio_compra": laboratorio_compra,
-                    "quantidade": quantidade, "fat_liquido": fat_liquido, "pct_cmv": pct_cmv,
-                    "custo_unitario": custo_unitario, "estoque": estoque,
-                    "upload_fs_node_id": upload_fs_node_id,
-                })
-                contadores["atualizados"] += 1
-            else:
-                novo = {
-                    "loja_id": loja.id, "ean": ean, "descricao_origem": descricao,
-                    "laboratorio_compra": laboratorio_compra, "ano_mes": ano_mes,
-                    "quantidade": quantidade, "fat_liquido": fat_liquido, "pct_cmv": pct_cmv,
-                    "custo_unitario": custo_unitario, "estoque": estoque,
-                    "upload_fs_node_id": upload_fs_node_id,
-                }
-                buffer_inserir.append(novo)
-                pendentes_inserir_por_chave[chave] = novo
-                chaves_existentes.add(chave)
-                contadores["processados"] += 1
-
-            reconciliation_motor.resolver_ean(
-                session, ean=ean, descricao_origem=descricao, origem=OrigemFila.GPS,
-                valor=fat_liquido, aparece_em_estoque=estoque > 0, criado_por="sistema",
-                cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
-                cache_fila_pendente=cache_fila_pendente, cache_descricao_pendente=cache_descricao_pendente,
-            )
-
-            if i % _TAMANHO_BLOCO == 0:
-                _flush()
-                if progresso_callback is not None:
-                    progresso_callback(i, total_linhas)
-
-        _flush()
-        if progresso_callback is not None:
-            progresso_callback(total_linhas, total_linhas)
-
-    return contadores
+            session.execute(stmt, bloco)
+    for bloco in _em_blocos(cnpjs, _TAMANHO_BLOCO_CHAVES):
+        session.execute(delete(CompraGPSOrfa).where(CompraGPSOrfa.cnpj.in_(bloco)))
+    reconciliation_motor.recalcular_valores_fila_ean(session)
+    return len(registros)
 
 
-def processar_planilha_gps(
-    session: Session, conteudo: bytes, nome_arquivo: str, criado_por: str, pasta_destino_id: int, ano_mes: str,
-    mapa_confirmado: dict[str, str] | None = None, df: pd.DataFrame | None = None,
-    progresso_callback: Callable[[int, int], None] | None = None,
-) -> ResultadoSincronizacao:
-    """`mapa_confirmado` vem do popup de confirmação de mapeamento (campo ->
-    coluna escolhido pelo usuário) — quando informado, tem prioridade sobre a
-    detecção automática por sinônimo pra ESTA planilha, mas é mesclado com ela
-    (não substitui): o popup só cobre os campos obrigatórios, então
-    laboratorio/razao_social (opcionais) vêm sempre da detecção automática,
-    já que nunca aparecem em `mapa_confirmado`. Ainda validamos que nenhum
-    campo obrigatório ficou de fora, como segurança contra um mapeamento
-    incompleto vindo de um chamador que não seja o popup (que já bloqueia
-    isso na própria UI).
+def resolver_cnpj_orfao(session: Session, fila_id: int, loja_id: int, resolvido_por: str) -> int:
+    """Vincula um CNPJ órfão a uma loja: as compras dele passam pra loja na
+    hora (sem reabrir planilha) e os próximos envios já o reconhecem."""
+    fila = session.get(FilaCnpjOrfao, fila_id)
+    if fila is None:
+        raise ValueError("Item da fila não encontrado.")
+    if session.get(Loja, loja_id) is None:
+        raise ValueError("Loja não encontrada.")
+    movidas = _mover_compras_orfas(session, {fila.cnpj: loja_id})
+    fila.status = StatusFila.RESOLVIDA
+    fila.resolvido_para_loja_id = loja_id
+    session.flush()
+    return movidas
 
-    `df`, se informado, evita reler/reparsear o Excel — o popup de
-    mapeamento já leu a planilha inteira pra montar o preview de colunas
-    (`pd.read_excel` sozinho leva ~19s numa planilha GPS real de 150 mil
-    linhas); sem isso, o mesmo parse acontecia 2x: uma no preview, outra
-    aqui. `conteudo` continua obrigatório (é o que vai pro storage do
-    arquivo bruto, ver `filesystem.salvar_arquivo`).
 
-    `progresso_callback`, se informado, repassa direto pra `_processar_linhas`
-    (ver lá) — pensado pra tela plugar uma barra de progresso real sem este
-    módulo depender de Streamlit."""
-    if df is None:
-        df = pd.read_excel(io.BytesIO(conteudo))
-    if mapa_confirmado is not None:
-        faltando = CAMPOS_OBRIGATORIOS - mapa_confirmado.keys()
-        if faltando:
-            raise ValueError(f"Mapeamento incompleto — faltam colunas para: {', '.join(sorted(faltando))}.")
-        # O popup de confirmação só cobre os campos obrigatórios — merge com a
-        # detecção automática preserva laboratorio/razao_social (opcionais,
-        # fora do popup) em vez de perdê-los. mapa_confirmado vence em caso de
-        # conflito (usuário corrigiu manualmente algum campo obrigatório).
-        mapa = {**detectar_colunas_automatico(df), **mapa_confirmado}
-    else:
-        mapa = mapear_colunas(df)
+def resolver_cnpjs_orfaos_identicos_em_lote(session: Session, resolvido_por: str) -> dict:
+    """Resolve de uma vez todo CNPJ órfão pendente cujos dígitos batem com
+    uma loja cadastrada (ex: a loja entrou na base depois do envio)."""
+    fila_pendente = session.execute(
+        select(FilaCnpjOrfao).where(FilaCnpjOrfao.status == StatusFila.PENDENTE)
+    ).scalars().all()
+    loja_id_por_cnpj = {_somente_digitos(cnpj): loja_id for loja_id, cnpj in session.execute(select(Loja.id, Loja.cnpj))}
+    casados = {f.cnpj: loja_id_por_cnpj[_somente_digitos(f.cnpj)] for f in fila_pendente if _somente_digitos(f.cnpj) in loja_id_por_cnpj}
+    if not casados:
+        return {"resolvidos": 0, "linhas_inseridas": 0, "cnpjs": []}
 
-    node = filesystem.salvar_arquivo(
-        session, pasta_destino_id, nome_arquivo, conteudo, criado_por,
-        mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-    session.add(UploadGPS(
-        fs_node_id=node.id, ano_mes=ano_mes, criado_por=criado_por,
-        mapa_colunas_json=mapeamento_integ.serializar_mapa(mapa),
-    ))
+    movidas = _mover_compras_orfas(session, casados)
+    for fila in fila_pendente:
+        if fila.cnpj in casados:
+            fila.status = StatusFila.RESOLVIDA
+            fila.resolvido_para_loja_id = casados[fila.cnpj]
+    session.flush()
+    return {"resolvidos": len(casados), "linhas_inseridas": movidas, "cnpjs": sorted(casados)}
 
-    lojas = session.execute(select(Loja)).scalars().all()
-    lojas_por_cnpj = {_somente_digitos(loja.cnpj): loja for loja in lojas}
 
-    contadores = _processar_linhas(
-        session, df, mapa, ano_mes, node.id, lojas_por_cnpj,
-        cache_candidatos={}, cache_eans_resolvidos=reconciliation_motor.carregar_cache_eans_resolvidos(session),
-        cache_fila_pendente={}, cache_descricao_pendente={}, progresso_callback=progresso_callback,
-    )
-
-    partes = [f"{contadores['processados']} compras importadas"]
-    if contadores["atualizados"]:
-        partes.append(f"{contadores['atualizados']} atualizadas (já existiam nesse mês)")
-    if contadores["cnpj_orfao"]:
-        partes.append(f"{contadores['cnpj_orfao']} linhas em CNPJ ainda não cadastrado (fila de CNPJ órfão)")
-    if contadores["linhas_lixo"]:
-        partes.append(f"{contadores['linhas_lixo']} linhas ignoradas (lixo/rodapé/dado inválido)")
-
-    return ResultadoSincronizacao(
-        status=StatusIntegracao.MANUAL,
-        registros_processados=contadores["processados"],
-        mensagem=f"Planilha '{nome_arquivo}' ({ano_mes}): " + "; ".join(partes) + ".",
-    )
-
+# ---------------------------------------------------------------------------
+# Explorador de Arquivos: exclusão definitiva de um envio
+# ---------------------------------------------------------------------------
 
 def buscar_upload_por_fs_node(session: Session, fs_node_id: int) -> UploadGPS | None:
-    """Usada pelo Explorador de Arquivos pra decidir se um arquivo GPS tem
-    "Excluir definitivamente" no menu — espelha `buscar_tabela_por_fs_node`
-    de integrations/gruppy.py."""
-    return session.execute(
-        select(UploadGPS).where(UploadGPS.fs_node_id == fs_node_id)
-    ).scalar_one_or_none()
+    return session.execute(select(UploadGPS).where(UploadGPS.fs_node_id == fs_node_id)).scalar_one_or_none()
 
 
 @dataclass
@@ -496,37 +678,34 @@ class ResultadoExclusaoUploadGPS:
     ano_mes: str
     registros_removidos: int
     storage_key: str | None
+    # Atalho de linhas órfãs dos envios antigos (antes de compras_gps_orfas
+    # existir) — purgado junto com o .xlsx, depois do commit.
+    storage_key_orfaos: str | None = None
 
 
 def excluir_upload_gps_definitivamente(session: Session, fs_node_id: int) -> ResultadoExclusaoUploadGPS:
-    """Remove DE VERDADE (não inativa) um upload GPS — simétrico a
-    `excluir_tabela_gruppy_definitivamente` (integrations/gruppy.py), mesma
-    ordem filhos-antes-do-pai-antes-do-arquivo: RegistroCompraGPS ->
-    UploadGPS -> FSNode do arquivo. NUNCA toca em BaseGenerico/EanGenerico/
-    FilaResolucaoEAN/FilaCnpjOrfao — mesmo que uma linha deste upload já
-    tenha resolvido um EAN ou gerado entrada na fila de CNPJ órfão, essas
-    são histórico de decisão (não pertencem ao upload em si); apagar o
-    upload não desfaz uma reconciliação já feita, nem mexe em nenhum outro
-    upload GPS (cada um só apaga a própria linhagem, via `upload_fs_node_id`).
+    """Remove DE VERDADE um envio GPS: as compras que ainda pertencem a ele
+    (normais e órfãs — o que um envio posterior já substituiu não é mais
+    dele), o `UploadGPS` e o FSNode do arquivo. Recalcula as duas filas.
+    NUNCA toca em Base Genéricos/EANs resolvidos.
 
-    Devolve `storage_key` (None se o FSNode já não existia) pra quem chamou
-    apagar o BYTE FÍSICO do Spaces depois — mesmo motivo de
-    `excluir_tabela_gruppy_definitivamente`: esta função só mexe no banco,
-    ainda dentro de uma transação que pode dar rollback; apagar o arquivo
-    físico só depois do commit confirmado evita o FSNode (se o rollback
-    acontecesse) apontar pra um storage_key já destruído."""
-    upload = session.execute(
-        select(UploadGPS).where(UploadGPS.fs_node_id == fs_node_id)
-    ).scalar_one_or_none()
+    Devolve `storage_key` pra quem chamou apagar o byte físico só DEPOIS do
+    commit — apagar antes deixaria o FSNode apontando pra um objeto
+    inexistente se a transação desse rollback."""
+    upload = buscar_upload_por_fs_node(session, fs_node_id)
     if upload is None:
         raise ValueError("Nenhum upload GPS vinculado a este arquivo.")
 
-    upload_id = upload.id
-    ano_mes = upload.ano_mes
+    upload_id, ano_mes = upload.id, upload.ano_mes
+    storage_key_orfaos = gps_cache_orfaos.chave_para_purgar(upload)
 
     registros_removidos = session.execute(
         delete(RegistroCompraGPS).where(RegistroCompraGPS.upload_fs_node_id == fs_node_id)
     ).rowcount
+    cnpjs_orfaos = set(
+        session.execute(select(CompraGPSOrfa.cnpj).where(CompraGPSOrfa.upload_fs_node_id == fs_node_id).distinct()).scalars()
+    )
+    session.execute(delete(CompraGPSOrfa).where(CompraGPSOrfa.upload_fs_node_id == fs_node_id))
 
     session.delete(upload)
     session.flush()
@@ -535,168 +714,42 @@ def excluir_upload_gps_definitivamente(session: Session, fs_node_id: int) -> Res
     storage_key = node.storage_key if node is not None else None
     if node is not None:
         session.delete(node)
-
     session.flush()
 
+    recalcular_fila_cnpj_orfao(session, cnpjs_orfaos)
+    reconciliation_motor.recalcular_valores_fila_ean(session)
+
     return ResultadoExclusaoUploadGPS(
-        upload_id=upload_id,
-        ano_mes=ano_mes,
-        registros_removidos=registros_removidos,
-        storage_key=storage_key,
+        upload_id=upload_id, ano_mes=ano_mes, registros_removidos=registros_removidos,
+        storage_key=storage_key, storage_key_orfaos=storage_key_orfaos,
     )
 
 
-def _uploads_gps_ja_processados(session: Session) -> list[tuple[FSNode, UploadGPS]]:
-    """(FSNode, UploadGPS) de cada upload GPS ainda ativo — via UploadGPS, não
-    inferido de linhas já importadas, então funciona mesmo se um arquivo
-    inteiro só tivesse linhas de CNPJ órfão."""
-    linhas = session.execute(
-        select(UploadGPS, FSNode)
-        .join(FSNode, UploadGPS.fs_node_id == FSNode.id)
-        .where(FSNode.status == StatusNode.ATIVO)
-    ).all()
-    return [(fs_node, upload) for upload, fs_node in linhas]
-
-
-def _reprocessar_cnpjs(
-    session: Session, lojas_por_cnpj: dict[str, Loja], fs_node_ids_relevantes: set[int] | None = None,
-) -> int:
-    """Relê os arquivos GPS já enviados UMA vez cada (não uma vez por CNPJ) e
-    processa, numa única passada por arquivo, as linhas de todos os CNPJs em
-    `lojas_por_cnpj`. Núcleo compartilhado entre o reprocesso manual de 1
-    CNPJ órfão e a resolução em lote — só muda quantos CNPJs entram no
-    dict; ler o arquivo 1x pra N CNPJs em vez de N vezes (1 por CNPJ) é o
-    que torna a resolução em lote viável (segundos em vez de horas pra uma
-    planilha de ~150 mil linhas).
-
-    `fs_node_ids_relevantes`, se informado, restringe a releitura só a esses
-    uploads — a união dos `FilaCnpjOrfao.uploads_fs_node_ids_json` dos CNPJs
-    sendo resolvidos agora (ver `upsert_fila_cnpj_orfao`, que popula esse
-    campo a cada linha órfã). Antes disso, resolver UM único CNPJ órfão relia
-    TODO upload GPS já enviado (às vezes dezenas de arquivos de ~150 mil
-    linhas cada), mesmo que aquele CNPJ só tivesse aparecido numa planilha.
-    `None` (fallback pra fila criada antes deste campo existir, ou qualquer
-    CNPJ do lote sem rastreio) mantém o comportamento antigo — relê TODOS os
-    uploads ainda ativos, com segurança em vez de arriscar pular um arquivo
-    onde o CNPJ pode ter aparecido sem estar registrado.
-
-    Usa o mapeamento EXATO gravado naquele upload (`UploadGPS.mapa_colunas_json`)
-    pra reler o arquivo — nunca o "último mapeamento confirmado" (que é
-    global por fornecedor e pode já ter mudado desde então), senão o
-    reprocesso poderia aplicar um mapeamento diferente do que foi usado de
-    verdade na hora do upload original. Upload de antes desse campo existir
-    (mapa_colunas_json nulo) cai pra heurística automática, como sempre foi
-    — com aviso no log, já que essa planilha nunca teve confirmação humana.
-
-    Um único `cache_candidatos`/`cache_eans_resolvidos` (ver
-    reconciliation/motor.py) é reaproveitado por TODOS os arquivos deste
-    reprocesso — o catálogo de genéricos ativos e os EANs já resolvidos não
-    mudam entre eles, então não faz sentido rebuscar do zero a cada
-    arquivo, só a cada resolução de CNPJ órfão como um todo."""
-    cnpjs = set(lojas_por_cnpj.keys())
-    total_inseridas = 0
-    cache_candidatos: dict = {}
-    cache_eans_resolvidos = reconciliation_motor.carregar_cache_eans_resolvidos(session)
-    cache_fila_pendente: dict = {}
-    cache_descricao_pendente: dict = {}
-
-    uploads = _uploads_gps_ja_processados(session)
-    if fs_node_ids_relevantes is not None:
-        uploads = [(node, upload) for node, upload in uploads if node.id in fs_node_ids_relevantes]
-
-    for node, upload in uploads:
-        conteudo = filesystem.ler_arquivo(node)
-        df = pd.read_excel(io.BytesIO(conteudo))
-
-        mapa = mapeamento_integ.desserializar_mapa(upload.mapa_colunas_json)
-        if mapa is None:
-            logger.warning(
-                "Upload GPS %s (ano_mes=%s) não tem mapeamento de colunas salvo — "
-                "reprocessando CNPJ órfão com a heurística automática atual, que pode "
-                "não ser idêntica à usada no upload original.",
-                node.nome, upload.ano_mes,
-            )
-            mapa = mapear_colunas(df)
-
-        contadores = _processar_linhas(
-            session, df, mapa, upload.ano_mes, node.id, lojas_por_cnpj, apenas_cnpjs=cnpjs,
-            cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
-            cache_fila_pendente=cache_fila_pendente, cache_descricao_pendente=cache_descricao_pendente,
+def mensagem_resultado(nome_arquivo: str, ano_mes: str, preparadas: ComprasPreparadas, resultado: ResultadoAplicacao) -> str:
+    partes = [
+        f"{resultado.compras_gravadas:,} compras gravadas para {resultado.lojas_atualizadas} loja(s)".replace(",", "."),
+    ]
+    if resultado.compras_removidas:
+        partes.append(f"{resultado.compras_removidas:,} compras anteriores dessas lojas substituídas".replace(",", "."))
+    if resultado.compras_orfas:
+        partes.append(
+            f"{resultado.compras_orfas:,} compras de {resultado.cnpjs_orfaos} CNPJ(s) sem loja cadastrada "
+            "(fila de CNPJ órfão)".replace(",", ".")
         )
-        total_inseridas += contadores["processados"] + contadores["atualizados"]
-
-    return total_inseridas
-
-
-def resolver_cnpj_orfao(session: Session, fila_id: int, loja_id: int, resolvido_por: str) -> int:
-    """CNPJ órfão vinculado a uma loja (fluxo manual, 1 item por vez, usado
-    pela tela): reprocessa AUTOMATICAMENTE relendo só os arquivos GPS onde
-    esse CNPJ apareceu (`fila.uploads_fs_node_ids_json`) e inserindo as
-    linhas que tinham ficado de fora."""
-    fila = session.get(FilaCnpjOrfao, fila_id)
-    if fila is None:
-        raise ValueError("Item da fila não encontrado.")
-    loja = session.get(Loja, loja_id)
-    if loja is None:
-        raise ValueError("Loja não encontrada.")
-
-    fs_node_ids = _desserializar_ids(fila.uploads_fs_node_ids_json) or None
-    total_inseridas = _reprocessar_cnpjs(session, {fila.cnpj: loja}, fs_node_ids_relevantes=fs_node_ids)
-
-    fila.status = StatusFila.RESOLVIDA
-    fila.resolvido_para_loja_id = loja_id
-    session.flush()
-    return total_inseridas
-
-
-def resolver_cnpjs_orfaos_identicos_em_lote(session: Session, resolvido_por: str) -> dict:
-    """Resolve de uma vez todo item PENDENTE da fila de CNPJ órfão cujo CNPJ
-    bate exatamente (string idêntica) com uma Loja já cadastrada — usa o
-    mesmo `_reprocessar_cnpjs` do fluxo manual, só que com todos os CNPJs
-    batidos de uma vez, então cada arquivo relevante é lido uma única vez no
-    total (não uma vez por CNPJ). CNPJs sem bate exato ficam intocados na
-    fila, pra revisão manual.
-
-    Restringe a releitura à união dos uploads relevantes de cada CNPJ do
-    lote — mas se QUALQUER um deles não tiver rastreio (fila antiga, sem
-    `uploads_fs_node_ids_json`), cai pro fallback de reler tudo pro lote
-    inteiro: não dá pra saber com segurança em quais arquivos aquele CNPJ
-    específico apareceu, e pular um arquivo por engano perderia linhas
-    daquele CNPJ silenciosamente."""
-    fila_pendente = session.execute(
-        select(FilaCnpjOrfao).where(FilaCnpjOrfao.status == StatusFila.PENDENTE)
-    ).scalars().all()
-    lojas_por_cnpj_todas = {loja.cnpj: loja for loja in session.execute(select(Loja)).scalars().all()}
-
-    fila_por_cnpj = {f.cnpj: f for f in fila_pendente}
-    cnpjs_com_match = sorted(set(fila_por_cnpj) & set(lojas_por_cnpj_todas))
-
-    if not cnpjs_com_match:
-        return {"resolvidos": 0, "linhas_inseridas": 0, "cnpjs": []}
-
-    lojas_dos_matches = {cnpj: lojas_por_cnpj_todas[cnpj] for cnpj in cnpjs_com_match}
-
-    fs_node_ids_relevantes: set[int] | None = set()
-    for cnpj in cnpjs_com_match:
-        ids_deste_cnpj = _desserializar_ids(fila_por_cnpj[cnpj].uploads_fs_node_ids_json)
-        if not ids_deste_cnpj:
-            fs_node_ids_relevantes = None
-            break
-        fs_node_ids_relevantes |= ids_deste_cnpj
-
-    total_inseridas = _reprocessar_cnpjs(session, lojas_dos_matches, fs_node_ids_relevantes=fs_node_ids_relevantes)
-
-    for cnpj in cnpjs_com_match:
-        fila = fila_por_cnpj[cnpj]
-        fila.status = StatusFila.RESOLVIDA
-        fila.resolvido_para_loja_id = lojas_dos_matches[cnpj].id
-    session.flush()
-
-    return {
-        "resolvidos": len(cnpjs_com_match),
-        "linhas_inseridas": total_inseridas,
-        "cnpjs": cnpjs_com_match,
-    }
+    if resultado.eans_novos_na_fila:
+        partes.append(f"{resultado.eans_novos_na_fila} EAN(s) novo(s) na fila de resolução")
+    if resultado.eans_resolvidos_automaticamente:
+        partes.append(f"{resultado.eans_resolvidos_automaticamente} EAN(s) resolvido(s) automaticamente")
+    ignoradas = []
+    if preparadas.linhas_sem_compra:
+        ignoradas.append(f"{preparadas.linhas_sem_compra:,} só de venda".replace(",", "."))
+    if preparadas.linhas_invalidas:
+        ignoradas.append(f"{preparadas.linhas_invalidas} com quantidade ou valor ≤ 0")
+    if preparadas.linhas_sem_chave:
+        ignoradas.append(f"{preparadas.linhas_sem_chave} sem CNPJ/EAN (rodapé/total)")
+    if ignoradas:
+        partes.append("linhas ignoradas: " + ", ".join(ignoradas))
+    return f"Planilha '{nome_arquivo}' ({ano_mes}): " + "; ".join(partes) + "."
 
 
 class GpsAdapter(IntegrationAdapter):
@@ -707,5 +760,5 @@ class GpsAdapter(IntegrationAdapter):
 
     def sincronizar(self, **kwargs) -> ResultadoSincronizacao:
         raise NotImplementedError(
-            "Sem API do GPS prevista — use a aba Dados para subir a planilha de compras."
+            "Sem API do GPS em uso — use a aba Dados para subir a planilha de compras."
         )

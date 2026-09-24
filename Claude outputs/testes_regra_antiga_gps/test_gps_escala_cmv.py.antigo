@@ -1,0 +1,188 @@
+"""Etapa 1 da nova base GPS: a escala do % CMV passa a ser decidida pela
+COLUNA INTEIRA, não valor a valor.
+
+O bug que isto conserta é real e já custou dado. `normalizar_percentual`
+divide por 100 qualquer valor maior que 1 — regra certa pro desconto da
+Gruppy, onde 1,6 nunca é "160% de desconto", e errada pro CMV do GPS, onde
+é: produto vendido abaixo do custo tem CMV acima de 100%, e é justamente a
+oportunidade que o sistema existe pra achar. Na base antiga, 175 linhas
+foram gravadas assim — CMV de 111,2% virou 1,112%, o custo unitário ficou
+100x menor, a economia perdida deu zero e a linha DESAPARECEU da análise.
+
+A coluna tem o contexto que o valor solto não tem: se a maioria dos valores
+não-zero cabe em [0, 1], a coluna está em fração e o 1,6 é um CMV alto de
+verdade; se a maioria passa de 1, a coluna está em percentual e todo mundo
+se divide por 100 — inclusive o 0,5, que ali quer dizer 0,5%.
+
+`reconciliation/normalizador.py` NÃO foi tocada: a Gruppy continua usando
+`normalizar_percentual` com a heurística por valor, que lá está correta. A
+decisão por coluna vive só em `integrations/gps.py` — e o último teste deste
+arquivo é o que trava essa separação.
+"""
+from __future__ import annotations
+
+import logging
+
+import pandas as pd
+import pytest
+
+from integrations import gps as gps_integ
+from reconciliation.normalizador import normalizar_percentual
+
+CAMPOS = ["cnpj", "ean", "descricao", "quantidade", "fat_liquido", "pct_cmv", "estoque"]
+
+
+def _coluna(valores: list) -> pd.Series:
+    return pd.Series(valores, dtype=object)
+
+
+def _pct_normalizado(valores: list) -> list:
+    """Roda a coluna pelo caminho real (`_colunas_normalizadas`), com os
+    outros campos preenchidos com dado bom, e devolve só o % CMV."""
+    df = pd.DataFrame({
+        "cnpj": ["00000000000001"] * len(valores),
+        "ean": [f"789000000{i:04d}" for i in range(len(valores))],
+        "descricao": ["PRODUTO"] * len(valores),
+        "quantidade": [10] * len(valores),
+        "fat_liquido": [1000.0] * len(valores),
+        "pct_cmv": valores,
+        "estoque": [0] * len(valores),
+    })
+    return gps_integ._colunas_normalizadas(df, {campo: campo for campo in CAMPOS})["pct_cmv"]
+
+
+# ---------------------------------------------------------------------------
+# A decisão em si
+# ---------------------------------------------------------------------------
+
+def test_coluna_em_fracao_preserva_valor_acima_de_1():
+    """O caso do bug: 1,6 numa coluna de frações é 160% de CMV e continua 1,6."""
+    divisor, proporcao = gps_integ._escala_percentual_da_coluna(_coluna([0.6, 0.45, 0.72, 1.6]))
+    assert divisor == 1.0
+    assert proporcao == pytest.approx(0.75)
+
+
+def test_coluna_em_percentual_divide_ate_o_valor_menor_que_1():
+    """O espelho: numa coluna 0-100, o 0,5 não é "meio" — é meio por cento."""
+    divisor, _ = gps_integ._escala_percentual_da_coluna(_coluna([60, 45, 72, 0.5]))
+    assert divisor == 100.0
+    assert _pct_normalizado([60, 45, 72, 0.5]) == [
+        pytest.approx(0.60), pytest.approx(0.45), pytest.approx(0.72), pytest.approx(0.005),
+    ]
+
+
+def test_zero_nao_vota_na_escala():
+    """Zero é o mesmo nas duas escalas (0/1 == 0/100). Se contasse, uma
+    planilha com muito CMV zerado seria declarada "em fração" sem nenhuma
+    evidência, e os 60/45 ao lado ficariam intactos como 6000% de CMV."""
+    valores = [0, 0, 0, 0, 0, 0, 0, 60, 45]
+    divisor, _ = gps_integ._escala_percentual_da_coluna(_coluna(valores))
+    assert divisor == 100.0
+    assert _pct_normalizado(valores)[-2:] == [pytest.approx(0.60), pytest.approx(0.45)]
+
+
+def test_empate_em_50_por_cento_fica_em_fracao():
+    """Regra de desempate explícita, pra não depender de arredondamento: com
+    metade dos valores de cada lado, a coluna fica como está (divisor 1). É a
+    escolha conservadora — não dividir preserva o dado bruto, e dividir
+    destruiria a informação de CMV alto sem maioria que justificasse."""
+    divisor, proporcao = gps_integ._escala_percentual_da_coluna(_coluna([0.6, 0.45, 60, 45]))
+    assert proporcao == pytest.approx(0.5)
+    assert divisor == 1.0
+
+
+def test_coluna_sem_valor_util_nao_quebra_nem_inventa_escala():
+    """Coluna toda zerada, toda vazia ou toda inconversível: divisor neutro,
+    nenhuma exceção."""
+    for valores in ([0, 0, 0], [None, None], ["abc", "abc"], []):
+        divisor, _ = gps_integ._escala_percentual_da_coluna(
+            gps_integ._numeros_de_percentual(_coluna(valores))
+        )
+        assert divisor == 1.0
+
+
+# ---------------------------------------------------------------------------
+# A conversão pra número (o que `normalizar_percentual` fazia valor a valor)
+# ---------------------------------------------------------------------------
+
+def test_texto_com_simbolo_e_virgula_continua_sendo_lido():
+    """O que se perderia se a conversão virasse um `pd.to_numeric` puro:
+    "65%" e "65,5" viram NaN nele, e a linha inteira seria contada como lixo.
+    A limpeza de string que `normalizar_percentual` fazia continua existindo —
+    só que aplicada às células que sobraram, não à coluna inteira."""
+    numeros = gps_integ._numeros_de_percentual(_coluna(["65%", "65,5%", " 70 ", "0,84"]))
+    assert list(numeros) == [
+        pytest.approx(65.0), pytest.approx(65.5), pytest.approx(70.0), pytest.approx(0.84),
+    ]
+
+
+def test_valor_inconversivel_vira_nan_e_a_linha_conta_como_lixo():
+    """Mesmo desfecho do `try/except` do laço antigo, agora pela máscara."""
+    df = pd.DataFrame({
+        "cnpj": ["00000000000001"] * 3,
+        "ean": ["7890000000001", "7890000000002", "7890000000003"],
+        "descricao": ["A", "B", "C"],
+        "quantidade": [1, 1, 1],
+        "fat_liquido": [10.0, 10.0, 10.0],
+        "pct_cmv": [0.5, "abc", None],
+        "estoque": [0, 0, 0],
+    })
+    colunas = gps_integ._colunas_normalizadas(df, {campo: campo for campo in CAMPOS})
+    assert colunas["descartar"] == [False, True, True]
+
+
+def test_coluna_inteira_de_datas_nao_vira_numero_gigante():
+    """Armadilha do `pd.to_numeric`: numa coluna de dtype datetime ele não
+    devolve NaN — devolve nanossegundos desde 1970, um número enorme,
+    silencioso e perfeitamente plausível pra o resto do código. O `float()`
+    do laço antigo levantava e a linha virava lixo; é esse desfecho que vale."""
+    numeros = gps_integ._numeros_de_percentual(pd.Series(pd.to_datetime(["2026-01-01", "2026-02-01"])))
+    assert numeros.isna().all()
+
+
+# ---------------------------------------------------------------------------
+# Aviso de coluna com escalas misturadas
+# ---------------------------------------------------------------------------
+
+def test_coluna_com_escalas_misturadas_avisa(caplog):
+    """Perto do empate (aqui 3 valores em fração contra 2 em percentual),
+    nenhuma escolha salva a coluna: metade vira dado errado de qualquer jeito.
+    O que cabe é não ficar calado sobre isso."""
+    with caplog.at_level(logging.WARNING, logger=gps_integ.logger.name):
+        gps_integ._percentuais_na_escala_da_coluna(_coluna([0.6, 0.45, 0.7, 60, 45]))
+    assert any("mistura escalas" in registro.getMessage() for registro in caplog.records)
+
+
+def test_coluna_homogenea_nao_avisa(caplog):
+    """Guarda contra o aviso virar ruído. A coluna aqui é o caso NORMAL de um
+    arquivo em fração: a maioria entre 0 e 1 e um 1,6 no meio — que não é
+    sujeira, é CMV de 160%, o dado que o sistema procura. Se isso avisasse,
+    toda planilha real avisaria e o aviso perderia o sentido."""
+    with caplog.at_level(logging.WARNING, logger=gps_integ.logger.name):
+        gps_integ._percentuais_na_escala_da_coluna(_coluna([0.6, 0.45, 0.7, 1.6, 0.0]))
+    assert caplog.records == []
+
+
+# ---------------------------------------------------------------------------
+# O contrato com a Gruppy
+# ---------------------------------------------------------------------------
+
+def test_gruppy_continua_com_a_heuristica_por_valor():
+    """`normalizar_percentual` NÃO foi alterada — e não pode ser. O desconto
+    da Gruppy (`integrations/gruppy.py`) depende dela, e lá a regra por valor
+    está certa: 1,6 é 1,6% de desconto, nunca 160%. Se alguém "consertar" a
+    função pra resolver o CMV, quebra o desconto sem que nada mais aponte."""
+    assert normalizar_percentual(1.6) == pytest.approx(0.016)
+    assert normalizar_percentual(0.84) == pytest.approx(0.84)
+    assert normalizar_percentual("84%") == pytest.approx(0.84)
+
+
+def test_gps_nao_usa_mais_normalizar_percentual():
+    """Prova negativa direta, no nível do módulo: `integrations/gps.py` não
+    importa mais `normalizar_percentual`, então não tem como chamá-la. Se
+    alguém reintroduzir o import pra "reaproveitar" a função, este teste cai
+    antes de o bug do CMV > 100% voltar calado."""
+    assert not hasattr(gps_integ, "normalizar_percentual"), (
+        "gps.py voltou a importar normalizar_percentual — a decisão de escala "
+        "por coluna deixa de valer se a regra por valor for usada de novo."
+    )

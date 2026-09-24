@@ -1,0 +1,390 @@
+"""Atalho de releitura das linhas de CNPJ órfão (integrations/gps_cache_orfaos.py).
+
+Resolver um CNPJ órfão obriga a recuperar as linhas daquele CNPJ, que só
+existiam dentro do .xlsx original — e reabrir o Excel custa ~7s por arquivo
+numa planilha real de 142 mil linhas, pra inserir talvez algumas centenas de
+linhas. O atalho grava essas linhas, já normalizadas, num arquivo lateral no
+momento do upload.
+
+O teste que sustenta o item inteiro é o primeiro: reprocessar PELO ATALHO
+tem que gravar exatamente os mesmos registros que reprocessar pelo Excel. Um
+atalho que fosse mais rápido e gravasse dado diferente seria pior do que não
+existir — por isso a comparação é registro a registro, campo a campo, e não
+uma contagem de linhas.
+
+Os demais testes cobrem o que acontece quando o atalho NÃO serve (ausente,
+corrompido, de versão desconhecida): em todos, o sistema volta a ler o Excel
+e o resultado continua certo. O atalho é otimização, nunca fonte da verdade —
+o .xlsx é.
+"""
+from __future__ import annotations
+
+import gzip
+import io
+import json
+
+import pandas as pd
+import pytest
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
+
+from core.models import Base, FilaCnpjOrfao, FSNode, Loja, RegistroCompraGPS, UploadGPS
+from integrations import gps as gps_integ
+from integrations import gps_cache_orfaos
+from storage import filesystem as fs
+
+CNPJ_CADASTRADO = "00000000000001"
+CNPJ_ORFAO = "00000000000009"
+
+
+def _xlsx_bytes(linhas: list[dict]) -> bytes:
+    buffer = io.BytesIO()
+    pd.DataFrame(linhas).to_excel(buffer, index=False)
+    return buffer.getvalue()
+
+
+def _linha(cnpj: str, ean: str, **extra) -> dict:
+    base = {
+        "cnpj": cnpj, "ean": ean, "descricao": f"PRODUTO {ean}",
+        "quantidade": 10, "fat_liquido": 1000.0, "pct_cmv": 0.6, "estoque": 5,
+        "laboratorio": "EMS", "razaosocial": "FARMACIA NOVA LTDA",
+    }
+    base.update(extra)
+    return base
+
+
+def _planilha_com_orfaos() -> bytes:
+    """Três linhas do CNPJ já cadastrado, quatro do CNPJ órfão, e uma linha
+    de lixo do PRÓPRIO CNPJ órfão (EAN vazio) — essa última existe pra provar
+    que ela não entra no atalho nem no reprocesso por nenhum dos caminhos."""
+    return _xlsx_bytes([
+        _linha(CNPJ_CADASTRADO, "7890000000001"),
+        _linha(CNPJ_ORFAO, "7890000000002", quantidade=3, fat_liquido=300.0, pct_cmv=0.55),
+        _linha(CNPJ_CADASTRADO, "7890000000003", estoque=0),
+        _linha(CNPJ_ORFAO, "7890000000004", quantidade=7, fat_liquido=70.5, laboratorio=None),
+        _linha(CNPJ_ORFAO, "", descricao="RODAPE"),                      # lixo, do CNPJ órfão
+        _linha(CNPJ_ORFAO, "7890000000006", pct_cmv=1.6),                # CMV acima de 100%
+        _linha(CNPJ_CADASTRADO, "7890000000007"),
+        _linha(CNPJ_ORFAO, "7890000000008", quantidade=0),               # quantidade zero -> custo 0
+    ])
+
+
+@pytest.fixture()
+def ambiente(tmp_path, monkeypatch):
+    """Sessão + storage local isolados. O reset de `_backend_instancia` não é
+    decorativo: `fs.backend()` é um singleton de processo que guarda o
+    diretório base recebido na PRIMEIRA construção, então sem isso um teste
+    escreveria no tmp_path de outro."""
+    def montar(nome: str):
+        from core import config as core_config
+
+        destino = tmp_path / nome
+        destino.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(core_config.settings, "local_storage_dir", destino)
+        monkeypatch.setattr(fs, "_backend_instancia", None)
+
+        engine = create_engine("sqlite:///:memory:", future=True)
+        Base.metadata.create_all(engine)
+        session = Session(engine)
+        session.add(Loja(cnpj=CNPJ_CADASTRADO, razao_social="Farmácia 1", uf="SP", cidade="São Paulo"))
+        session.flush()
+        return session, fs.garantir_raiz(session).id
+
+    return montar
+
+
+def _subir_planilha(session, raiz_id) -> UploadGPS:
+    gps_integ.processar_planilha_gps(
+        session, _planilha_com_orfaos(), "gps.xlsx", "admin", raiz_id, ano_mes="2026-08",
+    )
+    return session.execute(select(UploadGPS)).scalar_one()
+
+
+def _resolver_o_orfao(session) -> int:
+    loja = Loja(cnpj=CNPJ_ORFAO, razao_social="Farmácia 9", uf="SP", cidade="São Paulo")
+    session.add(loja)
+    session.flush()
+    fila = session.execute(
+        select(FilaCnpjOrfao).where(FilaCnpjOrfao.cnpj == CNPJ_ORFAO)
+    ).scalar_one()
+    return gps_integ.resolver_cnpj_orfao(session, fila.id, loja.id, "admin")
+
+
+def _registros(session) -> list[tuple]:
+    return [
+        (r.ean, float(r.quantidade), float(r.fat_liquido), float(r.pct_cmv),
+         float(r.custo_unitario), float(r.estoque), r.descricao_origem, r.laboratorio_compra)
+        for r in session.execute(
+            select(RegistroCompraGPS).order_by(RegistroCompraGPS.ean)
+        ).scalars()
+    ]
+
+
+# ---------------------------------------------------------------------------
+# 1. O teste que sustenta o item: atalho e Excel gravam a MESMA coisa
+# ---------------------------------------------------------------------------
+
+def test_reprocesso_pelo_atalho_grava_o_mesmo_que_pelo_excel(ambiente):
+    """Mesma planilha, mesmo CNPJ resolvido, dois caminhos de leitura. Se o
+    atalho divergir em QUALQUER campo de QUALQUER registro, isto estoura
+    apontando qual — não é um `assert` de contagem."""
+    sessao_atalho, raiz_atalho = ambiente("com_atalho")
+    upload = _subir_planilha(sessao_atalho, raiz_atalho)
+    assert upload.storage_key_orfaos, "o upload deveria ter gravado o atalho"
+    inseridas_atalho = _resolver_o_orfao(sessao_atalho)
+    resultado_atalho = _registros(sessao_atalho)
+
+    sessao_excel, raiz_excel = ambiente("sem_atalho")
+    upload = _subir_planilha(sessao_excel, raiz_excel)
+    upload.storage_key_orfaos = None  # simula upload anterior a este atalho
+    sessao_excel.flush()
+    inseridas_excel = _resolver_o_orfao(sessao_excel)
+    resultado_excel = _registros(sessao_excel)
+
+    assert inseridas_atalho == inseridas_excel
+    assert resultado_atalho == resultado_excel
+    # E o cenário precisa ter exercitado alguma coisa: 3 linhas do CNPJ já
+    # cadastrado + 4 do órfão (a de EAN vazio é lixo e não entra).
+    assert len(resultado_atalho) == 7
+    assert inseridas_atalho == 4
+
+
+def test_reprocesso_pelo_atalho_nao_abre_o_excel(ambiente, monkeypatch):
+    """A prova de que a economia é real. `filesystem.ler_arquivo` é o único
+    caminho pelo qual o .xlsx é lido; o atalho usa `backend().ler` direto,
+    então contar aqui separa um do outro sem ambiguidade."""
+    session, raiz = ambiente("nao_abre")
+    _subir_planilha(session, raiz)
+
+    chamadas = {"total": 0}
+    original = fs.ler_arquivo
+
+    def espiao(node):
+        chamadas["total"] += 1
+        return original(node)
+
+    monkeypatch.setattr(fs, "ler_arquivo", espiao)
+    _resolver_o_orfao(session)
+
+    assert chamadas["total"] == 0, (
+        f"o reprocesso reabriu o .xlsx {chamadas['total']}x mesmo com o atalho gravado"
+    )
+
+
+def test_sem_atalho_o_reprocesso_ainda_abre_o_excel(ambiente, monkeypatch):
+    """Contraprova do teste acima: sem ele, um atalho que silenciosamente não
+    fizesse nada passaria pelos dois testes."""
+    session, raiz = ambiente("abre")
+    upload = _subir_planilha(session, raiz)
+    upload.storage_key_orfaos = None
+    session.flush()
+
+    chamadas = {"total": 0}
+    original = fs.ler_arquivo
+
+    def espiao(node):
+        chamadas["total"] += 1
+        return original(node)
+
+    monkeypatch.setattr(fs, "ler_arquivo", espiao)
+    _resolver_o_orfao(session)
+
+    assert chamadas["total"] == 1, "sem atalho, o reprocesso tem que reler o arquivo uma vez"
+
+
+# ---------------------------------------------------------------------------
+# 2. Ida e volta sem perder tipo
+# ---------------------------------------------------------------------------
+
+def test_ida_e_volta_preserva_cnpj_com_zero_a_esquerda_e_none(ambiente):
+    """Os dois modos clássicos de corromper esse dado numa serialização
+    descuidada: CNPJ "00000000000001" virar o número 1 (foi o bug que
+    `_somente_digitos` existe pra evitar) e `None` virar `""` (laboratório
+    ausente tem que chegar ao banco como NULL, não como texto vazio)."""
+    session, raiz = ambiente("ida_volta")
+    node = fs.salvar_arquivo(session, raiz, "gps.xlsx", b"conteudo", "admin")
+    upload = UploadGPS(fs_node_id=node.id, ano_mes="2026-08", criado_por="admin")
+    session.add(upload)
+    session.flush()
+
+    colunas = {
+        "cnpj": ["00000000000001", "00000000000009", "30208213000174"],
+        "ean": ["7890000000001", "0000000000123", "789"],
+        "descricao": ["DIPIRONA", "", "  ESPAÇO  "],
+        "laboratorio": [None, "EMS", ""],
+        "razao_social": ["FARMACIA X", None, ""],
+        "quantidade": [1.0, 0.0, 3.5],
+        "fat_liquido": [10.0, -20.5, 0.0],
+        "pct_cmv": [0.6, 1.6, 0.0],
+        "estoque": [5.0, 0.0, 2.0],
+        "descartar": [False, False, False],
+    }
+    gravadas = gps_cache_orfaos.gravar(session, upload, node, {"colunas": colunas, "indices": [0, 1, 2]})
+    assert gravadas == 3
+
+    volta = gps_cache_orfaos.ler(upload)
+    assert volta == colunas, "a ida e volta mudou algum valor ou algum tipo"
+
+
+def test_atalho_guarda_so_as_linhas_orfas_nao_a_planilha_inteira(ambiente):
+    """O ponto do custo: o atalho é uma FATIA do arquivo. Se guardasse tudo,
+    ele cresceria junto com a planilha e a economia sumiria."""
+    session, raiz = ambiente("fatia")
+    upload = _subir_planilha(session, raiz)
+
+    volta = gps_cache_orfaos.ler(upload)
+    assert volta is not None
+    # 4 linhas boas do CNPJ órfão — nem as 3 do CNPJ cadastrado, nem a de lixo.
+    assert len(volta["ean"]) == 4
+    assert set(volta["cnpj"]) == {CNPJ_ORFAO}
+    assert "" not in volta["ean"]
+
+
+def test_linha_orfa_nunca_e_lixo(ambiente):
+    """A premissa estrutural que permite NÃO guardar o campo `descartar` e
+    reconstruí-lo como False na leitura: no laço de `_processar_linhas`, a
+    checagem de linha-lixo vem ANTES da de CNPJ órfão. Se alguém inverter
+    essa ordem, este teste cai — e o atalho passaria a reinjetar lixo."""
+    session, raiz = ambiente("premissa")
+    saida: dict = {}
+    df = pd.read_excel(io.BytesIO(_planilha_com_orfaos()))
+    mapa = gps_integ.mapear_colunas(df)
+    gps_integ._processar_linhas(
+        session, df, mapa, "2026-08", fs.garantir_raiz(session).id,
+        {CNPJ_CADASTRADO: session.execute(select(Loja)).scalars().first()},
+        cache_candidatos={}, cache_eans_resolvidos={}, saida_orfaos=saida,
+    )
+    assert saida["indices"], "o cenário precisa ter pelo menos uma linha órfã"
+    assert not any(saida["colunas"]["descartar"][i] for i in saida["indices"])
+
+
+def test_reprocesso_nao_coleta_linhas_para_um_novo_atalho(ambiente):
+    """No reprocesso, as linhas processadas JÁ NÃO são órfãs — o CNPJ delas
+    acabou de ser vinculado a uma loja. Um atalho novo gravado aí guardaria
+    linhas que nunca mais serão reprocessadas, dizendo o contrário.
+
+    O que garante isso não é um `if`, e sim uma invariante de
+    `_reprocessar_cnpjs`: `lojas_por_cnpj` e `apenas_cnpjs` são montados a
+    partir do MESMO conjunto de CNPJs resolvidos, então toda linha que passa
+    pelo filtro tem loja e o ramo de CNPJ órfão fica inalcançável. Este teste
+    trava a invariante: se alguém passar a chamar `_processar_linhas` com
+    `apenas_cnpjs` mais largo que `lojas_por_cnpj`, ele cai."""
+    session, raiz = ambiente("reprocesso_limpo")
+    df = pd.read_excel(io.BytesIO(_planilha_com_orfaos()))
+    mapa = gps_integ.mapear_colunas(df)
+    loja_orfa = Loja(cnpj=CNPJ_ORFAO, razao_social="Farmácia 9", uf="SP", cidade="São Paulo")
+    session.add(loja_orfa)
+    session.flush()
+
+    saida: dict = {}
+    contadores = gps_integ._processar_linhas(
+        session, df, mapa, "2026-08", fs.garantir_raiz(session).id,
+        {CNPJ_ORFAO: loja_orfa}, apenas_cnpjs={CNPJ_ORFAO},
+        cache_candidatos={}, cache_eans_resolvidos={}, saida_orfaos=saida,
+    )
+    assert contadores["processados"] == 4, "o cenário precisa ter processado as linhas do CNPJ resolvido"
+    assert saida["indices"] == [], "reprocesso não pode alimentar um atalho novo"
+
+
+# ---------------------------------------------------------------------------
+# 3. Quando o atalho não serve, o Excel salva o dia
+# ---------------------------------------------------------------------------
+
+def test_atalho_corrompido_cai_para_o_excel(ambiente):
+    """Bytes que não são gzip/JSON: não pode levantar, não pode perder linha
+    — tem que reler o Excel e gravar tudo igual."""
+    session, raiz = ambiente("corrompido")
+    upload = _subir_planilha(session, raiz)
+    fs.backend().salvar(upload.storage_key_orfaos, b"isto nao e um gzip")
+
+    assert gps_cache_orfaos.ler(upload) is None
+    assert _resolver_o_orfao(session) == 4
+
+
+def test_atalho_de_versao_desconhecida_e_ignorado(ambiente):
+    """Atalho gravado por uma versão futura do formato: melhor reler o Excel
+    do que interpretar na marra um conteúdo cujo significado mudou."""
+    session, raiz = ambiente("versao")
+    upload = _subir_planilha(session, raiz)
+    pacote = {"versao": gps_cache_orfaos.VERSAO_FORMATO + 1, "colunas": {"ean": ["789"]}}
+    fs.backend().salvar(upload.storage_key_orfaos, gzip.compress(json.dumps(pacote).encode()))
+
+    assert gps_cache_orfaos.ler(upload) is None
+    assert _resolver_o_orfao(session) == 4
+
+
+def test_atalho_sumido_do_storage_cai_para_o_excel(ambiente):
+    """O registro no banco aponta pra uma chave que não existe mais (limpeza
+    manual no Spaces, por exemplo)."""
+    session, raiz = ambiente("sumido")
+    upload = _subir_planilha(session, raiz)
+    fs.backend().excluir_fisicamente(upload.storage_key_orfaos)
+
+    assert gps_cache_orfaos.ler(upload) is None
+    assert _resolver_o_orfao(session) == 4
+
+
+def test_falha_ao_gravar_o_atalho_nao_derruba_o_upload(ambiente, monkeypatch):
+    """O atalho é otimização de uma leitura futura. Se o storage recusar a
+    gravação dele, o upload do usuário — que já leu, tratou e gravou a
+    planilha inteira — não pode falhar por causa disso."""
+    session, raiz = ambiente("falha")
+    original = fs.backend().salvar
+    chamadas = {"total": 0}
+    # Ligado só durante o upload: `monkeypatch.undo()` desfaria TAMBÉM o
+    # isolamento de storage montado pela fixture, e o reprocesso iria
+    # procurar o .xlsx no diretório errado.
+    falhar = {"ativo": True}
+
+    def salvar_que_falha_no_atalho(storage_key, conteudo):
+        chamadas["total"] += 1
+        if falhar["ativo"] and storage_key.endswith(".orfaos.json.gz"):
+            raise OSError("storage fora do ar")
+        return original(storage_key, conteudo)
+
+    monkeypatch.setattr(fs.backend(), "salvar", salvar_que_falha_no_atalho)
+    upload = _subir_planilha(session, raiz)
+
+    assert chamadas["total"] == 2, "deveria ter tentado gravar o .xlsx e o atalho"
+    assert upload.storage_key_orfaos is None, "atalho que falhou tem que ficar NULL, não meio gravado"
+
+    falhar["ativo"] = False
+    assert _resolver_o_orfao(session) == 4, "sem atalho, o reprocesso pelo Excel tem que funcionar"
+
+
+def test_upload_sem_cnpj_orfao_nao_grava_atalho(ambiente):
+    """Nenhuma linha órfã, nenhum arquivo lateral: não há reprocesso possível
+    pra esse upload, então guardar qualquer coisa seria lixo no storage."""
+    session, raiz = ambiente("sem_orfao")
+    gps_integ.processar_planilha_gps(
+        session,
+        _xlsx_bytes([_linha(CNPJ_CADASTRADO, "7890000000001")]),
+        "gps.xlsx", "admin", raiz, ano_mes="2026-08",
+    )
+    upload = session.execute(select(UploadGPS)).scalar_one()
+    assert upload.storage_key_orfaos is None
+    assert gps_cache_orfaos.ler(upload) is None
+
+
+# ---------------------------------------------------------------------------
+# 4. Ciclo de vida: o atalho morre junto com o upload
+# ---------------------------------------------------------------------------
+
+def test_excluir_upload_devolve_a_chave_do_atalho_para_purga(ambiente):
+    """`excluir_upload_gps_definitivamente` só mexe no banco — quem apaga o
+    byte físico é a tela, DEPOIS do commit (mesmo cuidado do .xlsx, ver a
+    docstring daquela função). O que se testa aqui é que a chave do atalho
+    chega até lá; sem isso ele ficaria órfão no Spaces pra sempre."""
+    session, raiz = ambiente("exclusao")
+    upload = _subir_planilha(session, raiz)
+    chave = upload.storage_key_orfaos
+    node_id = upload.fs_node_id
+    assert chave
+
+    resultado = gps_integ.excluir_upload_gps_definitivamente(session, node_id)
+    assert resultado.storage_key_orfaos == chave
+
+    fs.backend().excluir_fisicamente(resultado.storage_key_orfaos)
+    assert not (fs.backend().base_dir / chave).exists()
+    assert session.execute(select(UploadGPS)).scalar_one_or_none() is None
+    assert session.execute(select(FSNode).where(FSNode.id == node_id)).scalar_one_or_none() is None

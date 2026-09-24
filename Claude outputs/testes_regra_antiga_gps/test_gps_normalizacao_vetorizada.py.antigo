@@ -1,0 +1,505 @@
+"""Testes do item 5 da reforma: a normalização de CNPJ, EAN, descrição e
+valores sai de dentro do laço linha a linha e passa a acontecer uma vez só,
+de forma vetorizada, antes dele.
+
+O problema: `_processar_linhas` fazia, para CADA uma das ~150 mil linhas de
+uma planilha GPS real, `_somente_digitos` + `normalizar_ean` +
+`normalizar_percentual` + três `float()` + meia dúzia de `pd.notna()`, tudo
+em Python puro. O custo crescia com o número de LINHAS quando o trabalho
+real cresce com o número de valores DISTINTOS — algumas dezenas de CNPJs,
+alguns milhares de EANs.
+
+Três grupos de prova, nesta ordem de importância:
+
+1. EQUIVALÊNCIA (`test_...mesmo_resultado_do_laco_linha_a_linha`): sobre um
+   corpus de valores adversariais (EAN como float do Excel, CNPJ sem zero à
+   esquerda, percentual em três escalas, célula vazia, texto inconversível),
+   o resultado vetorizado é comparado com uma reimplementação LITERAL do
+   laço antigo, escrita aqui dentro como oráculo. É o teste que impede a
+   otimização de mudar dado.
+
+2. CUSTO (`test_...uma_vez_por_valor_distinto`): conta quantas vezes cada
+   função de normalização é chamada. Com 300 linhas e 3 valores distintos,
+   tem que ser 3 chamadas — não 300. É o análogo do contador de consultas
+   do item 4/5, só que pra custo de CPU em vez de ida ao banco.
+
+3. ESCOPO DA CONSULTA (`test_cache_...`): o pré-carregamento de "quais EANs
+   já estão resolvidos" traz só os EANs que a planilha usa, em lotes, e
+   reaproveita o que já está em memória entre arquivos.
+"""
+from __future__ import annotations
+
+import io
+import itertools
+
+import pandas as pd
+import pytest
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.orm import Session
+
+from core.models import Base, BaseGenerico, EanGenerico, Loja, OrigemResolucao
+from integrations import gps as gps_integ
+from reconciliation import motor as reconciliation_motor
+from reconciliation.normalizador import normalizar_ean
+from storage import filesystem as fs
+
+CAMPOS = ["cnpj", "ean", "descricao", "quantidade", "fat_liquido", "pct_cmv", "estoque"]
+
+
+def _xlsx_bytes(linhas: list[dict]) -> bytes:
+    buffer = io.BytesIO()
+    pd.DataFrame(linhas).to_excel(buffer, index=False)
+    return buffer.getvalue()
+
+
+@pytest.fixture()
+def session(tmp_path, monkeypatch):
+    from core import config as core_config
+
+    monkeypatch.setattr(core_config.settings, "local_storage_dir", tmp_path)
+    engine = create_engine("sqlite:///:memory:", future=True)
+    Base.metadata.create_all(engine)
+    with Session(engine) as s:
+        yield s
+
+
+@pytest.fixture()
+def pasta_raiz_id(session):
+    return fs.garantir_raiz(session).id
+
+
+# --------------------------------------------------------------------------
+# 1. Equivalência com o laço antigo
+# --------------------------------------------------------------------------
+
+def _divisor_de_escala_do_oraculo(coluna) -> float:
+    """A decisão de escala por coluna, reescrita À MÃO aqui (não importada de
+    `gps`) — senão o oráculo deixaria de ser uma implementação independente e
+    passaria a comparar o código com ele mesmo.
+
+    Percorre a coluna uma vez, guarda os valores não-zero conversíveis e
+    devolve 1 (coluna em fração) ou 100 (coluna em percentual 0-100)."""
+    numeros = []
+    for valor in coluna:
+        bruto = valor
+        if isinstance(bruto, str):
+            bruto = bruto.strip().replace("%", "").replace(",", ".")
+        try:
+            numero = float(bruto)
+        except (ValueError, TypeError):
+            continue
+        if numero != numero or numero == 0:  # NaN ou zero não votam
+            continue
+        numeros.append(numero)
+    if not numeros:
+        return 1.0
+    em_fracao = sum(1 for numero in numeros if abs(numero) <= 1)
+    return 1.0 if em_fracao >= 0.5 * len(numeros) else 100.0
+
+
+def _percentual_do_oraculo(valor, divisor: float) -> float:
+    """O que o laço antigo fazia por linha (`normalizar_percentual`), menos a
+    decisão de escala, que agora vem pronta de fora. Continua LEVANTANDO em
+    valor inconversível — é o `try/except` do laço que transforma isso em
+    linha de lixo, e essa parte não mudou."""
+    if isinstance(valor, str):
+        valor = valor.strip().replace("%", "").replace(",", ".")
+    return float(valor) / divisor
+
+
+def _oraculo_linha_a_linha(df: pd.DataFrame, mapa: dict[str, str]) -> list[dict]:
+    """Reimplementação LITERAL da normalização que ficava dentro do laço de
+    `_processar_linhas` antes deste item — copiada trecho a trecho, inclusive
+    a ordem das checagens e o `try/except`.
+
+    UMA mudança em relação ao laço original, feita quando a escala do % CMV
+    passou a ser decidida por coluna: o divisor é calculado uma vez, ANTES do
+    laço, e cada linha só divide por ele. O resto continua linha a linha, que
+    é o ponto do oráculo."""
+    bruto = gps_integ._dataframe_normalizado(df, mapa)
+    divisor_cmv = _divisor_de_escala_do_oraculo(bruto["pct_cmv"])
+    saida = []
+    for linha in bruto.itertuples(index=False):
+        cnpj_digitos = gps_integ._somente_digitos(linha.cnpj)
+        ean = normalizar_ean(linha.ean)
+
+        descartar = not cnpj_digitos or not ean or ean.lower() == "nan"
+        quantidade = fat_liquido = pct_cmv = estoque = None
+
+        if not descartar:
+            if not pd.notna(linha.quantidade) or not pd.notna(linha.fat_liquido) or not pd.notna(linha.pct_cmv):
+                descartar = True
+            else:
+                try:
+                    quantidade = float(linha.quantidade)
+                    fat_liquido = float(linha.fat_liquido)
+                    pct_cmv = _percentual_do_oraculo(linha.pct_cmv, divisor_cmv)
+                    estoque = float(linha.estoque) if pd.notna(linha.estoque) else 0.0
+                except (ValueError, TypeError):
+                    descartar = True
+
+        descricao = str(linha.descricao).strip() if pd.notna(linha.descricao) else ""
+        laboratorio_compra = None
+        if pd.notna(linha.laboratorio):
+            texto = str(linha.laboratorio).strip()
+            laboratorio_compra = texto if texto and texto.lower() != "nan" else None
+        razao_social = str(linha.razao_social).strip() if pd.notna(linha.razao_social) else None
+
+        saida.append({
+            "cnpj": cnpj_digitos, "ean": ean, "descricao": descricao,
+            "laboratorio": laboratorio_compra, "razao_social": razao_social,
+            "quantidade": quantidade, "fat_liquido": fat_liquido,
+            "pct_cmv": pct_cmv, "estoque": estoque, "descartar": descartar,
+        })
+    return saida
+
+
+def _corpus_adversarial(com_colunas_opcionais: bool) -> pd.DataFrame:
+    """Valores que já apareceram (ou plausivelmente aparecem) numa planilha
+    GPS real, combinados em ciclos de comprimentos primos entre si pra gerar
+    muitas combinações distintas sem montar o produto cartesiano inteiro.
+
+    A string literal "nan" NÃO entra nas colunas numéricas de propósito: é a
+    única divergência deliberada entre as duas implementações, coberta por
+    `test_string_nan_em_coluna_numerica_passa_a_contar_como_lixo`."""
+    cnpjs = ["30.208.213/0001-74", "00000000000001", 208213000174, 30208213000174.0, None, "", "   ", "sem digito"]
+    eans = ["7891234567890", 7891234567890, 7891234567890.0, "7891234567890.0", " 789 123 ", "nan", None, "", "abc"]
+    descricoes = ["  DIPIRONA 500MG  ", None, 123, "", "AMOXICILINA"]
+    quantidades = [1, "2", 3.5, 0, None, "abc", 7]
+    faturamentos = [10.0, "20.5", 0, None, "20,5", 33]
+    percentuais = [0.5, 65, "65%", "65,5%", 1, 0, None, "abc"]
+    estoques = [5, None, "abc", 0, "3"]
+
+    ciclos = [
+        itertools.cycle(cnpjs), itertools.cycle(eans), itertools.cycle(descricoes),
+        itertools.cycle(quantidades), itertools.cycle(faturamentos),
+        itertools.cycle(percentuais), itertools.cycle(estoques),
+    ]
+    dados = {campo: [next(ciclo) for _ in range(360)] for campo, ciclo in zip(CAMPOS, ciclos)}
+    if com_colunas_opcionais:
+        laboratorios = ["EMS", None, "  ", "nan", "  MEDLEY  "]
+        razoes = ["FARMACIA X LTDA", None, "  ", 42]
+        dados["laboratorio"] = [laboratorios[i % len(laboratorios)] for i in range(360)]
+        dados["razao_social"] = [razoes[i % len(razoes)] for i in range(360)]
+    return pd.DataFrame(dados)
+
+
+@pytest.mark.parametrize("com_colunas_opcionais", [True, False])
+def test_normalizacao_vetorizada_da_o_mesmo_resultado_do_laco_linha_a_linha(com_colunas_opcionais):
+    """O teste que sustenta o item inteiro. Se a vetorização mudar QUALQUER
+    valor em QUALQUER caso de borda do corpus, ele estoura apontando a linha
+    e o campo — não é um `assert` global de "deu certo"."""
+    df = _corpus_adversarial(com_colunas_opcionais)
+    mapa = {campo: campo for campo in CAMPOS}
+    if com_colunas_opcionais:
+        mapa["laboratorio"] = "laboratorio"
+        mapa["razao_social"] = "razao_social"
+
+    esperado = _oraculo_linha_a_linha(df, mapa)
+    obtido = gps_integ._colunas_normalizadas(df, mapa)
+
+    assert len(obtido["ean"]) == len(esperado)
+
+    for indice, referencia in enumerate(esperado):
+        for campo in ("cnpj", "ean", "descricao", "laboratorio", "razao_social", "descartar"):
+            assert obtido[campo][indice] == referencia[campo], (
+                f"linha {indice}, campo {campo}: vetorizado={obtido[campo][indice]!r} "
+                f"laço antigo={referencia[campo]!r}"
+            )
+        if referencia["descartar"]:
+            # Linha descartada não chega a virar registro — os numéricos dela
+            # nunca são lidos pelo laço, então não há o que comparar.
+            continue
+        for campo in ("quantidade", "fat_liquido", "pct_cmv", "estoque"):
+            assert obtido[campo][indice] == pytest.approx(referencia[campo]), (
+                f"linha {indice}, campo {campo}: vetorizado={obtido[campo][indice]!r} "
+                f"laço antigo={referencia[campo]!r}"
+            )
+
+
+def test_o_corpus_realmente_exercita_os_dois_desfechos():
+    """Guarda contra um falso positivo do teste acima: se o corpus só tivesse
+    linha boa (ou só linha ruim), a comparação passaria sem provar nada."""
+    df = _corpus_adversarial(True)
+    mapa = {campo: campo for campo in CAMPOS} | {"laboratorio": "laboratorio", "razao_social": "razao_social"}
+    descartar = gps_integ._colunas_normalizadas(df, mapa)["descartar"]
+    assert 20 < sum(descartar) < len(descartar) - 20
+
+
+# --------------------------------------------------------------------------
+# 2. Custo: uma chamada por valor distinto, não por linha
+# --------------------------------------------------------------------------
+
+class _ContadorDeChamadas:
+    """Envolve uma função do módulo `gps` contando quantas vezes ela roda —
+    o análogo, pra custo de CPU, do contador de consultas SQL do item 4/5."""
+
+    def __init__(self, monkeypatch, nome: str):
+        original = getattr(gps_integ, nome)
+        self.total = 0
+
+        def espiao(valor, *args, **kwargs):
+            self.total += 1
+            return original(valor, *args, **kwargs)
+
+        monkeypatch.setattr(gps_integ, nome, espiao)
+
+
+def test_normalizacao_roda_uma_vez_por_valor_distinto_nao_uma_vez_por_linha(monkeypatch):
+    """300 linhas, 3 CNPJs distintos, 3 EANs distintos, 3 percentuais
+    distintos. Antes: 300 chamadas de cada função. Agora: 3 (mais uma pelo
+    valor nulo sentinela, que `pd.factorize` separa) — o custo passa a
+    acompanhar a variedade do arquivo, não o tamanho dele."""
+    cnpj_espiao = _ContadorDeChamadas(monkeypatch, "_somente_digitos")
+    ean_espiao = _ContadorDeChamadas(monkeypatch, "normalizar_ean")
+    pct_espiao = _ContadorDeChamadas(monkeypatch, "_numeros_de_percentual")
+
+    df = pd.DataFrame({
+        "cnpj": [f"{i % 3:014d}" for i in range(300)],
+        "ean": [f"789000000000{i % 3}" for i in range(300)],
+        "descricao": ["PRODUTO"] * 300,
+        "quantidade": [1] * 300,
+        "fat_liquido": [10.0] * 300,
+        "pct_cmv": [[0.5, 0.6, 0.7][i % 3] for i in range(300)],
+        "estoque": [0] * 300,
+    })
+    gps_integ._colunas_normalizadas(df, {campo: campo for campo in CAMPOS})
+
+    # Margem de 1 pro sentinela de nulo que `_mapear_por_valor_distinto`
+    # sempre avalia. O que importa é a ORDEM DE GRANDEZA: 3-4, nunca 300.
+    assert cnpj_espiao.total <= 4, f"esperava ~3 chamadas (3 CNPJs distintos), achei {cnpj_espiao.total}"
+    assert ean_espiao.total <= 4, f"esperava ~3 chamadas (3 EANs distintos), achei {ean_espiao.total}"
+    # O % CMV é o caso extremo: desde que a escala passou a ser decidida por
+    # coluna, a conversão é vetorizada de ponta a ponta — UMA chamada pra
+    # coluna inteira, independente de quantos valores distintos ela tem (no
+    # arquivo real de agosto são 113.504).
+    assert pct_espiao.total == 1, f"esperava 1 chamada (a coluna inteira de uma vez), achei {pct_espiao.total}"
+
+
+def test_nenhuma_normalizacao_sobra_dentro_do_laco_de_gravacao(session, pasta_raiz_id, monkeypatch):
+    """Verificação explícita, ponta a ponta: durante um upload inteiro, o
+    número de chamadas às funções de normalização tem que ficar preso à
+    variedade dos dados, não às 240 linhas do arquivo. Se alguém reintroduzir
+    uma conversão dentro do laço, o contador salta pra ~240 e o teste aponta.
+
+    `_somente_digitos` tem uma folga maior: `processar_planilha_gps` também o
+    usa pra normalizar o CNPJ de cada Loja cadastrada, fora do laço."""
+    for i in range(4):
+        session.add(Loja(cnpj=f"{i:014d}", razao_social=f"Farmácia {i}", uf="SP", cidade="São Paulo"))
+    session.flush()
+
+    linhas = [
+        {
+            "cnpj": f"{i % 4:014d}", "ean": f"789000000000{i % 6}", "descricao": f"PRODUTO {i % 6}",
+            "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0,
+        }
+        for i in range(240)
+    ]
+    conteudo = _xlsx_bytes(linhas)
+
+    ean_espiao = _ContadorDeChamadas(monkeypatch, "normalizar_ean")
+    pct_espiao = _ContadorDeChamadas(monkeypatch, "_numeros_de_percentual")
+    cnpj_espiao = _ContadorDeChamadas(monkeypatch, "_somente_digitos")
+
+    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-08")
+
+    assert ean_espiao.total <= 10, f"6 EANs distintos em 240 linhas, mas normalizar_ean rodou {ean_espiao.total}x"
+    assert pct_espiao.total == 1, f"a coluna de % CMV deveria ser convertida de uma vez, mas rodou {pct_espiao.total}x"
+    assert cnpj_espiao.total <= 20, f"4 CNPJs distintos (+4 lojas), mas _somente_digitos rodou {cnpj_espiao.total}x"
+
+
+# --------------------------------------------------------------------------
+# 3. Comportamento preservado ponta a ponta
+# --------------------------------------------------------------------------
+
+def test_contadores_do_upload_continuam_iguais_com_planilha_suja(session, pasta_raiz_id):
+    """Planilha de composição conhecida: 3 compras boas, 1 repetição da mesma
+    chave, 1 CNPJ não cadastrado e 5 tipos diferentes de linha ruim. Os
+    quatro contadores têm que sair exatamente como saíam antes — é o que
+    garante que juntar três checagens numa máscara só não mexeu em contagem."""
+    for i in range(1, 5):
+        session.add(Loja(cnpj=f"{i:014d}", razao_social=f"Farmácia {i}", uf="SP", cidade="São Paulo"))
+    session.flush()
+
+    boa = {"quantidade": 2, "fat_liquido": 20.0, "pct_cmv": 0.5, "estoque": 1}
+    linhas = [
+        {"cnpj": "00000000000001", "ean": "7890000000001", "descricao": "A", **boa},
+        {"cnpj": "00000000000002", "ean": "7890000000002", "descricao": "B", **boa},
+        {"cnpj": "00000000000003", "ean": "7890000000003", "descricao": "C", **boa},
+        # mesma (loja, ean) de novo, mais adiante no arquivo -> atualização
+        {"cnpj": "00000000000001", "ean": "7890000000001", "descricao": "A2", **boa},
+        # CNPJ que não é de nenhuma loja cadastrada -> fila de órfão
+        {"cnpj": "99999999999999", "ean": "7890000000004", "descricao": "D", **boa},
+        # cinco sabores de lixo
+        {"cnpj": "", "ean": "7890000000005", "descricao": "E", **boa},
+        {"cnpj": "00000000000004", "ean": "", "descricao": "F", **boa},
+        {"cnpj": "00000000000004", "ean": "7890000000006", "descricao": "G",
+         **{**boa, "quantidade": "abc"}},
+        {"cnpj": "00000000000004", "ean": "7890000000007", "descricao": "H",
+         **{**boa, "pct_cmv": "abc"}},
+        {"cnpj": "00000000000004", "ean": "7890000000008", "descricao": "I",
+         **{**boa, "estoque": "abc"}},
+    ]
+    resultado = gps_integ.processar_planilha_gps(
+        session, _xlsx_bytes(linhas), "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-09",
+    )
+
+    assert "3 compras importadas" in resultado.mensagem
+    assert "1 atualizadas" in resultado.mensagem
+    assert "1 linhas em CNPJ ainda não cadastrado" in resultado.mensagem
+    assert "5 linhas ignoradas" in resultado.mensagem
+
+
+def test_string_nan_em_coluna_numerica_passa_a_contar_como_lixo():
+    """A ÚNICA divergência deliberada em relação ao laço antigo, registrada
+    aqui de propósito.
+
+    `float("nan")` não levanta — devolve NaN. Então a string literal "nan"
+    numa coluna numérica escapava das três checagens do laço e era GRAVADA no
+    banco como NaN, exatamente o que o comentário daquele trecho dizia querer
+    impedir. `pd.to_numeric(..., errors="coerce")` a trata como valor
+    inconversível, e a linha vira lixo como qualquer outro dado ruim."""
+    df = pd.DataFrame({
+        "cnpj": ["00000000000001"] * 3,
+        "ean": ["7890000000001"] * 3,
+        "descricao": ["X"] * 3,
+        "quantidade": [1, "nan", 1],
+        "fat_liquido": [10.0, 10.0, "nan"],
+        "pct_cmv": [0.5, 0.5, 0.5],
+        "estoque": [0, 0, 0],
+    })
+    descartar = gps_integ._colunas_normalizadas(df, {campo: campo for campo in CAMPOS})["descartar"]
+    assert descartar == [False, True, True]
+
+
+def test_filtro_de_cnpj_vem_antes_da_contagem_de_lixo(session):
+    """Detalhe de ordem que a máscara vetorizada poderia ter estragado: no
+    reprocesso de CNPJ órfão (`apenas_cnpjs`), uma linha ruim de um CNPJ que
+    NÃO está sendo reprocessado não pode entrar em `linhas_lixo` — ela nem
+    diz respeito a esta operação."""
+    loja = Loja(cnpj="00000000000001", razao_social="Farmácia 1", uf="SP", cidade="São Paulo")
+    session.add(loja)
+    session.flush()
+
+    df = pd.DataFrame({
+        "cnpj": ["00000000000009", "00000000000009", "00000000000001"],
+        "ean": ["", "7890000000002", ""],          # 1ª e 3ª são lixo
+        "descricao": ["A", "B", "C"],
+        "quantidade": [1, 1, 1],
+        "fat_liquido": [10.0, 10.0, 10.0],
+        "pct_cmv": [0.5, 0.5, 0.5],
+        "estoque": [0, 0, 0],
+    })
+    contadores = gps_integ._processar_linhas(
+        session, df, {campo: campo for campo in CAMPOS}, "2026-09", 1,
+        {"00000000000001": loja}, apenas_cnpjs={"00000000000001"},
+    )
+    # Só a 3ª linha conta como lixo: as duas primeiras são de outro CNPJ.
+    assert contadores["linhas_lixo"] == 1
+    assert contadores["processados"] == 0
+
+
+# --------------------------------------------------------------------------
+# 4. Escopo da consulta de EANs já resolvidos
+# --------------------------------------------------------------------------
+
+class _ContadorDeSelects:
+    def __init__(self, engine):
+        self.total = 0
+        self._engine = engine
+
+    def _ouvir(self, conn, cursor, statement, parameters, context, executemany):
+        if "ean_genericos" in statement.lower() and statement.lower().strip().startswith("select"):
+            self.total += 1
+
+    def __enter__(self):
+        event.listen(self._engine, "before_cursor_execute", self._ouvir)
+        return self
+
+    def __exit__(self, *exc):
+        event.remove(self._engine, "before_cursor_execute", self._ouvir)
+
+
+def _semear_eans_resolvidos(session, quantidade: int, prefixo: str = "789") -> list[str]:
+    generico = BaseGenerico(nome_canonico="DIPIRONA 500MG", ativo=True)
+    session.add(generico)
+    session.flush()
+    eans = [f"{prefixo}{i:010d}" for i in range(quantidade)]
+    for ean in eans:
+        session.add(EanGenerico(
+            ean=ean, base_generico_id=generico.id, origem_resolucao=OrigemResolucao.IMPORTADA,
+            descricao_origem_snapshot="DIPIRONA 500MG", resolvido_por="teste",
+        ))
+    session.flush()
+    return eans
+
+
+def test_cache_traz_so_os_eans_do_arquivo_nao_a_tabela_inteira(session):
+    """O ponto do escopo: `ean_genericos` cresce com o catálogo inteiro, de
+    todos os fornecedores, de sempre — a planilha em processamento usa uma
+    fatia disso. O cache tem que voltar com a fatia, não com a tabela."""
+    todos = _semear_eans_resolvidos(session, 50)
+    do_arquivo = set(todos[:5]) | {"7899999999999"}  # 5 conhecidos + 1 pendente
+
+    cache: dict[str, int] = {}
+    reconciliation_motor.completar_cache_eans_resolvidos(session, do_arquivo, cache)
+
+    assert set(cache) == set(todos[:5]), "o cache deveria ter só os EANs resolvidos que o arquivo usa"
+    assert "7899999999999" not in cache, "EAN pendente não é resolvido — não entra no cache"
+    assert all(ean not in cache for ean in todos[5:]), "EAN que o arquivo não usa não deveria ser carregado"
+
+
+def test_consulta_de_eans_resolvidos_vai_em_lotes_nao_uma_por_ean(session):
+    """2500 EANs distintos viram poucas consultas em lote, não 2500 — e o
+    lote existe porque todo banco tem teto de parâmetros num `IN (...)`."""
+    eans = _semear_eans_resolvidos(session, 2500)
+
+    cache: dict[str, int] = {}
+    with _ContadorDeSelects(session.get_bind()) as contador:
+        reconciliation_motor.completar_cache_eans_resolvidos(session, set(eans), cache)
+
+    assert len(cache) == 2500
+    esperado = -(-2500 // reconciliation_motor._TAMANHO_LOTE_EANS)
+    assert contador.total == esperado, f"esperava {esperado} consultas em lote, achei {contador.total}"
+
+
+def test_cache_reaproveitado_entre_arquivos_nao_reconsulta_o_que_ja_sabe(session):
+    """É o que permite o reprocesso de CNPJ órfão ler vários arquivos sem
+    repetir trabalho: o segundo arquivo só consulta o que o primeiro ainda
+    não trouxe."""
+    eans = _semear_eans_resolvidos(session, 10)
+    cache: dict[str, int] = {}
+    reconciliation_motor.completar_cache_eans_resolvidos(session, set(eans[:6]), cache)
+
+    with _ContadorDeSelects(session.get_bind()) as contador:
+        reconciliation_motor.completar_cache_eans_resolvidos(session, set(eans[:6]), cache)
+    assert contador.total == 0, "todos os EANs já estavam no cache — não deveria consultar nada"
+
+    with _ContadorDeSelects(session.get_bind()) as contador:
+        reconciliation_motor.completar_cache_eans_resolvidos(session, set(eans), cache)
+    assert contador.total == 1, "só os 4 EANs novos justificam consulta, e cabem num lote só"
+    assert len(cache) == 10
+
+
+def test_upload_nao_carrega_mais_a_tabela_de_eans_inteira(session, pasta_raiz_id, monkeypatch):
+    """Prova negativa direta: `carregar_cache_eans_resolvidos` (que faz o
+    SELECT sem WHERE) não pode mais ser chamada pelo caminho de upload do
+    GPS. Ela continua existindo porque o Gruppy ainda a usa (item 9)."""
+    chamadas = {"total": 0}
+    original = reconciliation_motor.carregar_cache_eans_resolvidos
+
+    def espiao(sessao):
+        chamadas["total"] += 1
+        return original(sessao)
+
+    monkeypatch.setattr(reconciliation_motor, "carregar_cache_eans_resolvidos", espiao)
+
+    session.add(Loja(cnpj="00000000000001", razao_social="Farmácia 1", uf="SP", cidade="São Paulo"))
+    session.flush()
+    conteudo = _xlsx_bytes([{
+        "cnpj": "00000000000001", "ean": "7890000000001", "descricao": "A",
+        "quantidade": 1, "fat_liquido": 10.0, "pct_cmv": 0.5, "estoque": 0,
+    }])
+    gps_integ.processar_planilha_gps(session, conteudo, "gps.xlsx", "admin", pasta_raiz_id, ano_mes="2026-09")
+
+    assert chamadas["total"] == 0, "upload de GPS voltou a carregar a tabela ean_genericos inteira"
