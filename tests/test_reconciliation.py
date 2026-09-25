@@ -615,3 +615,29 @@ def test_reprocessar_fila_por_ean_existente_e_idempotente(session, monkeypatch):
     assert primeiro.resolvidos_por_ean_existente == 1
     assert segundo.itens_avaliados == 0  # já resolvido, nem entra na segunda passada
     assert segundo.resolvidos_por_ean_existente == 0
+
+
+def test_importar_base_genericos_nao_consulta_por_linha(session):
+    """Regressão de 24/09/2026: 1 consulta + 1 gravação por genérico novo
+    levava vários minutos pra carregar a base (2.210 genéricos) num banco
+    vazio do outro lado da rede. O número de instruções não pode crescer com
+    o tamanho da planilha."""
+    from sqlalchemy import event
+
+    def instrucoes(qtd, prefixo):
+        contador = {"n": 0}
+
+        def _conta(*_a, **_k):
+            contador["n"] += 1
+
+        motor_engine = session.get_bind()
+        event.listen(motor_engine, "before_cursor_execute", _conta)
+        try:
+            motor.importar_base_genericos(
+                session, [(f"{prefixo}{i:08d}", f"GENERICO {prefixo} {i}") for i in range(qtd)], "teste",
+            )
+        finally:
+            event.remove(motor_engine, "before_cursor_execute", _conta)
+        return contador["n"]
+
+    assert instrucoes(50, "1") == instrucoes(500, "2")

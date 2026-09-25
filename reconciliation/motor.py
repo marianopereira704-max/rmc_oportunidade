@@ -637,69 +637,82 @@ def importar_base_genericos(
       normalizado (ver `reconciliation.normalizador.normalizar_ean`).
 
     Cada vínculo novo criado aqui fica com origem_resolucao=IMPORTADA —
-    rastreável em separado de AUTOMATICA (fuzzy-match) e MANUAL (fila)."""
-    genericos_criados = 0
-    genericos_reaproveitados = 0
-    eans_vinculados = 0
-    eans_pulados = 0
+    rastreável em separado de AUTOMATICA (fuzzy-match) e MANUAL (fila).
+
+    Tudo em LOTE: antes era 1 SELECT por descrição nova + 1 INSERT com flush
+    por genérico criado — numa base vazia (2.210 genéricos, 7.093 EANs), ~4.400
+    idas e voltas ao Postgres em NY, vários minutos com a tela parada (medido
+    em 24/09/2026 ao carregar a base no banco do app publicado). Agora: a
+    decisão do que é novo é feita em memória, os genéricos existentes vêm em
+    blocos de nomes, e genéricos e vínculos são gravados em blocos com
+    `ON CONFLICT DO NOTHING` (seguro mesmo com dois envios ao mesmo tempo)."""
+    session.flush()  # o que já estava pendente na sessão entra antes das leituras
     linhas_invalidas = 0
+    eans_pulados = 0
+    eans_ja_resolvidos = set(session.execute(select(EanGenerico.ean)).scalars())
 
-    eans_ja_resolvidos = {row[0] for row in session.execute(select(EanGenerico.ean)).all()}
-    cache_generico_por_nome: dict[str, BaseGenerico] = {}
+    # 1. Decide em memória: o que é inválido, o que já está resolvido e o
+    #    que é vínculo novo (a primeira ocorrência de cada EAN na planilha).
+    novos: dict[str, str] = {}
+    for ean, descricao in linhas:
+        ean = (ean or "").strip()
+        descricao = (descricao or "").strip()
+        if not ean or not descricao:
+            linhas_invalidas += 1
+            continue
+        if ean in eans_ja_resolvidos or ean in novos:
+            eans_pulados += 1
+            continue
+        novos[ean] = descricao
 
-    # ver justificativa detalhada em integrations/gps.py::_processar_linhas —
-    # mesmo raciocínio: toda SELECT abaixo (cache miss de `cache_generico_por_nome`)
-    # já é seguida de `session.flush()` explícito quando cria algo novo, então
-    # autoflush implícito a cada SELECT (disparando flush do que já foi
-    # `session.add`ado no loop) é só custo redundante.
-    with session.no_autoflush:
-        for ean, descricao in linhas:
-            ean = (ean or "").strip()
-            descricao = (descricao or "").strip()
-            if not ean or not descricao:
-                linhas_invalidas += 1
-                continue
+    # 2. Genéricos: busca os que já existem (em blocos de nomes) e cria só os
+    #    que faltam — mesma descrição = mesmo genérico.
+    nomes = sorted(set(novos.values()))
+    id_por_nome = _ids_de_genericos(session, nomes)
+    faltando = [nome for nome in nomes if nome not in id_por_nome]
+    genericos_reaproveitados = len(id_por_nome)
+    for inicio in range(0, len(faltando), _TAMANHO_LOTE_EANS):
+        bloco = faltando[inicio:inicio + _TAMANHO_LOTE_EANS]
+        session.execute(
+            insert_ignorando_conflito(session, BaseGenerico.__table__, ["nome_canonico"]),
+            [{"nome_canonico": nome, "ativo": True, "criado_por": criado_por} for nome in bloco],
+        )
+    id_por_nome.update(_ids_de_genericos(session, faltando))
 
-            if ean in eans_ja_resolvidos:
-                eans_pulados += 1
-                continue
-
-            generico = cache_generico_por_nome.get(descricao)
-            if generico is None:
-                generico = session.execute(
-                    select(BaseGenerico).where(BaseGenerico.nome_canonico == descricao)
-                ).scalar_one_or_none()
-                if generico is None:
-                    generico = BaseGenerico(nome_canonico=descricao, criado_por=criado_por)
-                    session.add(generico)
-                    session.flush()
-                    genericos_criados += 1
-                else:
-                    genericos_reaproveitados += 1
-                cache_generico_por_nome[descricao] = generico
-
-            session.add(
-                EanGenerico(
-                    ean=ean,
-                    base_generico_id=generico.id,
-                    origem_resolucao=OrigemResolucao.IMPORTADA,
-                    score_similaridade=None,
-                    descricao_origem_snapshot=descricao,
-                    resolvido_por=criado_por,
-                )
-            )
-            eans_ja_resolvidos.add(ean)  # mesma planilha repetindo o EAN não deve duplicar
-            eans_vinculados += 1
-
-    session.flush()
+    # 3. Vínculos EAN -> genérico, em blocos.
+    agora = dt.datetime.utcnow()
+    vinculos = [
+        {
+            "ean": ean, "base_generico_id": id_por_nome[descricao],
+            "origem_resolucao": OrigemResolucao.IMPORTADA, "score_similaridade": None,
+            "descricao_origem_snapshot": descricao, "resolvido_por": criado_por, "resolvido_em": agora,
+        }
+        for ean, descricao in novos.items()
+    ]
+    for inicio in range(0, len(vinculos), _TAMANHO_LOTE_EANS):
+        session.execute(
+            insert_ignorando_conflito(session, EanGenerico.__table__, ["ean"]),
+            vinculos[inicio:inicio + _TAMANHO_LOTE_EANS],
+        )
 
     return ResultadoImportacaoBase(
-        genericos_criados=genericos_criados,
+        genericos_criados=len(faltando),
         genericos_reaproveitados=genericos_reaproveitados,
-        eans_vinculados=eans_vinculados,
+        eans_vinculados=len(vinculos),
         eans_pulados=eans_pulados,
         linhas_invalidas=linhas_invalidas,
     )
+
+
+def _ids_de_genericos(session: Session, nomes: list[str]) -> dict[str, int]:
+    """nome canônico -> id, em blocos (nunca uma consulta por nome)."""
+    ids: dict[str, int] = {}
+    for inicio in range(0, len(nomes), _TAMANHO_LOTE_EANS):
+        bloco = nomes[inicio:inicio + _TAMANHO_LOTE_EANS]
+        ids.update(session.execute(
+            select(BaseGenerico.nome_canonico, BaseGenerico.id).where(BaseGenerico.nome_canonico.in_(bloco))
+        ).tuples().all())
+    return ids
 
 
 @dataclass
