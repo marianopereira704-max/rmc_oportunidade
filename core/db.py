@@ -52,6 +52,17 @@ else:
         # simultâneos (a equipe RMC), não pra uma API de alto tráfego.
         "pool_size": 5,
         "max_overflow": 10,
+        # Gravações em lista (`session.execute(stmt, [linhas])`) que NÃO são
+        # INSERT simples — INSERT ... ON CONFLICT e UPDATE com bindparam —
+        # iam linha por linha no modo padrão do psycopg2: uma ida e volta até
+        # o Postgres em NY por linha. Medido em 24/09/2026: 100 linhas com ON
+        # CONFLICT levavam 14,5 s; neste modo, 2.000 linhas levam 3,3 s
+        # (UPDATE: 0,7 s). Atingia a importação da Base Genéricos (~14 min num
+        # banco vazio), a sincronização diária de lojas, a fila de EAN e o
+        # vínculo de CNPJ órfão. INSERT simples continua no "insertmanyvalues"
+        # de sempre; o que muda é só o resto, agora em páginas de 500.
+        "executemany_mode": "values_plus_batch",
+        "executemany_batch_page_size": 500,
     }
 
 if settings.db.is_sqlite:
