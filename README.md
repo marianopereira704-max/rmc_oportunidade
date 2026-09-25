@@ -218,6 +218,26 @@ Rodam em SQLite em memória/arquivo temporário e com storage local temporário
 (`tests/conftest.py`) — nunca tocam no banco nem no bucket reais. Os testes com
 concorrência real contra Postgres só rodam com `RMC_TESTE_POSTGRES_DSN` definida.
 
+### Teste visual e de contrato das telas
+
+```bash
+python -m tests.visual.rodar              # compara com as referências
+python -m tests.visual.rodar --atualizar  # a tela atual vira a referência
+```
+
+Fica fora do `pytest` porque sobe o app e abre um navegador (Playwright +
+Chromium). Monta um SQLite descartável com `data.seed`, passa ao app um
+secrets próprio (nunca o `.streamlit/secrets.toml` real), percorre login,
+Por Loja, Por Produto, Detalhes, Pedido, Dashboard e Dados em 1280 e 1920 px e:
+
+- confere se os seletores da estrutura interna do Streamlit usados pelo CSS
+  (`core/theme.py`, `SELETORES_STREAMLIT`) ainda existem;
+- compara cada captura com `tests/visual/referencia/`; o que mudou sai
+  destacado em `tests/visual/resultado/`.
+
+Rodar antes de atualizar o Streamlit (a versão é fixada em `requirements.txt`).
+Mudança visual intencional: `--atualizar` e versionar as imagens novas.
+
 ## Migrações de banco (Alembic)
 
 O esquema é versionado com Alembic. **Nunca** altere uma tabela à mão: toda

@@ -19,6 +19,7 @@ AA de 4,5:1), deliberadamente mais apagado que o verde de sucesso.
 from __future__ import annotations
 
 import base64
+import html
 import io
 import logging
 
@@ -47,14 +48,108 @@ STATUS = {
     "neutro": {"bg": "#E7E9EC", "fg": "#3F4750"},  # NOVO — "já otimizada"
 }
 
+# ---------------------------------------------------------------------------
+# Camada 1 — tokens: a fonte ÚNICA dos valores de tamanho do sistema.
+#
+# Escala curta de propósito (aprovada em 24/09/2026): antes eram 9 tamanhos
+# de fonte (alguns em px, outros em rem) e espaçamentos/raios escolhidos um a
+# um em cada componente. Componente novo usa só estes valores; se precisar de
+# outro, o valor entra AQUI primeiro. Fonte do corpo e títulos nativos do
+# Streamlit vêm de .streamlit/config.toml (baseFontSize/headingFontSizes),
+# com os mesmos números.
+# ---------------------------------------------------------------------------
+TOKENS = {
+    # texto
+    "fs-titulo": "28px",    # título da página (cabeçalho de cada tela)
+    "fs-secao": "20px",     # título de seção
+    "fs-destaque": "16px",  # destaque: nome em evidência, subtítulo do cabeçalho
+    "fs-corpo": "14px",     # corpo: tabelas, filtros, textos
+    "fs-aux": "13px",       # auxiliar: CNPJ, responsáveis, textos em cinza
+    "fs-min": "12px",       # mínimo: selos, rótulos de grupo
+    # espaçamento
+    "esp-1": "4px",
+    "esp-2": "8px",
+    "esp-3": "12px",
+    "esp-4": "16px",
+    "esp-5": "24px",
+    "esp-6": "32px",
+    # raios
+    "raio-sm": "6px",     # selo pequeno, botão compacto
+    "raio": "8px",        # botão, campo
+    "raio-lg": "12px",    # card, faixa, tabela, cabeçalho
+    "raio-pill": "999px",
+}
+
+# ---------------------------------------------------------------------------
+# Camada 2 — contrato com a estrutura INTERNA do Streamlit.
+#
+# Estes são os únicos pontos em que o CSS depende de como o Streamlit monta o
+# HTML (atributos `data-testid`, classes de widget). Isso pode mudar de uma
+# versão pra outra sem aviso — já aconteceu (o alinhamento dos botões da
+# sidebar parou de valer entre 1.60 e 1.62). Por isso: (1) a versão do
+# Streamlit é fixada no requirements.txt; (2) toda regra que depende dessa
+# estrutura monta o seletor a partir DESTA lista; (3) o teste de contrato
+# (tests/visual/) abre as telas e confere se cada seletor ainda encontra o
+# elemento — rodar antes de atualizar o Streamlit.
+#
+# nome -> (seletor, tela em que o teste confere que ele existe)
+# ---------------------------------------------------------------------------
+SELETORES_STREAMLIT: dict[str, tuple[str, str]] = {
+    "sidebar": ('section[data-testid="stSidebar"]', "por_loja"),
+    "conteudo": ('[data-testid="stMainBlockContainer"]', "por_loja"),
+    "bloco_vertical": ('div[data-testid="stVerticalBlock"]', "por_loja"),
+    "elemento": ('div[data-testid="stElementContainer"]', "por_loja"),
+    "botao": ("div.stButton > button", "por_loja"),
+    "botao_download": ("div.stDownloadButton > button", "dados_explorador_baixar"),
+    # <div> de dentro do <button>, que centraliza ícone+texto (1.62) — alinhar
+    # o <button> à esquerda não basta, é este que manda (medido 25/09/2026).
+    "botao_conteudo": ("div.stButton > button > div", "por_loja"),
+    "markdown": ('[data-testid="stMarkdownContainer"]', "por_loja"),
+    "rotulo_campo": ('[data-testid="stWidgetLabel"]', "por_loja"),
+    "titulo_expander": ('[data-testid="stExpander"] summary', "por_loja"),
+    "aba": ('[data-testid="stTab"]', "dados_explorador"),
+    "cabecalho_app": ('[data-testid="stHeader"]', "login"),
+    "fundo_app": ('[data-testid="stAppViewContainer"]', "login"),
+    "iframe": ('[data-testid="stIFrame"]', "login"),
+}
+
+
+def _sel(nome: str) -> str:
+    return SELETORES_STREAMLIT[nome][0]
+
+
+def _com_marcador(marcador: str) -> str:
+    """Bloco vertical que tem, como filho direto, o elemento com o marcador
+    invisível `div.<marcador>` — é assim que um botão nativo recebe estilo
+    próprio sem perder a função (padrão da skill de identidade visual)."""
+    return f'{_sel("bloco_vertical")}:has(> {_sel("elemento")} div.{marcador})'
+
+
 def _construir_css() -> str:
-    """Monta o CSS a cada chamada (não mais uma string fixa de módulo) —
-    assim `settings.tema.sidebar_largura_px` (core/config.py, configurável
-    via secrets/env) é sempre lido na hora, nunca "congelado" num valor
-    fixo capturado no import."""
+    """Monta o CSS a cada chamada — `settings.tema.*` (configurável via
+    secrets/env) é lido na hora, nunca congelado no import.
+
+    Organizado em quatro camadas, cada uma com seu alcance:
+    1. tokens (`:root`) — valores globais, de propósito;
+    2. adaptação do Streamlit — as únicas regras sobre a estrutura interna
+       dele, todas a partir de `SELETORES_STREAMLIT`;
+    3. componentes — classes próprias (`.rmc-*`) e containers com `key`
+       própria (`st-key-*`), que só pegam onde o componente é usado;
+    4. telas — ajustes que valem só numa tela, dentro do container dela
+       (`theme.tela("nome")` → classe `st-key-tela-nome`)."""
     sidebar_largura = settings.tema.sidebar_largura_px
+    largura_conteudo = settings.tema.largura_maxima_px
+    tokens = "\n".join(f"    --{nome}: {valor};" for nome, valor in TOKENS.items())
+    sidebar = _sel("sidebar")
+    nav = _com_marcador("nav-marker")
+    nav_ativo = _com_marcador("nav-marker-ativo")
+    bc = _com_marcador("bc-btn")
+    bc_ativo = _com_marcador("bc-btn-ativo")
+    destaque = _com_marcador("btn-destaque")
+    botao = _sel("botao")
     return f"""
 <style>
+/* ===== 1. Tokens ===================================================== */
 :root {{
     --navy: {PALETA['navy']};
     --navy-claro: {PALETA['navy_claro']};
@@ -63,41 +158,66 @@ def _construir_css() -> str:
     --fundo-card: {PALETA['fundo_card']};
     --borda: {PALETA['borda']};
     --texto-muted: {PALETA['texto_muted']};
+    --negativo: #B3261E;
+    --sidebar-texto-2: #C9D4E0;
+    --largura-conteudo: {largura_conteudo}px;
+{tokens}
 }}
 
-/* Sidebar navy — navegação principal do sistema.
-   Largura travada em `settings.tema.sidebar_largura_px` (default 272px,
-   mesmo valor do mockup aprovado, mas ajustável via secrets/env
-   SIDEBAR_LARGURA_PX sem editar código) — o Streamlit define a largura via
-   style inline (sidebar redimensionável arrastando a borda), então só um
-   CSS externo comum não venceria; precisa de !important tanto na largura
-   quanto em min/max pra também desativar o arraste (min == max == width). */
-section[data-testid="stSidebar"] {{
+/* ===== 2. Adaptação do Streamlit (estrutura interna — ver
+   SELETORES_STREAMLIT e o teste de contrato em tests/visual/) ========== */
+
+/* Área útil com largura máxima, centralizada. O respiro lateral do
+   Streamlit (padding) fica de fora da conta: a largura limitada é a do
+   conteúdo em si. */
+{_sel("conteudo")} {{
+    max-width: calc(var(--largura-conteudo) + 10rem);
+}}
+
+/* Texto "pequeno" do Streamlit (rótulo de campo, título de expander, texto
+   de botão, aba) é 0,875 × a fonte base: com baseFontSize 14 dava 12,25px, fora
+   da escala (medido em 24/09/2026 — antes, com base 16, era 14px). Vai para
+   o tamanho auxiliar da escala. */
+{_sel("rotulo_campo")} p,
+{_sel("titulo_expander")} p,
+{_sel("aba")} p,
+{botao} p,
+{_sel("botao_download")} p {{
+    font-size: var(--fs-aux);
+}}
+
+/* Sidebar navy, largura travada (min == max == width desativa o arraste
+   de redimensionar, que o Streamlit faz via style inline — por isso
+   !important). */
+{sidebar} {{
     background: linear-gradient(180deg, var(--navy) 0%, #1c3f68 100%);
     width: {sidebar_largura}px !important;
     min-width: {sidebar_largura}px !important;
     max-width: {sidebar_largura}px !important;
 }}
-section[data-testid="stSidebar"] * {{
+{sidebar} * {{
     color: #FFFFFF;
 }}
-section[data-testid="stSidebar"] .stCaption, section[data-testid="stSidebar"] small {{
-    color: #C9D4E0 !important;
+{sidebar} .stCaption, {sidebar} small {{
+    color: var(--sidebar-texto-2) !important;
 }}
 
-/* Botões de navegação da sidebar (marcador invisível + :has).
-   Importante: o seletor usa ":has(> div[data-testid='stElementContainer'] ...)"
-   — filho DIRETO stElementContainer (sempre presente, é assim que o
-   Streamlit encapsula cada elemento) contendo o marcador em qualquer
-   profundidade dentro dele. Isso escopa a regra exatamente ao container do
-   item de navegação (marcador + botão), sem "vazar" para o stVerticalBlock
-   externo que agrupa todos os itens da sidebar (esse teria o marcador como
-   neto, não como filho direto de um stElementContainer seu). Seletor de
-   ATRIBUTO (data-testid), não de classe (.stElementContainer) — validado
-   via inspeção real do DOM (Playwright) no Streamlit 1.60; a classe
-   "stElementContainer" também existe hoje, mas o atributo é o contrato
-   estável que o Streamlit documenta, então é o que usamos aqui. */
-section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.nav-marker) div.stButton > button {{
+/* Espaço regular na sidebar: 8px entre itens. O elemento do marcador
+   invisível (nav-marker) ocupava uma vaga no "gap" do Streamlit — dava 28px
+   entre botões do mesmo grupo. Escondido com display:none ele continua no
+   DOM (o seletor :has() do marcador segue valendo), mas sai do espaçamento. */
+{sidebar} {_sel("bloco_vertical")} {{ gap: var(--esp-2); }}
+/* O Streamlit põe margin-bottom: -1rem (-14px) em todo bloco de Markdown:
+   o rótulo do grupo "afundava" no botão de baixo e o primeiro rótulo
+   encostava no logo (medido em 25/09/2026). Na sidebar, sem margem. */
+{sidebar} {_sel("markdown")} {{ margin-bottom: 0; }}
+{sidebar} {_sel("elemento")}:has(div.nav-marker),
+{sidebar} {_sel("elemento")}:has(div.nav-marker-ativo) {{ display: none; }}
+{sidebar} {nav} {_sel("botao_conteudo")},
+{sidebar} {nav_ativo} {_sel("botao_conteudo")} {{ justify-content: flex-start; }}
+
+/* Botões de navegação da sidebar (marcador nav-marker / nav-marker-ativo). */
+{sidebar} {nav} {botao} {{
     background: transparent;
     border: 1px solid rgba(255,255,255,0.18);
     color: #FFFFFF;
@@ -106,10 +226,10 @@ section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"]:has(> div[da
     align-items: center;
     gap: 10px;
     width: 100%;
-    border-radius: 8px;
+    border-radius: var(--raio);
     font-weight: 500;
 }}
-section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.nav-marker-ativo) div.stButton > button {{
+{sidebar} {nav_ativo} {botao} {{
     background: var(--verde);
     color: var(--navy);
     border: 1px solid var(--verde);
@@ -118,113 +238,93 @@ section[data-testid="stSidebar"] div[data-testid="stVerticalBlock"]:has(> div[da
     align-items: center;
     gap: 10px;
     width: 100%;
-    border-radius: 8px;
+    border-radius: var(--raio);
     font-weight: 700;
 }}
 
-/* Rótulo de grupo da navegação (ex.: "Análise de Oportunidade") — separa
-   visualmente as seções da sidebar; ver theme.nav_grupo_label(). Precisa de
-   !important porque "section[data-testid='stSidebar'] *" (acima) já fixa
-   branco em tudo dentro da sidebar com especificidade maior que uma classe
-   sozinha — a versão sem escopo/!important perde essa disputa de
-   especificidade e o rótulo sai branco em vez do cinza discreto pretendido. */
-section[data-testid="stSidebar"] .rmc-nav-grupo-label {{
-    color: #C9D4E0 !important;
-    font-size: 11px;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    margin: 18px 4px 6px;
-}}
-
-/* Botão primário (fora da sidebar): navy preenchido, texto branco */
-div.stButton > button {{
+/* Botão padrão (fora da sidebar): navy preenchido, texto branco. */
+{botao} {{
     background: var(--navy);
     color: #FFFFFF;
     border: 1px solid var(--navy);
-    border-radius: 8px;
+    border-radius: var(--raio);
     font-weight: 600;
 }}
-div.stButton > button:hover {{
+{botao}:hover {{
     background: #123055;
     border-color: #123055;
     color: #FFFFFF;
 }}
-div.stDownloadButton > button {{
+{botao}:focus:not(:active) {{
+    box-shadow: none;
+}}
+{_sel("botao_download")} {{
     background: #FFFFFF;
     color: var(--navy);
     border: 1px solid var(--navy);
-    border-radius: 8px;
+    border-radius: var(--raio);
     font-weight: 600;
 }}
-div.stDownloadButton > button:hover {{
+{_sel("botao_download")}:hover {{
     background: var(--fundo-card);
 }}
 
-/* Botão de breadcrumb (Explorador de Arquivos): secundário/discreto.
-   Reconstruído do zero com o seletor de ATRIBUTO validado (ver comentário
-   do bloco de navegação da sidebar acima) — nem a versão da referência
-   (seletor de classe .stElementContainer) nem a versão anterior deste
-   arquivo (sem intermediário nenhum) tinham comprovação de que casam com o
-   DOM real do Streamlit 1.60; confirmado por inspeção via Playwright na
-   tela Dados. */
-div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.bc-btn) div.stButton > button {{
+/* Variações de botão por marcador invisível. */
+{bc} {botao} {{
     background: var(--fundo-card);
     color: var(--navy);
     border: 1px solid var(--borda);
     font-weight: 500;
 }}
-div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.bc-btn-ativo) div.stButton > button {{
+{bc_ativo} {botao} {{
     background: #FFFFFF;
     color: var(--navy);
     border: 1px solid var(--navy);
     font-weight: 700;
 }}
-
-/* Botão secundário/discreto reutilizável (ex: "Detalhes" nas tabelas de
-   Análise de Oportunidade) — mesma cor de marca (navy), só sem o
-   preenchimento sólido dos botões primários, pra não competir visualmente
-   com ações principais numa tabela de muitas linhas. Mesmo seletor de
-   atributo validado acima (reconstruído do zero pela mesma razão). */
-div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.btn-secundario) div.stButton > button {{
-    background: var(--fundo-card);
-    color: var(--navy);
-    border: 1px solid var(--borda);
-    font-weight: 500;
-}}
-div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.btn-secundario) div.stButton > button:hover {{
-    background: #FFFFFF;
-    border-color: var(--navy);
-}}
-/* Centraliza o botão dentro da coluna (por padrão o Streamlit alinha o
-   container do botão à esquerda da coluna). Importante: o botão em si
-   (`<button>`) já vem com "flex-grow: 1" do próprio Streamlit, então forçar
-   o container (stElementContainer) a 100% de largura faz o BOTÃO esticar
-   junto — vira um botão largo, não um botão pequeno centralizado. A forma
-   certa é manter o container do tamanho do conteúdo e só mudar sua POSIÇÃO
-   no eixo cruzado do flex da coluna ("align-self: center" em vez do
-   "align-items: stretch" herdado do bloco vertical pai). */
-div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.btn-secundario) div[data-testid="stElementContainer"]:has(div.stButton) {{
-    align-self: center;
-}}
-
-/* Botão de destaque com glow (usar no máximo 1 por tela — marcador
-   .btn-destaque). Mesmo seletor de atributo validado acima (reconstruído
-   do zero pela mesma razão; sem uso ativo em nenhuma tela hoje, então não
-   deu pra confirmar via DOM real — só por analogia com o padrão validado). */
-div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.btn-destaque) div.stButton > button {{
+/* Destaque com glow no hover (no máximo 1 por tela, regra da skill). */
+{destaque} {botao} {{
     background: var(--verde-escuro);
     border-color: var(--verde-escuro);
 }}
-div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] div.btn-destaque) div.stButton > button:hover {{
+{destaque} {botao}:hover {{
     box-shadow: 0 0 0 4px rgba(141, 198, 63, 0.28);
 }}
 
-/* Cabeçalho em mesh gradient */
+/* ===== 3. Componentes ================================================ */
+
+/* Marca no topo da sidebar */
+.rmc-marca {{
+    display: flex; align-items: center; gap: var(--esp-3);
+    padding: var(--esp-2) var(--esp-1) var(--esp-3) var(--esp-1);
+}}
+.rmc-marca-logo {{
+    width: 36px; height: 36px; border-radius: 50%; flex: none; object-fit: cover;
+    background: linear-gradient(135deg, var(--verde) 0%, var(--navy-claro) 100%);
+    box-shadow: 0 0 0 2px rgba(255,255,255,0.18);
+}}
+.rmc-marca-nome {{ font-weight: 700; font-size: var(--fs-destaque); line-height: 1.25; }}
+.rmc-marca-usuario {{ font-size: var(--fs-aux); line-height: 1.3; color: var(--sidebar-texto-2) !important; }}
+.rmc-marca-usuario .sep {{ opacity: .5; margin: 0 var(--esp-1); }}
+/* Divisória entre grupos da navegação e antes do "Sair". */
+.rmc-nav-divisor {{ border-top: 1px solid rgba(255,255,255,0.14); margin: var(--esp-2) 0; }}
+
+/* Rótulo de grupo da navegação (ex.: "Análise de Oportunidade"). O
+   !important vence o "{sidebar} *" que fixa branco em tudo. */
+{sidebar} .rmc-nav-grupo-label {{
+    color: var(--sidebar-texto-2) !important;
+    font-size: var(--fs-min);
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    margin: var(--esp-1) var(--esp-1) 0;
+}}
+
+/* Cabeçalho da página em mesh gradient */
 .rmc-header {{
-    border-radius: 14px;
-    padding: 28px 32px;
-    margin-bottom: 20px;
+    border-radius: var(--raio-lg);
+    padding: var(--esp-5) var(--esp-6);
+    margin-bottom: var(--esp-5);
     background:
         radial-gradient(circle at 15% 20%, rgba(141,198,63,0.55), transparent 45%),
         radial-gradient(circle at 85% 15%, rgba(74,110,144,0.55), transparent 45%),
@@ -233,57 +333,114 @@ div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] d
     color: #FFFFFF;
 }}
 .rmc-header h1 {{
-    font-size: 1.75rem;
+    font-size: var(--fs-titulo);
     font-weight: 700;
-    margin: 0 0 4px 0;
+    margin: 0 0 var(--esp-1) 0;
+    padding: 0;
     color: #FFFFFF;
 }}
 .rmc-header p {{
     margin: 0;
+    font-size: var(--fs-destaque);
     color: #E6ECF3;
 }}
 
-/* Cards de KPI */
+/* Card de KPI */
+/* Cards de indicadores (KPI), no modelo aprovado em 25/09/2026: ícone num
+   círculo à esquerda e, ao lado, TÍTULO em maiúsculas em cima, número e
+   subtítulo; fundo levemente tingido na cor do card. Grid de 4 colunas
+   iguais: as bordas batem com as da tabela embaixo. */
+.rmc-kpis {{
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: var(--esp-3);
+    /* 16px do vão da tela + 12px = 28px até os rótulos dos filtros — com
+       16px a borda dos cards parecia "colada" nos rótulos. */
+    margin-bottom: var(--esp-3);
+}}
 .rmc-kpi {{
     background: #FFFFFF;
     border: 1px solid var(--borda);
-    border-radius: 12px;
-    padding: 18px 20px;
+    border-radius: var(--raio-lg);
+    padding: var(--esp-4) var(--esp-5);
 }}
-.rmc-kpi .valor {{
-    font-size: 1.6rem;
-    font-weight: 700;
-    color: var(--navy);
+.rmc-kpi .valor {{ font-size: var(--fs-secao); font-weight: 700; color: var(--navy); }}
+.rmc-kpi .label {{ color: var(--texto-muted); font-size: var(--fs-aux); }}
+/* Daqui pra baixo, só os cards de indicador (dentro de .rmc-kpis). O
+   `.rmc-kpi` sozinho também é usado nos cards de status da aba Dados — em
+   25/09/2026 mudar o `.rmc-kpi` direto alterou aquela tela sem querer
+   (o teste visual pegou). */
+.rmc-kpis .rmc-kpi {{
+    display: flex; align-items: flex-start; gap: var(--esp-3);
+    padding: var(--esp-4); min-width: 0;
+    container-type: inline-size;
 }}
-.rmc-kpi .label {{
-    color: var(--texto-muted);
-    font-size: 0.85rem;
+.rmc-kpis .rmc-kpi.azul {{ background: linear-gradient(135deg, #F1F6FC 0%, #FFFFFF 100%); border-color: #D9E6F5; }}
+.rmc-kpis .rmc-kpi.verde {{ background: linear-gradient(135deg, #F3F8EC 0%, #FFFFFF 100%); border-color: #DCEBC9; }}
+.rmc-kpis .rmc-kpi.roxo {{ background: linear-gradient(135deg, #F5F1FB 0%, #FFFFFF 100%); border-color: #E3DAF2; }}
+.rmc-kpis .icone {{
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 40px; height: 40px; border-radius: 50%; flex: none;
 }}
+.rmc-kpis .icone svg {{ width: 20px; height: 20px; }}
+.rmc-kpis .azul .icone {{ background: {STATUS['alterado']['bg']}; color: var(--navy); }}
+.rmc-kpis .verde .icone {{ background: {STATUS['sucesso']['bg']}; color: var(--verde-escuro); }}
+.rmc-kpis .roxo .icone {{ background: {STATUS['multiplo']['bg']}; color: {STATUS['multiplo']['fg']}; }}
+.rmc-kpis .corpo {{ min-width: 0; flex: 1; }}
+.rmc-kpis .label {{
+    color: var(--navy); font-size: var(--fs-min); font-weight: 700;
+    text-transform: uppercase; letter-spacing: .03em; line-height: 1.3;
+}}
+.rmc-kpis .linha-valor {{
+    display: flex; align-items: center; flex-wrap: wrap; gap: 2px var(--esp-2); margin-top: var(--esp-1);
+}}
+.rmc-kpis .valor {{ line-height: 1.2; white-space: nowrap; }}
+.rmc-kpis .sub {{ margin-top: 2px; color: var(--texto-muted); font-size: var(--fs-aux); line-height: 1.3; }}
+/* Card estreito (1280px: ~205px por card): o ícone ao lado não deixa caber
+   "R$ 31.503,20" — o ícone sobe e o título continua em cima do número. */
+@container (max-width: 250px) {{
+    .rmc-kpis .rmc-kpi-dentro {{ flex-direction: column; gap: var(--esp-2); }}
+    /* Título de 1 ou 2 linhas conforme o card: reservar 2 deixa os números
+       dos quatro cards na mesma altura. */
+    .rmc-kpis .label {{ min-height: 2.6em; }}
+}}
+.rmc-kpis .rmc-kpi-dentro {{ display: flex; align-items: flex-start; gap: var(--esp-3); width: 100%; min-width: 0; }}
+/* Selo de tendência: pílula com seta + %. Verde = subiu, âmbar = caiu
+   (nunca vermelho — regra da identidade). */
+.rmc-tendencia {{
+    display: inline-flex; align-items: center; gap: 2px;
+    padding: 2px var(--esp-2); border-radius: var(--raio-pill);
+    font-size: var(--fs-min); font-weight: 600; line-height: 1.4; white-space: nowrap; cursor: default;
+}}
+.rmc-tendencia svg {{ width: 10px; height: 10px; }}
+.rmc-tendencia.sobe {{ background: {STATUS['sucesso']['bg']}; color: {STATUS['sucesso']['fg']}; }}
+.rmc-tendencia.desce {{ background: {STATUS['sugestao']['bg']}; color: {STATUS['sugestao']['fg']}; }}
+.rmc-tendencia.igual {{ background: {STATUS['neutro']['bg']}; color: {STATUS['neutro']['fg']}; }}
 
-/* Card de destaque de oportunidade — preenchimento navy sólido */
+/* Card de destaque — preenchimento navy sólido (máx. 1 por seção) */
 .rmc-destaque {{
     background: var(--navy);
     color: #FFFFFF;
-    border-radius: 12px;
-    padding: 20px 24px;
+    border-radius: var(--raio-lg);
+    padding: var(--esp-5);
 }}
 .rmc-destaque .valor {{
-    font-size: 1.9rem;
+    font-size: var(--fs-titulo);
     font-weight: 700;
     color: var(--verde);
 }}
 .rmc-destaque .label {{
-    color: #C9D4E0;
-    font-size: 0.9rem;
+    color: var(--sidebar-texto-2);
+    font-size: var(--fs-corpo);
 }}
 
-/* Badge de status (pílula) */
+/* Selo de status (pílula) */
 .rmc-badge {{
     display: inline-block;
-    padding: 3px 10px;
-    border-radius: 999px;
-    font-size: 12px;
+    padding: var(--esp-1) var(--esp-2);
+    border-radius: var(--raio-pill);
+    font-size: var(--fs-min);
     font-weight: 600;
+    line-height: 1.2;
 }}
 .rmc-badge-sugestao {{ background: {STATUS['sugestao']['bg']}; color: {STATUS['sugestao']['fg']}; }}
 .rmc-badge-sucesso {{ background: {STATUS['sucesso']['bg']}; color: {STATUS['sucesso']['fg']}; }}
@@ -292,93 +449,52 @@ div[data-testid="stVerticalBlock"]:has(> div[data-testid="stElementContainer"] d
 .rmc-badge-neutro {{ background: {STATUS['neutro']['bg']}; color: {STATUS['neutro']['fg']}; }}
 .rmc-badge-inativo {{ background: {STATUS['sugestao']['bg']}; color: {STATUS['sugestao']['fg']}; }}
 
-/* Texto secundário/metadado */
-.rmc-muted {{ color: var(--texto-muted); font-size: 0.85rem; }}
+/* Textos auxiliares */
+.rmc-muted {{ color: var(--texto-muted); font-size: var(--fs-aux); }}
+.rmc-negativo {{ color: var(--negativo); font-weight: 600; }}
 
-/* Loja + CNPJ embaixo do produto na visão Por Produto: 2px menor que o
-   texto da tabela (pedido de 24/09/2026), no mesmo cinza dos metadados. */
-.rmc-sub-loja {{ color: var(--texto-muted); font-size: calc(1em - 2px); }}
-
-/* Valor negativo (ex: diferença por unidade quando a loja já paga menos) */
-.rmc-negativo {{ color: #B3261E; font-weight: 600; }}
-
-/* Faixa do filtro principal (Laboratório) nas telas de Análise de
-   Oportunidade: destaca o filtro que "libera" a análise sem criar um
-   componente novo — mesmo branco/borda dos cards, com o verde da marca só
-   na borda esquerda, e compacta (uma linha só). Seletor por key do
-   container, que o Streamlit expõe como classe "st-key-<key>". */
+/* Faixa do filtro principal (Laboratório): mesmo branco/borda dos cards,
+   verde só na borda esquerda. Altura mínima fixa: com ou sem o seletor
+   (sem laboratório cadastrado), a faixa tem a mesma altura. */
 div[class*="st-key-faixa-laboratorio"] {{
     background: #FFFFFF;
     border: 1px solid var(--borda);
     border-left: 4px solid var(--verde);
-    border-radius: 12px;
-    /* Padding e altura mínima fixos: sem laboratório cadastrado a faixa só
-       tem texto (sem o seletor), e ficava rasa, com o subtítulo colado na
-       borda de baixo. Assim ela tem a mesma altura com ou sem seletor. */
-    padding: 14px 18px 16px;
-    min-height: 76px;
+    border-radius: var(--raio-lg);
+    padding: var(--esp-4);
+    min-height: 76px;  /* 61px ficou baixa demais (pedido de 25/09/2026) */
     justify-content: center;
-    margin-bottom: 6px;
 }}
-.rmc-faixa-titulo {{ font-weight: 700; color: var(--navy); font-size: 0.95rem; line-height: 1.3; }}
-.rmc-faixa-sub {{ color: var(--texto-muted); font-size: 0.78rem; line-height: 1.3; margin-top: 2px; }}
+.rmc-faixa-cab {{ display: flex; align-items: center; gap: var(--esp-3); }}
+.rmc-faixa-icone {{
+    display: inline-flex; align-items: center; justify-content: center; flex: none;
+    width: 32px; height: 32px; border-radius: var(--raio);
+    background: {STATUS['sucesso']['bg']}; color: var(--verde-escuro);
+}}
+.rmc-faixa-icone svg {{ width: 18px; height: 18px; }}
+.rmc-faixa-titulo {{ font-weight: 700; color: var(--navy); font-size: var(--fs-destaque); line-height: 1.25; }}
+.rmc-faixa-sub {{ color: var(--texto-muted); font-size: var(--fs-aux); line-height: 1.3; }}
 
-/* Cabeçalho ordenável das tabelas (clique ordena; seta mostra o sentido):
-   botões sem cara de botão — texto navy em negrito, como os cabeçalhos
-   fixos de antes; o sublinhado no hover é a pista de que é clicável. */
-div[class*="st-key-cabecalho-"] div.stButton > button {{
-    background: transparent;
-    border: none;
-    color: var(--navy);
-    padding: 0;
-    min-height: 0;
-    justify-content: flex-start;
-    text-align: left;
-    box-shadow: none;
-}}
-div[class*="st-key-cabecalho-"] div.stButton > button:hover {{
-    background: transparent;
-    color: var(--verde-escuro);
-    text-decoration: underline;
-}}
-div[class*="st-key-cabecalho-"] div.stButton > button p {{ font-weight: 700; }}
-
-/* Nunca usar cor padrão vermelho/rosa do Streamlit em elementos de marca */
-div.stButton > button:focus:not(:active) {{
-    box-shadow: none;
+/* Título de seção dentro de popup/tela. O "####" do Markdown saía com
+   ~12px dentro do st.dialog (medido em 24/09/2026), menor que o texto. */
+.rmc-titulo-secao {{
+    font-size: var(--fs-destaque); font-weight: 600; color: var(--navy);
+    margin: var(--esp-4) 0 var(--esp-2) 0;
 }}
 
-/* Abas (st.tabs): nunca o vermelho/rosa padrão do Streamlit */
-[data-testid="stTab"] {{
-    color: var(--texto-muted);
-}}
-[data-testid="stTab"][aria-selected="true"] {{
-    color: var(--navy) !important;
-    font-weight: 600;
-}}
-[data-testid="stTab"] .react-aria-SelectionIndicator {{
-    background-color: var(--navy) !important;
-}}
+/* ===== 4. Telas ======================================================
+   Ajustes que valem só numa tela entram aqui, sempre dentro do container
+   dela: div[class*="st-key-tela-<nome>"] ... (ver `tela()`). */
 
-/* Selectbox (st.selectbox, Streamlit 1.62 = ComboBox do react-aria): a borda
-   de foco vem vermelha por padrão — navy, como o resto da marca. Seletor
-   validado por inspeção do DOM real (Playwright): o contorno é desenhado no
-   `div[role=group]`, que ganha data-focus-within ao focar. */
-[data-testid="stSelectbox"] div[role="group"][data-focus-within="true"] {{
-    border-color: var(--navy) !important;
-}}
-
-/* Checkbox e toggle (st.checkbox / st.toggle): nunca o vermelho/rosa padrão
-   do Streamlit. O input real fica visualmente escondido (clip) e o desenho
-   do controle é feito pela div logo depois do <span> que embrulha o input —
-   por isso o seletor estrutural (span + div), em vez de depender de classes
-   com hash que mudam a cada build do Streamlit. */
-div[data-testid="stCheckbox"] label > span + div {{
-    border-color: var(--navy) !important;
-}}
-div[data-testid="stCheckbox"]:has(input:checked) label > span + div {{
-    background: var(--navy) !important;
-    border-color: var(--navy) !important;
+/* Análise (Por Loja / Por Produto): 16px entre as seções (cabeçalho,
+   faixa, cards, filtros, lojas específicas, tabela, paginação). O padrão
+   do Streamlit é 1rem = 14px, fora da escala (medido em 25/09/2026). */
+div[class*="st-key-tela-por-loja"], div[class*="st-key-tela-por-produto"] {{ gap: var(--esp-4); }}
+/* Mesmo -1rem do Markdown que foi zerado na sidebar: aqui ele "comia" 14px
+   de baixo do cabeçalho e dos cards — o vão visível entre os cards e os
+   rótulos dos filtros era de ~2px (medido em 25/09/2026). */
+div[class*="st-key-tela-por-loja"] {_sel("markdown")}, div[class*="st-key-tela-por-produto"] {_sel("markdown")} {{
+    margin-bottom: 0;
 }}
 </style>
 """
@@ -386,6 +502,14 @@ div[data-testid="stCheckbox"]:has(input:checked) label > span + div {{
 
 def aplicar_tema() -> None:
     st.markdown(_construir_css(), unsafe_allow_html=True)
+
+
+def tela(nome: str):
+    """Container de uma tela inteira (`with theme.tela("por-loja"):`). Dá à
+    tela a classe `st-key-tela-<nome>`, onde entram os ajustes que valem SÓ
+    nela (camada 4 do CSS) — sem isso, qualquer ajuste pra uma tela era uma
+    regra global que podia mudar as outras sem ninguém perceber."""
+    return st.container(key=f"tela-{nome}")
 
 
 def cabecalho(titulo: str, subtitulo: str = "") -> None:
@@ -399,17 +523,90 @@ def badge(texto: str, tipo: str = "sucesso") -> str:
     return f'<span class="rmc-badge rmc-badge-{tipo}">{texto}</span>'
 
 
-def nav_grupo_label(texto: str) -> None:
+def nav_grupo_label(texto: str, divisoria: bool = True) -> None:
     """Rótulo de grupo na sidebar (ex: 'Análise de Oportunidade',
-    'Administração') — separa visualmente os itens de navegação por seção."""
-    st.markdown(f'<div class="rmc-nav-grupo-label">{texto.upper()}</div>', unsafe_allow_html=True)
+    'Administração'), com linha fina acima — menos no primeiro grupo."""
+    linha = '<div class="rmc-nav-divisor"></div>' if divisoria else ""
+    st.markdown(f'{linha}<div class="rmc-nav-grupo-label">{html.escape(texto.upper())}</div>', unsafe_allow_html=True)
 
 
-def kpi(label: str, valor: str) -> None:
+def nav_divisoria() -> None:
+    st.markdown('<div class="rmc-nav-divisor"></div>', unsafe_allow_html=True)
+
+
+def marca_sidebar(nome: str, usuario: str, papel: str) -> None:
+    """Logo + nome do sistema + "usuário | papel" no topo da sidebar. O logo
+    é o mesmo do login (já carregado em base64 no import); sem ele, fica o
+    círculo em gradiente do próprio CSS."""
+    if _LOGO_LOGIN is not None:
+        b64, mime = _LOGO_LOGIN
+        logo = f'<img class="rmc-marca-logo" src="data:{mime};base64,{b64}" alt="" />'
+    else:
+        logo = '<span class="rmc-marca-logo"></span>'
     st.markdown(
-        f"""<div class="rmc-kpi"><div class="valor">{valor}</div><div class="label">{label}</div></div>""",
+        f'<div class="rmc-marca">{logo}<div>'
+        f'<div class="rmc-marca-nome">{html.escape(nome)}</div>'
+        f'<div class="rmc-marca-usuario">{html.escape(usuario)}<span class="sep">|</span>{html.escape(papel)}</div>'
+        f'</div></div>',
         unsafe_allow_html=True,
     )
+
+
+_ICONES_KPI = {
+    "loja": '<path d="M3 9l1.5-5h15L21 9M3 9h18M3 9v11h18V9M9 20v-6h6v6" stroke="currentColor" '
+            'stroke-width="1.8" stroke-linejoin="round" fill="none"/>',
+    "moeda": '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" fill="none"/>'
+             '<path d="M15 9.5c-.5-1-1.6-1.5-3-1.5-1.7 0-3 .9-3 2.1 0 2.8 6 1.4 6 4.3 0 1.2-1.3 2.1-3 2.1-1.4 0-2.6-.6-3-1.6'
+             'M12 6.5v11" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" fill="none"/>',
+    "produto": '<rect x="4" y="7" width="16" height="13" rx="2" stroke="currentColor" stroke-width="1.8" fill="none"/>'
+               '<path d="M8 7V5a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2M12 10.5v6M9 13.5h6" stroke="currentColor" '
+               'stroke-width="1.8" stroke-linecap="round" fill="none"/>',
+    "media": '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2" stroke="currentColor" stroke-width="1.8" '
+             'stroke-linecap="round" fill="none"/>',
+}
+_SETA_SOBE = '<svg viewBox="0 0 10 10"><path d="M5 1.5L9 7H1z" fill="currentColor"/></svg>'
+_SETA_DESCE = '<svg viewBox="0 0 10 10"><path d="M5 8.5L1 3h8z" fill="currentColor"/></svg>'
+
+
+def _tendencia(variacao: float | None, dica: str) -> str:
+    """Selo de tendência, ou nada (sem período anterior comparável, a regra
+    é não mostrar seta — decidido em 24/09/2026)."""
+    if variacao is None:
+        return ""
+    percentual = f"{abs(variacao) * 100:.0f}%"
+    if percentual == "0%":
+        classe, seta, percentual = "igual", "", "0%"
+    elif variacao > 0:
+        classe, seta = "sobe", _SETA_SOBE
+    else:
+        classe, seta = "desce", _SETA_DESCE
+    return f'<span class="rmc-tendencia {classe}" title="{html.escape(dica)}">{seta}{percentual}</span>'
+
+
+def kpis(cards: list[dict]) -> None:
+    """Linha de cards de indicador. Cada card: {"icone": loja|moeda|produto|
+    media, "tom": azul|verde|roxo, "valor", "label", "sub" (opcional),
+    "variacao" (float|None), "dica_variacao"}.
+
+    O "$" vira entidade HTML: o Markdown do Streamlit leria "R$ … R$" como
+    fórmula (mesmo motivo de views/analise_comum._sem_matematica)."""
+    partes = []
+    for c in cards:
+        sub = f'<div class="sub">{html.escape(c["sub"])}</div>' if c.get("sub") else ""
+        # O container-query mede o .rmc-kpi; quem muda de direção é o
+        # .rmc-kpi-dentro (um elemento não consulta o próprio tamanho).
+        partes.append(
+            f'<div class="rmc-kpi {c.get("tom", "azul")}"><div class="rmc-kpi-dentro">'
+            f'<span class="icone"><svg viewBox="0 0 24 24" aria-hidden="true">{_ICONES_KPI[c["icone"]]}</svg></span>'
+            f'<div class="corpo"><div class="label">{html.escape(c["label"])}</div>'
+            f'<div class="linha-valor"><span class="valor">{html.escape(c["valor"])}</span>'
+            f'{_tendencia(c.get("variacao"), c.get("dica_variacao", ""))}</div>{sub}</div></div></div>'
+        )
+    st.markdown(f'<div class="rmc-kpis">{"".join(partes)}</div>'.replace("$", "&#36;"), unsafe_allow_html=True)
+
+
+def titulo_secao(texto: str) -> None:
+    st.markdown(f'<div class="rmc-titulo-secao">{html.escape(texto)}</div>', unsafe_allow_html=True)
 
 
 def card_destaque(label: str, valor: str) -> None:
@@ -488,13 +685,13 @@ def logo_login_markup() -> str:
 
 _CSS_LOGIN = f"""
 <style>
-header[data-testid="stHeader"] {{ display: none !important; }}
+header{_sel("cabecalho_app")} {{ display: none !important; }}
 section[data-testid="stSidebar"] {{ display: none !important; }}
-div[data-testid="stAppViewContainer"] {{
+div{_sel("fundo_app")} {{
     background: linear-gradient(135deg, var(--verde) 0%, var(--navy) 100%);
 }}
 
-iframe[data-testid="stIFrame"] {{
+iframe{_sel("iframe")} {{
     position: fixed !important;
     inset: 0 !important;
     width: 100vw !important;

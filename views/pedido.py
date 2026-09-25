@@ -12,5 +12,10 @@ from core import theme
 
 
 def render() -> None:
+    with theme.tela("pedido"):
+        _render()
+
+
+def _render() -> None:
     theme.cabecalho("Pedido", "Em construção")
     st.info("Esta seção ainda não foi desenhada em detalhe e fica fora do escopo desta etapa do projeto.")

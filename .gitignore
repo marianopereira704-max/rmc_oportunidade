@@ -5,3 +5,6 @@ data/app.db
 data/local_storage/*
 !data/local_storage/.gitkeep
 .streamlit/secrets.toml
+
+# Teste visual: saídas locais (as referências em tests/visual/referencia/ SÃO versionadas)
+tests/visual/resultado/

@@ -28,6 +28,7 @@ então ordenar pelo cabeçalho, paginar ou abrir o detalhe não vão ao banco.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -270,6 +271,12 @@ def carregar(session: Session, laboratorio: str, periodo_meses: int) -> pd.DataF
     são aplicados depois, em memória (`filtrar`, `ordenar`, `por_loja`)."""
     meses_periodo = listar_ultimos_ano_meses(session, periodo_meses)
     meses_media = listar_ultimos_ano_meses(session, settings.analise.meses_preco_medio)
+    return _carregar_meses(session, laboratorio, meses_periodo, meses_media)
+
+
+def _carregar_meses(
+    session: Session, laboratorio: str, meses_periodo: list[str], meses_media: list[str],
+) -> pd.DataFrame:
     if not meses_periodo:
         return pd.DataFrame(columns=COLUNAS_RESULTADO)
     compras = buscar_compras(session, laboratorio, sorted(set(meses_periodo) | set(meses_media)))
@@ -279,6 +286,82 @@ def carregar(session: Session, laboratorio: str, periodo_meses: int) -> pd.DataF
     lojas = buscar_lojas(session, resultado["loja_id"].unique())
     final = resultado.merge(lojas, on="loja_id", how="inner")[COLUNAS_RESULTADO]
     return _texto_ausente_como_none(final, (*COLUNAS_LOJA[1:], "nome_canonico", "descricao", "laboratorio"))
+
+
+# ---------------------------------------------------------------------------
+# Indicadores (cards do topo) e comparação com o período anterior
+# ---------------------------------------------------------------------------
+
+def _mes_menos(ano_mes: str, meses: int) -> str:
+    ano, mes = (int(p) for p in ano_mes.split("-"))
+    total = ano * 12 + (mes - 1) - meses
+    return f"{total // 12:04d}-{total % 12 + 1:02d}"
+
+
+def meses_periodo_anterior(meses_periodo: list[str], carregados: set[str]) -> list[str] | None:
+    """Os N meses de CALENDÁRIO imediatamente antes do período, se TODOS
+    estiverem carregados; senão None (a tela não mostra seta). Não usa "os N
+    carregados anteriores": com agosto e janeiro carregados, "último mês"
+    compararia agosto com janeiro e a seta diria que algo mudou "desde o mês
+    passado" quando são sete meses de diferença."""
+    if not meses_periodo:
+        return None
+    mais_antigo = min(meses_periodo)
+    anteriores = [_mes_menos(mais_antigo, k) for k in range(1, len(meses_periodo) + 1)]
+    return sorted(anteriores) if all(m in carregados for m in anteriores) else None
+
+
+def carregar_anterior(session: Session, laboratorio: str, periodo_meses: int) -> tuple[pd.DataFrame, list[str]] | None:
+    """Resultado do período anterior de mesmo tamanho (só pra comparação dos
+    indicadores), ou None quando não há meses carregados suficientes."""
+    carregados = listar_ultimos_ano_meses(session, 10_000)
+    anteriores = meses_periodo_anterior(carregados[:periodo_meses], set(carregados))
+    if anteriores is None:
+        return None
+    # Preço médio não entra nos indicadores: a média usa os próprios meses.
+    return _carregar_meses(session, laboratorio, anteriores, anteriores), anteriores
+
+
+@dataclass
+class Indicadores:
+    economia: float
+    lojas_com_oportunidade: int
+    lojas_analisadas: int
+    produtos_com_oportunidade: int
+    produtos_analisados: int
+
+    @property
+    def economia_media_loja(self) -> float | None:
+        return self.economia / self.lojas_com_oportunidade if self.lojas_com_oportunidade else None
+
+    @property
+    def economia_media_produto(self) -> float | None:
+        return self.economia / self.produtos_com_oportunidade if self.produtos_com_oportunidade else None
+
+
+def indicadores(df: pd.DataFrame) -> Indicadores:
+    """Números dos cards sobre o resultado JÁ filtrado. "Produto" = genérico
+    distinto (o mesmo genérico em 30 lojas conta 1), igual à coluna Produtos
+    do Por Loja; "com oportunidade" = economia > 0 ("a revisar" e "já
+    otimizada" contam como analisados, não como oportunidade)."""
+    if df.empty:
+        return Indicadores(0.0, 0, 0, 0, 0)
+    com = df[df["economia"] > 0]
+    return Indicadores(
+        economia=float(df["economia"].sum()),
+        lojas_com_oportunidade=int(com["loja_id"].nunique()),
+        lojas_analisadas=int(df["loja_id"].nunique()),
+        produtos_com_oportunidade=int(com["base_generico_id"].nunique()),
+        produtos_analisados=int(df["base_generico_id"].nunique()),
+    )
+
+
+def variacao(atual: float | None, anterior: float | None) -> float | None:
+    """Variação relativa (0,12 = +12%). None quando não dá pra comparar
+    (sem período anterior, ou anterior zero — "de 0 para 5" não é %)."""
+    if atual is None or anterior is None or anterior == 0:
+        return None
+    return (atual - anterior) / anterior
 
 
 def filtrar(df: pd.DataFrame, filtros: Filtros) -> pd.DataFrame:
@@ -299,7 +382,15 @@ def filtrar(df: pd.DataFrame, filtros: Filtros) -> pd.DataFrame:
             df["razao_social"].fillna("") + " " + df["cnpj"].fillna("") + " " + df["nome_canonico"].fillna("")
             + " " + df["laboratorio"].fillna("") + " " + df["descricao"].fillna("")
         ).str.lower()
-        mascara &= alvo.str.contains(termo, regex=False)
+        encontrado = alvo.str.contains(termo, regex=False)
+        # CNPJ digitado com pontuação ("10.482.949/0001-29") também acha: o
+        # banco guarda só os dígitos, e o CNPJ formatado é o que aparece na
+        # tela — copiar de lá e colar na busca não achava nada.
+        if re.fullmatch(r"[\d./\-\s]+", termo):
+            digitos = re.sub(r"\D", "", termo)
+            if digitos:
+                encontrado |= df["cnpj"].fillna("").str.contains(digitos, regex=False)
+        mascara &= encontrado
     return df[mascara]
 
 
@@ -334,8 +425,10 @@ def ordenar(df: pd.DataFrame, coluna: str, crescente: bool) -> pd.DataFrame:
     def chave(serie: pd.Series) -> pd.Series:
         # pandas 3 guarda texto num dtype próprio ("str"), não mais em object —
         # checar só `object` deixava a ordenação sensível a maiúsculas.
+        # strip: 22 lojas do cadastro vêm com espaço antes da razão social
+        # (visto em 24/09/2026) — " DROGARIA LIZ" ia pro topo do A–Z.
         if pd.api.types.is_string_dtype(serie) or serie.dtype == object:
-            return serie.astype("string").str.lower()
+            return serie.astype("string").str.strip().str.lower()
         return serie
     desempate = [c for c in ("loja_id", "base_generico_id") if c in df.columns and c != coluna]
     return df.sort_values(

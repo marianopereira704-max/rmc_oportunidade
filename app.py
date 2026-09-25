@@ -91,12 +91,8 @@ if _apenas_admin_por_chave.get(st.session_state["secao_ativa"]) and not auth.is_
     st.session_state["secao_ativa"] = "oportunidade_loja"
 
 with st.sidebar:
-    st.markdown(
-        f"""<div style="padding: 8px 4px 20px 4px;">
-        <div style="font-weight:700; font-size:1.1rem;">{settings.nome_fornecedor} Oportunidades</div>
-        <div style="font-size:0.8rem; color:#C9D4E0;">{usuario['nome']} · {"Admin" if auth.is_admin() else "Consultor"}</div>
-        </div>""",
-        unsafe_allow_html=True,
+    theme.marca_sidebar(
+        f"{settings.nome_fornecedor} Oportunidades", usuario["nome"], "Admin" if auth.is_admin() else "Consultor",
     )
 
     _ultimo_grupo = None
@@ -104,7 +100,7 @@ with st.sidebar:
         if apenas_admin and not auth.is_admin():
             continue
         if grupo != _ultimo_grupo:
-            theme.nav_grupo_label(grupo)
+            theme.nav_grupo_label(grupo, divisoria=_ultimo_grupo is not None)
             _ultimo_grupo = grupo
         ativa = st.session_state["secao_ativa"] == chave
         with st.container():
@@ -113,7 +109,7 @@ with st.sidebar:
                 st.session_state["secao_ativa"] = chave
                 st.rerun()
 
-    st.markdown("<div style='margin-top:24px;'></div>", unsafe_allow_html=True)
+    theme.nav_divisoria()
     with st.container():
         st.markdown('<div class="nav-marker"></div>', unsafe_allow_html=True)
         if st.button("Sair", key="nav_sair", icon=":material/logout:", use_container_width=True):

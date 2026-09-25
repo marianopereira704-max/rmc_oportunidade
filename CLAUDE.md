@@ -40,8 +40,10 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
   `alembic`, `data.seed` ou qualquer script também. Para NÃO tocar em
   produção: `RMC_IGNORAR_SECRETS=1` (o `_get` de `core/config.py` pula o
   secrets.toml; sem outras variáveis, cai em SQLite `data/app.db` + disco
-  local). Só para a tela, também serve
-  `streamlit run app.py --secrets.files=<secrets de teste>`.
+  local). **Atenção:** sob `streamlit run` isso NÃO basta — ao subir, o
+  Streamlit copia as chaves do secrets.toml para as variáveis de ambiente,
+  por cima das suas (medido em 24/09/2026). Para abrir o app sem tocar no
+  banco/bucket reais, use `streamlit run app.py --secrets.files=<secrets de teste>`.
   `data.seed` apaga lojas/genéricos/compras e por isso se recusa a rodar fora de SQLite.
 - **Migrações rodam sozinhas** no start do app (`core/db.py::_preparar_esquema`).
   Depois das migrações, `_criar_tabelas_faltantes` cria qualquer tabela do
@@ -65,11 +67,18 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
 - Código, comentários, mensagens de tela e commits em português. O estilo do
   projeto é comentário/docstring explicando o PORQUÊ, com o bug ou a medição
   que motivou a decisão — manter essa densidade.
-- Testes: `python -m pytest -q -p no:warnings` (210 passando em 24/09, ~20s).
+- Testes: `python -m pytest -q -p no:warnings` (248 passando em 25/09, ~25s).
   `tests/conftest.py` força storage local temporário em todo teste — sem ele,
   a suíte gravava arquivos no bucket real. Testes usam SQLite; primitivas
   que dependem do banco (ON CONFLICT) ficam em `core/sql.py` pra valer igual
   nos dois.
+- Teste visual e de contrato (fora do pytest, precisa de Playwright):
+  `python -m tests.visual.rodar` — sobe o app num SQLite com `data.seed`,
+  percorre as telas em 1280/1920 px, confere os seletores internos do
+  Streamlit (`SELETORES_STREAMLIT`) e compara as capturas com
+  `tests/visual/referencia/`. Mudança visual de propósito:
+  `--atualizar` e versionar as imagens novas. Rodar antes de atualizar o
+  Streamlit (versão fixada em `requirements.txt`).
 
 ## Mapa do código
 
@@ -81,6 +90,7 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
 | `core/db.py` | Engine/pool, `get_session` (commit/rollback), migrações no start, usuários fixos. |
 | `core/analise.py` | Cálculo da oportunidade (menor preço, recuo de preço, bonificação, vencedor, preço médio, economia), filtros/ordenação em memória. |
 | `core/queries.py` | Consultas de apoio: meses carregados, histórico mensal, listas dos filtros. |
+| `views/tabela.py` | Tabela das telas de análise (CCv2): um grid só pra cabeçalho e linhas, ordenação pelo título, botão por linha, dica, estado vazio. Mudou o JS/CSS: reiniciar o `streamlit run`. |
 | `views/analise_comum.py` | Faixa do filtro Laboratório, filtros, cabeçalho ordenável, cache do resultado, formatação das células. |
 | `core/rotinas.py` | `controle_rotinas`: rotina diária (`reivindicar`) e trava "um por vez" (`reivindicar_trava`/`liberar_trava`). |
 | `core/sql.py` | Upsert atômico portátil (`insert_com_atualizacao`, `insert_ignorando_conflito`). |
@@ -96,6 +106,8 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
 | `storage/filesystem.py` | Explorador de Arquivos virtual (FSNode) sobre Spaces/disco; nada se apaga, "inativar" move pra `_Inativos`. |
 | `views/leitor_planilha.py` | Componente (CCv2) que lê o .xlsx NO NAVEGADOR. |
 | `views/dados.py` | Aba Dados (só admin): explorador, importações, filas. |
+| `core/theme.py` | CSS em camadas: 1 tokens (cores, escala de texto 28/20/16/14/13/12, espaçamento 4–32, raios); 2 adaptação do Streamlit — única camada com seletor interno, sempre via `SELETORES_STREAMLIT`; 3 componentes `.rmc-*`/`st-key-*`; 4 telas (`theme.tela("nome")` → `st-key-tela-nome`). |
+| `.streamlit/config.toml` | Tema oficial (primaryColor navy, fonte base 14, raios) e `toolbarMode = "viewer"`. O que der pra resolver aqui não vai pra CSS. Largura máxima do conteúdo: `LARGURA_MAXIMA_PX` (1220). |
 
 ## Perfis
 
@@ -266,6 +278,41 @@ UM laboratório Gruppy; o cabeçalho da coluna de preço é o nome dele (o que
 foi digitado no upload da Gruppy). Só entram genéricos da tabela dele e lojas
 de UF que ela cobre. A escolha fica lembrada entre Por Loja e Por Produto.
 
+Layout (redesenho de 24–25/09/2026, etapas 0–5): conteúdo com largura
+máxima de 1220 px (`LARGURA_MAXIMA_PX`), todas as seções com as mesmas bordas
+e 16 px entre elas (28 px dos cards até os
+rótulos dos filtros); sem cabeçalho de página (a tela abre na faixa —
+pedido de 25/09/2026); faixa Laboratório de 76 px com ícone de frasco. Nas
+telas de análise o `margin-bottom: -1rem` do Markdown é zerado — sem isso os
+vãos visíveis ficavam 14 px menores que os do CSS. Sidebar: logo + nome, "usuário | papel", divisória entre
+os grupos e antes do Sair, 8 px entre botões, ícone e texto à esquerda.
+Streamlit 1.62 põe `margin-bottom: -1rem` em todo Markdown e centraliza o
+conteúdo do botão num `<div>` interno — os dois estão na lista
+`SELETORES_STREAMLIT` (`markdown`, `botao_conteudo`).
+
+Cards de indicadores (modelo do print de 25/09/2026: ícone num círculo,
+TÍTULO em maiúsculas em cima, número e subtítulo; fundo tingido — azul,
+verde na Economia, roxo em Produtos; com card estreito, < 250 px, o ícone
+sobe e o título reserva 2 linhas pros números alinharem. Ficam entre a faixa
+Laboratório e os filtros e seguem todos os filtros): **Por Loja** — Lojas com oportunidade (de X analisadas) |
+Economia potencial | Produtos com oportunidade (de X analisados) | Economia
+média por loja; **Por Produto** — os mesmos, abrindo por Produtos e com
+Economia média por produto. "Produto" = genérico distinto; "com
+oportunidade" = economia > 0. Seta de tendência (verde sobe, âmbar desce)
+contra os N meses de CALENDÁRIO imediatamente anteriores, com os mesmos
+filtros — só aparece se todos esses meses estiverem carregados
+(`analise.meses_periodo_anterior`); a dica diz com quais meses comparou.
+Os cards de status da aba Dados também usam `.rmc-kpi`: estilo novo de card
+vai em `.rmc-kpis .rmc-kpi`, nunca no `.rmc-kpi` sozinho.
+
+Filtros (linha única): busca sem rótulo à vista, com texto de exemplo (acha
+razão social, CNPJ — com ou sem pontuação —, produto, laboratório e a
+descrição do GPS) | UF | Atendente comercial | Grupo econômico | Período sem
+rótulo ("Último mês", "Últimos 2/3/6 meses" — `PERIODOS_MESES_OPCOES`), e o
+"Selecionar lojas específicas" embaixo. Sem "filtros avançados" (decidido em
+24/09/2026). Os rótulos escondidos usam `label_visibility="hidden"` pra os
+cinco campos ficarem na mesma altura.
+
 Para cada (loja, genérico) no período (N últimos `ano_mes` carregados):
 1. **Bonificação** (preço < R$ 0,10, `ANALISE_LIMITE_BONIFICACAO`) sai de tudo; só é contada.
 2. **Preço efetivo** de cada compra = o primeiro a até ±50% (`ANALISE_TOLERANCIA_PRECO`)
@@ -285,9 +332,16 @@ Para cada (loja, genérico) no período (N últimos `ano_mes` carregados):
 
 Colunas: **Por Produto** — Produto (loja embaixo) | Laboratório (da compra, GPS) |
 Preço pago | *laboratório escolhido* | Diferença un. | Qtd. | Preço médio (3m) |
-Economia. **Por Loja** — Loja | Time de atendimento | UF | Cidade | Genéricos |
-Economia; o **Detalhes** abre a tabela de produtos da loja com as colunas do
-Por Produto (descrição do GPS embaixo do produto).
+Economia. **Por Loja** (tabela `views/tabela.py`, desde 25/09/2026) — Loja
+(razão social em destaque, CNPJ embaixo) | Localização (Cidade/UF, ícone de pino) |
+Responsável (ícone de pessoa; 3 linhas em ordem fixa: consultor interno, consultor farma,
+atendente comercial; nome + sobrenome, pulando "de/da/dos" — o nome inteiro
+fica na dica; vazio = "—"; "?" no título explica a ordem) | Produtos |
+Economia | botão de seta ("Ver detalhes"), que abre a tabela de produtos da
+loja com as colunas do Por Produto (sem a loja embaixo). **Por Produto** e os
+dois Detalhes usam a mesma tabela (`analise_comum.colunas_produto`/`linha_produto`);
+os Detalhes mostram os três responsáveis com nome inteiro e papel. Sem
+resultado: "Nenhuma oportunidade encontrada / Tente alterar os filtros".
 
 **Ordenação:** clicar no título de qualquer coluna (inclusive no Detalhes);
 de novo inverte. Vazios sempre no fim. Padrão: Economia decrescente.

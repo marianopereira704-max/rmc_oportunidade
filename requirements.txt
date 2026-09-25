@@ -1,4 +1,7 @@
-streamlit>=1.38
+# Versão FIXA: o CSS do tema depende da estrutura interna do Streamlit (ver
+# core/theme.py, SELETORES_STREAMLIT). Atualizar = decisão consciente: subir
+# aqui, rodar `python -m tests.visual.rodar` e conferir o contrato.
+streamlit==1.62.0
 sqlalchemy>=2.0
 alembic>=1.13
 psycopg2-binary>=2.9
