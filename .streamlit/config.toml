@@ -1,0 +1,25 @@
+# Configuração oficial do Streamlit — vale no app local e no publicado.
+#
+# O que dá pra resolver aqui NÃO vai pra CSS: estas opções são contrato
+# público do Streamlit, não dependem da estrutura interna das telas e não
+# quebram ao atualizar a versão (ver core/theme.py, camada "adaptação").
+
+[client]
+# Esconde o "Deploy" e o menu de desenvolvedor (Rerun continua na tecla R).
+toolbarMode = "viewer"
+
+[theme]
+# Cor principal = navy da marca. Substitui o vermelho padrão do Streamlit em
+# foco de campo, checkbox, toggle e barra da aba ativa — antes, três regras
+# de CSS sobre a estrutura interna faziam isso (e uma já tinha quebrado).
+primaryColor = "#17375E"
+borderColor = "#E4E7EB"
+
+# Escala de texto (tokens em core/theme.py): corpo 14px; títulos h1 28px
+# (título da página) e h2–h5 20px (título de seção). h6 fica como destaque.
+baseFontSize = 14
+headingFontSizes = ["28px", "20px", "20px", "20px", "20px", "16px"]
+
+# Raio padrão de campos e botões (token --raio).
+baseRadius = "8px"
+buttonRadius = "8px"

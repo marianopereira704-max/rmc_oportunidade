@@ -985,6 +985,11 @@ def _fila_cnpj_orfao() -> None:
 
 
 def render() -> None:
+    with theme.tela("dados"):
+        _render()
+
+
+def _render() -> None:
     theme.cabecalho("Dados", "Status das integrações, importação de planilhas e filas de pendência.")
     # Toda ação que muda os dados da análise (envios, EAN/CNPJ resolvido,
     # exclusões) acontece nesta aba: descartar o cálculo guardado aqui faz

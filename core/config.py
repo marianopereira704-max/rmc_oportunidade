@@ -340,6 +340,11 @@ class TemaConfig:
     """Parâmetros de layout do tema que fazem sentido variar por ambiente
     (ex: largura da sidebar) sem precisar editar core/theme.py."""
     sidebar_largura_px: int = field(default_factory=lambda: int(_get("SIDEBAR_LARGURA_PX", "272")))
+    # Largura máxima da ÁREA ÚTIL do conteúdo (sem contar o respiro lateral).
+    # Em telas largas o conteúdo para de esticar e fica centralizado — sem
+    # isso, em 1920px a tabela Por Loja ocupava ~1.490px com as colunas
+    # espalhadas. Abaixo de ~1.600px de tela o limite nem entra em jogo.
+    largura_maxima_px: int = field(default_factory=lambda: int(_get("LARGURA_MAXIMA_PX", "1220")))
 
 
 @dataclass
@@ -379,7 +384,7 @@ class AppConfig:
         default_factory=lambda: _get_int_list("PAGE_SIZE_OPCOES", [25, 50, 100, 200])
     )
     periodos_meses_opcoes: list[int] = field(
-        default_factory=lambda: _get_int_list("PERIODOS_MESES_OPCOES", [1, 2, 6])
+        default_factory=lambda: _get_int_list("PERIODOS_MESES_OPCOES", [1, 2, 3, 6])
     )
     nome_rede: str = field(default_factory=lambda: _get("NOME_REDE", "Rede"))
     nome_fornecedor: str = field(default_factory=lambda: _get("NOME_FORNECEDOR", "RMC"))

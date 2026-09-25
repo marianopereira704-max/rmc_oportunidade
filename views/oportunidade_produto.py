@@ -2,10 +2,10 @@
 comparando o MENOR preço que a loja pagou com o preço do laboratório
 escolhido no filtro principal (regras em core/analise.py). Ordenação pelo
 cabeçalho e paginação rodam sobre o resultado guardado em memória
-(views/analise_comum.py) — só mudar laboratório ou período vai ao banco."""
+(views/analise_comum.py) — só mudar laboratório ou período vai ao banco. A
+tabela é o componente de views/tabela.py, com as colunas de
+`analise_comum.colunas_produto` (as mesmas do Detalhes da loja)."""
 from __future__ import annotations
-
-import html
 
 import plotly.graph_objects as go
 import streamlit as st
@@ -15,24 +15,10 @@ from core.config import settings
 from core.db import get_session
 from core.queries import historico_compras
 from views import analise_comum as comum
+from views import tabela as tb
 
 _KEY = "op_produto"
 _TODOS = "Todos"
-_LARGURAS = [2.4, 1.2, 1.1, 1.0, 1.05, 0.65, 1.15, 1.25, 1.1]
-
-
-def _colunas(laboratorio: str) -> list[comum.Coluna]:
-    return [
-        comum.Coluna("Produto", "nome_canonico"),
-        comum.Coluna("Laboratório", "laboratorio"),
-        comum.Coluna("Preço pago", "preco_pago", numerica=True),
-        comum.Coluna(laboratorio, "preco_laboratorio", numerica=True),
-        comum.Coluna("Diferença un.", "diferenca", numerica=True),
-        comum.Coluna("Qtd.", "quantidade", numerica=True),
-        comum.Coluna(f"Preço médio ({settings.analise.meses_preco_medio}m)", "preco_medio", numerica=True),
-        comum.Coluna("Economia", "economia", numerica=True),
-        comum.Coluna("", None),
-    ]
 
 
 def _grafico_historico(historico: list[dict]) -> go.Figure:
@@ -71,6 +57,10 @@ def _dialog_detalhes(linha: dict, laboratorio: str) -> None:
             st.markdown(f"**CNPJ**  \n{ui.formatar_cnpj(linha['cnpj'])}")
             st.markdown(f"**Razão Social**  \n{linha['razao_social']}")
             st.markdown(f"**UF / Cidade**  \n{linha['uf']} · {linha['cidade']}")
+            # Os três responsáveis, com o nome inteiro e o papel — mesma
+            # ordem da coluna Responsável do Por Loja.
+            st.markdown(f"**Consultor interno**  \n{linha.get('consultor_interno') or '—'}")
+            st.markdown(f"**Consultor farma**  \n{linha.get('consultor_farma') or '—'}")
             st.markdown(f"**Atendente comercial**  \n{linha.get('atendente_comercial') or '—'}")
         with c2:
             st.markdown(f"**Genérico**  \n{linha['nome_canonico']}")
@@ -116,54 +106,41 @@ def _dialog_detalhes(linha: dict, laboratorio: str) -> None:
 
 
 def render() -> None:
-    theme.cabecalho(
-        "Análise de Oportunidade · Por Produto",
-        "Comparativo genérico a genérico entre o menor preço que a loja pagou e o preço do laboratório.",
-    )
+    with theme.tela("por-produto"):
+        _render()
 
+
+def _render() -> None:
+    # Sem cabeçalho de página (pedido de 25/09/2026): a tela abre direto na
+    # faixa Laboratório — o botão ativo na sidebar já diz em que tela se está.
     laboratorio = comum.faixa_laboratorio(_KEY)
-    filtros = comum.filtros(_KEY, laboratorio, "Buscar por produto, laboratório, razão social ou CNPJ")
+    # Cards entre a faixa e os filtros, preenchidos depois de ler os filtros.
+    area_indicadores = st.container()
+    filtros = comum.filtros(_KEY, laboratorio, "Buscar produto, laboratório, loja ou CNPJ")
     if laboratorio is None:
         comum.aviso_sem_laboratorio()
         return
 
     todas = comum.resultado(laboratorio, filtros.periodo_meses)
     linhas = analise.filtrar(todas, filtros)
-    comum.card_conjunto(linhas, filtros)
+    with area_indicadores:
+        comum.indicadores("produto", linhas, laboratorio, filtros)
 
     assinatura = f"{laboratorio}|{filtros}"
     ui.resetar_pagina_se_filtro_mudou(_KEY, assinatura)
 
-    if linhas.empty:
-        st.info(
-            f"Nenhum produto com compra comparável ao {laboratorio} com os filtros atuais. Confira se as compras GPS "
-            "do período já foram enviadas e se os EANs estão resolvidos na Base Genéricos."
-        )
-        return
+    ordem = comum.ordem_atual(_KEY)
+    fatia, pagina = comum.pagina(analise.ordenar(linhas, *ordem), _KEY)
+    comum.tabela_produtos(
+        f"{_KEY}_tabela", _KEY, fatia.to_dict("records"), laboratorio, com_loja=True, acao="Ver detalhes",
+    )
 
-    colunas = _colunas(laboratorio)
-    campo, crescente = comum.cabecalho_ordenavel(colunas, _LARGURAS, _KEY)
-    fatia, pagina = comum.pagina(analise.ordenar(linhas, campo, crescente), _KEY)
+    clicada = tb.acao_clicada(f"{_KEY}_tabela")
+    if clicada is not None:
+        chaves = fatia["loja_id"].astype(str) + "-" + fatia["base_generico_id"].astype(str)
+        escolhida = fatia[chaves == clicada]
+        if not escolhida.empty:
+            _dialog_detalhes(escolhida.iloc[0].to_dict(), laboratorio)
 
-    for linha in fatia.to_dict("records"):
-        c = st.columns(_LARGURAS)
-        c[0].markdown(
-            f"**{linha['nome_canonico']}**<br>"
-            f"<span class='rmc-sub-loja'>{html.escape(linha['razao_social'] or '')} · "
-            f"{ui.formatar_cnpj(linha['cnpj'])}</span>",
-            unsafe_allow_html=True,
-        )
-        c[1].write(linha.get("laboratorio") or "—")
-        c[2].markdown(comum.preco_pago(linha), unsafe_allow_html=True)
-        c[3].write(comum.moeda(linha["preco_laboratorio"]))
-        c[4].markdown(comum.diferenca(linha["diferenca"]), unsafe_allow_html=True)
-        c[5].write(ui.formatar_numero(linha["quantidade"]))
-        c[6].markdown(comum.preco_medio(linha), unsafe_allow_html=True)
-        c[7].markdown(comum.economia(linha), unsafe_allow_html=True)
-        with c[8]:
-            st.markdown('<div class="btn-secundario"></div>', unsafe_allow_html=True)
-            if st.button("Detalhes", key=f"{_KEY}_detalhe_{linha['loja_id']}_{linha['base_generico_id']}"):
-                _dialog_detalhes(linha, laboratorio)
-
-    st.divider()
-    ui.controles_paginacao(pagina, _KEY)
+    if not linhas.empty:
+        ui.controles_paginacao(pagina, _KEY)

@@ -205,6 +205,11 @@ def test_ordenar_texto_ignora_maiuscula_e_vazio_fica_no_fim_nos_dois_sentidos():
     assert pd.isna(analise.ordenar(df, "laboratorio", False)["laboratorio"].tolist()[-1])
 
 
+def test_ordenar_texto_ignora_espaco_nas_pontas():
+    df = pd.DataFrame({"loja_id": [1, 2, 3], "razao_social": [" DROGARIA LIZ", "AFONSO", "BELA VISTA "]})
+    assert analise.ordenar(df, "razao_social", True)["loja_id"].tolist() == [2, 3, 1]
+
+
 def test_ordenar_numero():
     assert analise.ordenar(_tabela(), "economia", False)["economia"].tolist() == [30.0, 10.0, 5.0]
 
@@ -280,3 +285,22 @@ def test_texto_ausente_sai_como_none_e_nao_nan():
     (NaN é verdadeiro em Python) — aconteceu no detalhe da loja."""
     lojas = analise.por_loja(_tabela())
     assert lojas.set_index("loja_id").loc[1, "grupo_economico"] is None
+
+
+def _para_busca() -> pd.DataFrame:
+    return pd.DataFrame({
+        "loja_id": [1, 2], "razao_social": ["DROGARIA UM", "FARMACIA 2020"], "cnpj": ["10482949000129", "20643529000130"],
+        "nome_canonico": ["LOSARTANA", "DIPIRONA"], "laboratorio": ["EMS", "TEUTO"], "descricao": [None, None],
+        "uf": ["MG", "MG"], "atendente_comercial": [None, None], "grupo_economico": [None, None],
+    })
+
+
+def test_busca_acha_cnpj_digitado_com_pontuacao():
+    df = _para_busca()
+    for termo in ("10.482.949/0001-29", "10.482.949", "10482949000129"):
+        assert analise.filtrar(df, analise.Filtros(laboratorio="X", periodo_meses=1, busca=termo))["loja_id"].tolist() == [1]
+
+
+def test_busca_de_texto_com_numero_continua_por_texto():
+    df = _para_busca()
+    assert analise.filtrar(df, analise.Filtros(laboratorio="X", periodo_meses=1, busca="farmacia 2020"))["loja_id"].tolist() == [2]
