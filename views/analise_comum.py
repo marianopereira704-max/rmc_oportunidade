@@ -316,19 +316,19 @@ def diferenca(valor) -> str:
 def colunas_produto(laboratorio: str) -> list[tb.ColunaTabela]:
     """As 8 colunas da tabela de produtos. O título da coluna de preço é o
     nome do laboratório escolhido (como foi digitado no upload da Gruppy).
-    Pesos acertados em 1280 px (conteúdo ~870 px): "Preço médio (3m)" e
-    "Diferença un." cabem numa linha; o nome do produto quebra se precisar."""
+    Larguras pelo conteúdo (views/tabela.py); o nome do produto vai até
+    210 px e quebra linha. Com mais (250–320), em 1280 px ele crescia junto
+    com Laboratório quando faltava espaço: os vãos caíam pro mínimo (12 px) e
+    "GERMED PHARMA" quebrava em duas linhas (medido em 25/09/2026)."""
     return [
-        tb.ColunaTabela("nome_canonico", "Produto", 2.1),
-        tb.ColunaTabela("laboratorio", "Laboratório", 1.1),
-        tb.ColunaTabela("preco_pago", "Preço pago", 0.95, direita=True, numerica=True),
-        tb.ColunaTabela("preco_laboratorio", laboratorio, 0.95, direita=True, numerica=True),
-        tb.ColunaTabela("diferenca", "Diferença un.", 1.05, direita=True, numerica=True),
-        tb.ColunaTabela("quantidade", "Qtd.", 0.55, direita=True, numerica=True),
-        tb.ColunaTabela(
-            "preco_medio", f"Preço médio ({settings.analise.meses_preco_medio}m)", 1.4, direita=True, numerica=True,
-        ),
-        tb.ColunaTabela("economia", "Economia", 1.2, direita=True, numerica=True),
+        tb.ColunaTabela("nome_canonico", "Produto", "fit-content(210px)"),
+        tb.ColunaTabela("laboratorio", "Laboratório", "fit-content(150px)"),
+        tb.ColunaTabela("preco_pago", "Preço pago", direita=True, numerica=True),
+        tb.ColunaTabela("preco_laboratorio", laboratorio, direita=True, numerica=True),
+        tb.ColunaTabela("diferenca", "Diferença un.", direita=True, numerica=True),
+        tb.ColunaTabela("quantidade", "Qtd.", direita=True, numerica=True),
+        tb.ColunaTabela("preco_medio", f"Preço médio ({settings.analise.meses_preco_medio}m)", direita=True, numerica=True),
+        tb.ColunaTabela("economia", "Economia", direita=True, numerica=True),
     ]
 
 

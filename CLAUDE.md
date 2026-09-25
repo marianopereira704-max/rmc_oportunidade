@@ -75,7 +75,7 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
 - Teste visual e de contrato (fora do pytest, precisa de Playwright):
   `python -m tests.visual.rodar` — sobe o app num SQLite com `data.seed`,
   percorre as telas em 1280/1920 px, confere os seletores internos do
-  Streamlit (`SELETORES_STREAMLIT`) e compara as capturas com
+  Streamlit (`SELETORES_STREAMLIT`), os vãos iguais das tabelas e compara as capturas com
   `tests/visual/referencia/`. Mudança visual de propósito:
   `--atualizar` e versionar as imagens novas. Rodar antes de atualizar o
   Streamlit (versão fixada em `requirements.txt`).
@@ -342,6 +342,14 @@ loja com as colunas do Por Produto (sem a loja embaixo). **Por Produto** e os
 dois Detalhes usam a mesma tabela (`analise_comum.colunas_produto`/`linha_produto`);
 os Detalhes mostram os três responsáveis com nome inteiro e papel. Sem
 resultado: "Nenhuma oportunidade encontrada / Tente alterar os filtros".
+
+**Largura das colunas (regra de 25/09/2026):** cada coluna tem a largura do
+próprio conteúdo (`auto`; texto longo em `fit-content(Npx)` — Loja 340,
+Produto 210 — que quebra linha acima disso) e a sobra vira vãos IGUAIS
+entre todas as colunas (grid + subgrid, `justify-content: space-between`).
+Nunca largura fixa ou em pesos (`fr`): foi o que deixou um buraco entre
+Responsável e Produtos. O teste visual mede o vão VISÍVEL entre as colunas de
+toda tabela (±8 px) e falha também se um título quebrar linha.
 
 **Ordenação:** clicar no título de qualquer coluna (inclusive no Detalhes);
 de novo inverte. Vazios sempre no fim. Padrão: Economia decrescente.

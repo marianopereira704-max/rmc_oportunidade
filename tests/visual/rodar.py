@@ -10,11 +10,13 @@ O que faz:
    dados em toda execução) e sobe o app contra ele — nunca toca em produção.
 2. Percorre as telas (login, Por Loja, Por Produto, Detalhes, Dados, Pedido,
    Dashboard) em 1280 e 1920 px.
-3. CONTRATO: em cada tela, confere se os seletores da estrutura interna do
+3. TABELAS: em toda tabela, os vãos entre colunas têm de ser iguais (±8 px)
+   e nenhum título de coluna pode quebrar linha.
+4. CONTRATO: em cada tela, confere se os seletores da estrutura interna do
    Streamlit de que o tema depende (core/theme.py, SELETORES_STREAMLIT) ainda
    encontram o elemento. Se o Streamlit mudou o HTML numa atualização, é
    aqui que aparece — com o nome da regra e a tela.
-4. CAPTURA: fotografa cada tela e compara com `tests/visual/referencia/`.
+5. CAPTURA: fotografa cada tela e compara com `tests/visual/referencia/`.
    Diferença acima da tolerância = falha, com uma imagem destacando o que
    mudou em `tests/visual/resultado/`.
 
@@ -274,7 +276,61 @@ def _comparar(atual: Path, referencia: Path, diferenca: Path) -> tuple[bool, flo
     return mudou <= TOLERANCIA, mudou
 
 
-def _registrar(page, tela, largura, mascaras, atualizar, falhas_contrato, conferidos, falhas_visuais) -> None:
+# Regra das tabelas (views/tabela.py), medida em toda tela que tiver uma:
+# vãos iguais entre as colunas e nenhum título quebrando linha. Pedido de
+# 25/09/2026, depois de um vão enorme entre "Responsável" e "Produtos".
+# 8 px: nome longo que quebra linha deixa a borda direita "serrilhada" alguns
+# px antes do fim da coluna (medido: +5 a +6 px na Por Loja real). O buraco
+# que motivou a regra tinha mais de 100 px.
+VAO_DIFERENCA_MAX_PX = 8
+# O vão medido é entre o que APARECE: a borda do conteúdo mais à direita de
+# uma coluna (texto, ícone, selo — em qualquer linha, título incluído) até a
+# borda do conteúdo mais à esquerda da seguinte. Medir a caixa das colunas
+# não serve: na versão com pesos fixos as caixas tinham vão constante de
+# 16 px e mesmo assim sobrava um buraco visível entre "Responsável" e
+# "Produtos" (a primeira versão desta checagem passou nela — 25/09/2026).
+_JS_TABELAS = r"""quadros => quadros.map(quadro => {
+  const linhas = [...quadro.children].filter(l => l.classList.contains('linha'));
+  const ncol = linhas.length ? linhas[0].children.length : 0;
+  const extensao = Array.from({length: ncol}, () => [Infinity, -Infinity]);
+  const somar = (i, r) => { if (r.width > 0) { extensao[i][0] = Math.min(extensao[i][0], r.left); extensao[i][1] = Math.max(extensao[i][1], r.right); } };
+  for (const linha of linhas) {
+    [...linha.children].forEach((cel, i) => {
+      const it = document.createTreeWalker(cel, NodeFilter.SHOW_TEXT);
+      for (let n = it.nextNode(); n; n = it.nextNode()) {
+        if (!n.textContent.trim() || n.parentElement.closest('.seta')) continue;
+        const rg = document.createRange(); rg.selectNodeContents(n); somar(i, rg.getBoundingClientRect());
+      }
+      cel.querySelectorAll('svg:not(.seta), [class*="selo-"], button.acao').forEach(e => somar(i, e.getBoundingClientRect()));
+    });
+  }
+  const cols = extensao.filter(e => e[1] > -Infinity);
+  const vaos = cols.slice(1).map((e, i) => Math.round(e[0] - cols[i][1]));
+  const cab = linhas[0];
+  const quebrados = [...cab.querySelectorAll('.titulo')].filter(t => {
+    const alt = parseFloat(getComputedStyle(t).lineHeight) || 19;
+    return t.getBoundingClientRect().height > alt * 1.5;
+  }).map(t => t.innerText.trim());
+  const titulos = [...cab.querySelectorAll('.titulo')].map(t => t.innerText.trim());
+  return {titulos, vaos, quebrados};
+})"""
+
+
+def _verificar_tabelas(page, tela: str, largura: int, falhas: list[str]) -> None:
+    for tabela in page.locator(".rmc-tabela .quadro").evaluate_all(_JS_TABELAS):
+        if not tabela["titulos"]:
+            continue  # tabela vazia ("Nenhuma oportunidade encontrada")
+        nome = " | ".join(tabela["titulos"][:3]) + " …"
+        vaos = tabela["vaos"]
+        if vaos and max(vaos) - min(vaos) > VAO_DIFERENCA_MAX_PX:
+            falhas.append(f"{tela} @ {largura}px, tabela [{nome}]: vãos desiguais entre colunas {vaos}")
+        if tabela["quebrados"]:
+            falhas.append(f"{tela} @ {largura}px, tabela [{nome}]: título quebrado {tabela['quebrados']}")
+
+
+def _registrar(page, tela, largura, mascaras, atualizar, falhas_contrato, conferidos, falhas_visuais,
+               falhas_layout) -> None:
+    _verificar_tabelas(page, tela, largura, falhas_layout)
     from core.theme import SELETORES_STREAMLIT
 
     for nome, (seletor, tela_contrato) in SELETORES_STREAMLIT.items():
@@ -320,6 +376,7 @@ def main() -> int:
     falhas_contrato: list[str] = []
     conferidos: set[str] = set()
     falhas_visuais: list[str] = []
+    falhas_layout: list[str] = []
     try:
         with sync_playwright() as p:
             navegador = p.chromium.launch()
@@ -330,7 +387,7 @@ def main() -> int:
                     for tela, mascaras in _telas(page, url):
                         _estabilizar(page)
                         _registrar(page, tela, largura, mascaras, args.atualizar,
-                                   falhas_contrato, conferidos, falhas_visuais)
+                                   falhas_contrato, conferidos, falhas_visuais, falhas_layout)
                 except Exception as erro:
                     # Foto de onde travou: sem ela, só sobra um timeout genérico.
                     page.screenshot(path=str(RESULTADO / f"ERRO_depois_de_{tela}_{largura}.png"))
@@ -346,12 +403,14 @@ def main() -> int:
     print("OK" if not falhas_contrato else "\n".join(f"FALHOU: {f}" for f in falhas_contrato))
     if sem_tela:
         print(f"(não conferidos neste roteiro — sem tela garantida: {', '.join(sem_tela)})")
+    print("\n== TABELAS (vãos iguais entre colunas, títulos numa linha) ==")
+    print("OK" if not falhas_layout else "\n".join(f"FALHOU: {f}" for f in falhas_layout))
     print("\n== CAPTURAS ==")
     if args.atualizar:
         print(f"Referências atualizadas em {REFERENCIA}")
     else:
         print("OK — nenhuma tela mudou." if not falhas_visuais else "\n".join(f"MUDOU: {f}" for f in falhas_visuais))
-    return 1 if (falhas_contrato or falhas_visuais) else 0
+    return 1 if (falhas_contrato or falhas_visuais or falhas_layout) else 0
 
 
 if __name__ == "__main__":

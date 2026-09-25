@@ -5,8 +5,17 @@ Por que componente e não `st.columns` por linha: com colunas do Streamlit,
 cada linha é um bloco horizontal independente e o cabeçalho é outro; a
 largura de cada célula depende do conteúdo e da quebra de linha, e o botão
 "Detalhes" quebrava em "Detalhe/s" a 1280 px (medido na auditoria de
-24/09/2026). Aqui todas as linhas usam as MESMAS trilhas de grid
-(`minmax(0, Nfr)`: a largura não depende do conteúdo), então nada se desloca.
+24/09/2026). Aqui o quadro é UM grid e cada linha é um subgrid dele: as
+colunas são as mesmas em todas as linhas, e a largura de cada uma vem do
+conteúdo de TODAS as linhas juntas.
+
+Espaço entre colunas (padronizado em 25/09/2026): cada coluna tem a largura
+do próprio conteúdo e a sobra vira vãos IGUAIS entre todas elas
+(`justify-content: space-between`). Antes as larguras eram pesos fixos
+(`2.1fr`, `0.8fr`…): Responsável ficava bem mais largo que os nomes e,
+com Produtos alinhado à direita, sobrava um buraco entre os dois títulos.
+O teste visual (tests/visual/rodar.py) mede os vãos de toda tabela e falha
+se diferirem mais de 2 px ou se um título quebrar linha.
 
 O componente só desenha e avisa cliques — ordenar e paginar continuam em
 Python sobre o resultado em memória (core/analise.py), como antes:
@@ -55,7 +64,12 @@ def celula(*linhas) -> list[list[dict]]:
 class ColunaTabela:
     campo: str | None       # campo do DataFrame usado na ordenação; None = não ordena
     rotulo: str
-    largura: float          # peso da coluna (fr); todas as linhas usam o mesmo
+    # Trilha CSS da coluna. Padrão "auto" = largura do conteúdo (título e
+    # todas as células). Texto que pode ser longo (nome de loja/produto,
+    # cidade, laboratório): "fit-content(Npx)" — do tamanho do texto até N px,
+    # e quebra linha acima disso. Nunca largura fixa ou mínima: sobra espaço
+    # dentro da coluna e o vão visível fica maior que os outros.
+    largura: str = "auto"
     direita: bool = False   # números e valores alinham à direita
     numerica: bool = False  # 1º clique: número do maior pro menor, texto de A a Z
     dica: str | None = None  # "?" ao lado do título, com esta explicação
@@ -84,20 +98,28 @@ _CSS = """
   border: 1px solid var(--borda, #E4E7EB);
   border-radius: var(--raio-lg, 12px);
   background: #FFFFFF;
-}
-.linha {
   display: grid;
   grid-template-columns: var(--colunas);
-  column-gap: var(--esp-4, 16px);
+  /* Vão MÍNIMO entre colunas; a sobra de largura vira vãos iguais. */
+  column-gap: var(--esp-6, 32px);
+  justify-content: space-between;
+}
+.linha {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: subgrid;
   word-break: normal;
   align-items: center;
   padding: var(--esp-3, 12px) var(--esp-4, 16px);
   border-top: 1px solid var(--borda, #E4E7EB);
 }
+.vazio { grid-column: 1 / -1; }
 .linha.corpo:hover { background: rgba(23, 55, 94, 0.03); }
 /* Tabela de muitas colunas (Por Produto, Detalhes): vão menor entre colunas,
    pra caber em 1280 px sem quebrar os títulos. */
-.rmc-tabela.densa .linha { column-gap: var(--esp-3, 12px); padding-left: var(--esp-3, 12px); padding-right: var(--esp-3, 12px); }
+/* 12px mínimos: com 16, a Por Produto real passava 4px da borda em 1280. */
+.rmc-tabela.densa .quadro { column-gap: var(--esp-3, 12px); }
+.rmc-tabela.densa .linha { padding-left: var(--esp-3, 12px); padding-right: var(--esp-3, 12px); }
 .linha.cabecalho {
   border-top: 0;
   background: var(--fundo-card, #F7F8FA);
@@ -106,8 +128,14 @@ _CSS = """
   padding-bottom: var(--esp-2, 8px);
 }
 .linha.corpo:last-child { border-radius: 0 0 var(--raio-lg, 12px) var(--raio-lg, 12px); }
-.cel { min-width: 0; overflow-wrap: anywhere; }
-.cel.direita { text-align: right; justify-self: stretch; }
+/* break-word (não "anywhere"): "anywhere" reduz a largura mínima da coluna
+   a uma letra, e o grid espremia nomes letra a letra antes de apertar os
+   vãos. Números e títulos de coluna numérica nunca quebram. Sem
+   "min-width: 0": a coluna nunca fica mais estreita que o próprio conteúdo
+   (com ele, em 1280 px o selo de Economia invadia o vão até o botão). */
+.cel { overflow-wrap: break-word; }
+.cel.direita { text-align: right; white-space: nowrap; }
+.cabecalho .titulo { white-space: nowrap; }
 .cel > div + div { margin-top: 2px; }
 /* Célula com ícone (Localização, Responsável): ícone à esquerda, centrado
    no bloco de texto. */
@@ -257,8 +285,11 @@ export default function (component) {
   const raiz = parentElement.querySelector(".rmc-tabela");
   const colunas = data.colunas || [];
   const linhas = data.linhas || [];
-  const trilhas = colunas.map(c => `minmax(0, ${c.largura}fr)`);
-  if (data.acao) trilhas.push("32px");
+  const trilhas = colunas.map(c => c.largura || "auto");
+  // "auto", não "32px": no subgrid o padding lateral da linha entra como
+  // margem das colunas das pontas — com 32px fixos, o botão (32px) invadia o
+  // vão de Economia em 16px (medido pela checagem de vãos em 25/09/2026).
+  if (data.acao) trilhas.push("auto");
   raiz.style.setProperty("--colunas", trilhas.join(" "));
   raiz.classList.toggle("densa", !!data.densa);
 

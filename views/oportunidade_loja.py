@@ -25,11 +25,11 @@ _DICA_RESPONSAVEL = (
 )
 
 _COLUNAS = [
-    tb.ColunaTabela("razao_social", "Loja", 2.6),
-    tb.ColunaTabela("localizacao", "Localização", 1.5, icone="local"),
-    tb.ColunaTabela("consultor_interno", "Responsável", 2.1, dica=_DICA_RESPONSAVEL, icone="pessoa"),
-    tb.ColunaTabela("qtd_produtos", "Produtos", 0.8, direita=True, numerica=True),
-    tb.ColunaTabela("economia", "Economia", 1.2, direita=True, numerica=True),
+    tb.ColunaTabela("razao_social", "Loja", "fit-content(340px)"),
+    tb.ColunaTabela("localizacao", "Localização", "fit-content(220px)", icone="local"),
+    tb.ColunaTabela("consultor_interno", "Responsável", dica=_DICA_RESPONSAVEL, icone="pessoa"),
+    tb.ColunaTabela("qtd_produtos", "Produtos", direita=True, numerica=True),
+    tb.ColunaTabela("economia", "Economia", direita=True, numerica=True),
 ]
 
 
