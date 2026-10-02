@@ -78,7 +78,24 @@ class Usuario(Base):
     nome_exibicao: Mapped[str] = mapped_column(String(120))
     ativo: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # Estrutura dos níveis de acesso (27/09/2026), pronta antes do login
+    # individual: `nivel` = ADM | CONSULTOR | COMPRADOR | PROPRIETARIO (texto,
+    # não enum do Postgres — acrescentar valor a enum com o app antigo no
+    # mesmo banco é arriscado). Vazio = deduzido do `papel` (core/acesso.py).
+    # `login` será o usuário do login individual (e-mail ou CPF).
+    nivel: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    login: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    lojas: Mapped[list["UsuarioLoja"]] = relationship(cascade="all, delete-orphan")
+
     __table_args__ = (UniqueConstraint("cnpj_login", "papel", name="uq_login_papel"),)
+
+
+class UsuarioLoja(Base):
+    """Lojas de um Comprador/Proprietário — ele só vê o Pedido delas."""
+    __tablename__ = "usuarios_lojas"
+
+    usuario_id: Mapped[int] = mapped_column(ForeignKey("usuarios.id"), primary_key=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), primary_key=True)
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +118,16 @@ class Loja(Base):
 
     fonte: Mapped[str] = mapped_column(String(30), default="sistema_interno")
     atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+    # Vindos do sistema interno desde 27/09/2026, para o vínculo com a loja do
+    # GPS (pedido/vinculo.py): nas lojas que o GPS manda sem CNPJ, o número do
+    # endereço é o que casa (MEGA FARMA: 6 de 6). `legacy_id` é o código que
+    # a equipe usa no dia a dia (ex.: 787–790 = Drogarias Reis).
+    legacy_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    endereco_numero: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    bairro: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    cep: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    nome_fantasia: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
     compras: Mapped[list["RegistroCompraGPS"]] = relationship(back_populates="loja")
 
@@ -152,6 +179,10 @@ class EanGenerico(Base):
 class OrigemFila(str, enum.Enum):
     GPS = "gps"
     GRUPPY = "gruppy"
+    # Genérico que a loja vendeu (API do GPS, rotina do Pedido) e que não
+    # está na Base Genéricos — entra pela fila, sempre pra confirmar
+    # (integrations/fila_loja.py; decisão de 27/09/2026, Q23).
+    LOJA_API = "loja_api"
 
 
 class StatusFila(str, enum.Enum):
@@ -516,3 +547,267 @@ class FSNode(Base):
     )
 
     filhos: Mapped[list["FSNode"]] = relationship()
+
+
+# ---------------------------------------------------------------------------
+# Pedido: vínculo loja do GPS ↔ loja do RMC
+# ---------------------------------------------------------------------------
+
+class SituacaoVinculoGps(str, enum.Enum):
+    AUTOMATICO = "automatico"      # CNPJ igual, ou número do endereço + nome concordando
+    CONFIRMAR = "confirmar"        # há sugestão, falta uma pessoa confirmar
+    CONFIRMADO = "confirmado"      # uma pessoa confirmou (ou trocou) a loja
+    NAO_CLIENTE = "nao_cliente"    # uma pessoa disse que não é loja do RMC
+    SEM_CANDIDATO = "sem_candidato"
+
+
+class VinculoLojaGps(Base):
+    """Qual loja do GPS (idEmpresa, CodigoLoja) é qual loja do RMC.
+
+    Recalculado a partir das lojas que a rotina do Pedido grava no Spaces
+    (`pedido/controle/lojas_gps/`), MAS decisão humana (CONFIRMADO,
+    NAO_CLIENTE) nunca é sobrescrita pelo recálculo — igual EanGenerico com
+    resolução manual. Regras da sugestão: pedido/vinculo.py."""
+    __tablename__ = "vinculos_loja_gps"
+    __table_args__ = (UniqueConstraint("id_empresa_gps", "codigo_loja_gps", name="uq_vinculo_loja_gps"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id_empresa_gps: Mapped[str] = mapped_column(String(40))
+    codigo_loja_gps: Mapped[str] = mapped_column(String(40))
+    nome_loja_gps: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    cnpj_gps: Mapped[str | None] = mapped_column(String(18), nullable=True)
+    numero_gps: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    cidade_gps: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    uf_gps: Mapped[str | None] = mapped_column(String(2), nullable=True)
+
+    loja_id: Mapped[int | None] = mapped_column(ForeignKey("lojas.id"), nullable=True, index=True)
+    situacao: Mapped[SituacaoVinculoGps] = mapped_column(Enum(SituacaoVinculoGps))
+    metodo: Mapped[str | None] = mapped_column(String(20), nullable=True)   # cnpj | endereco | nome
+    pontuacao: Mapped[float | None] = mapped_column(Numeric(6, 2), nullable=True)
+    motivo: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+    decidido_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    decidido_em: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
+
+    loja: Mapped["Loja | None"] = relationship()
+
+
+# ---------------------------------------------------------------------------
+# Base de categorias (Pedido): EAN → categoria
+# ---------------------------------------------------------------------------
+
+class OrigemCategoria(str, enum.Enum):
+    FEBRAFAR = "febrafar"
+    CMED = "cmed"
+    MANUAL = "manual"
+
+
+class CategoriaEan(Base):
+    """Categoria de cada EAN — decide quantos dias de estoque o Pedido sugere
+    (medicamento 7, perfumaria 15) e se o produto entra na sugestão. Regras e
+    nomes das categorias: pedido/categorias.py.
+
+    Uma tabela só, que CRESCE com o uso: nasce com FEBRAFAR + CMED (carga
+    inicial, arquivo no Spaces) e recebe as planilhas do admin para os
+    produtos "Sem Classificação". A categoria MANUAL nunca é sobrescrita por
+    uma nova carga FEBRAFAR/CMED — mesma ideia do EanGenerico resolvido à mão.
+
+    `ean` é a CHAVE normalizada (só dígitos, sem zeros à esquerda): o mesmo
+    produto chega como EAN-13 no GPS e como GTIN-14 com zero na frente em
+    algumas listas (ver `categorias.chave_ean`)."""
+    __tablename__ = "categorias_ean"
+
+    ean: Mapped[str] = mapped_column(String(20), primary_key=True)
+    categoria: Mapped[str] = mapped_column(String(60))
+    origem: Mapped[OrigemCategoria] = mapped_column(Enum(OrigemCategoria))
+    descricao: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    atualizado_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Configurações de Pedidos
+# ---------------------------------------------------------------------------
+
+class ConfiguracaoPedido(Base):
+    """Os parâmetros da sugestão de pedido (pedido/configuracao.py), em JSON.
+    Cada gravação é uma LINHA NOVA — a vigente é a de maior id — pra ficar
+    o histórico de quem mudou o quê e quando: um "dias de estoque" alterado
+    muda o pedido de todas as lojas."""
+    __tablename__ = "configuracoes_pedido"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    valores: Mapped[str] = mapped_column(Text)
+    criado_por: Mapped[str] = mapped_column(String(120))
+    criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+
+# ---------------------------------------------------------------------------
+# Pedido: rascunho, correção de estoque negativo, exportações
+# ---------------------------------------------------------------------------
+# `linha` = a linha do pedido (pedido/calculo.py): "G<id>" para um genérico
+# da Base Genéricos, "P<código>" para um produto do cadastro da loja.
+
+class RascunhoPedido(Base):
+    """Quantidade digitada pelo usuário no lugar da sugestão — rascunho DA
+    LOJA (quem abrir a loja vê), com quem e quando alterou. Fica até alguém
+    descartar: exportar não apaga (dá pra exportar de novo)."""
+    __tablename__ = "rascunhos_pedido"
+    __table_args__ = (UniqueConstraint("loja_id", "linha", name="uq_rascunho_loja_linha"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), index=True)
+    linha: Mapped[str] = mapped_column(String(40))
+    quantidade: Mapped[int] = mapped_column(Integer)
+    sugestao_calculada: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    alterado_por: Mapped[str] = mapped_column(String(120))
+    alterado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class CorrecaoEstoque(Base):
+    """Estoque correto de um item que o GPS mostra NEGATIVO. Vale só no
+    nosso sistema (não volta pro GPS) e só enquanto a foto do GPS continuar
+    negativa: quando uma foto nova vier não negativa, ela é ignorada."""
+    __tablename__ = "correcoes_estoque"
+    __table_args__ = (UniqueConstraint("loja_id", "linha", name="uq_correcao_loja_linha"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), index=True)
+    linha: Mapped[str] = mapped_column(String(40))
+    estoque_corrigido: Mapped[float] = mapped_column(Numeric(12, 3))
+    estoque_gps: Mapped[float | None] = mapped_column(Numeric(12, 3), nullable=True)
+    data_foto: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    corrigido_por: Mapped[str] = mapped_column(String(120))
+    corrigido_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class ExportacaoPedido(Base):
+    """Registro de cada exportação (quem, quando, o quê) — não guarda o
+    arquivo."""
+    __tablename__ = "exportacoes_pedido"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), index=True)
+    formato: Mapped[str] = mapped_column(String(10))
+    itens: Mapped[int] = mapped_column(Integer)
+    unidades: Mapped[int] = mapped_column(Integer)
+    valor: Mapped[float] = mapped_column(Numeric(14, 2))
+    exportado_por: Mapped[str] = mapped_column(String(120))
+    exportado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Pedido: área de trabalho (usuário + loja) e listas salvas (29/09/2026)
+# ---------------------------------------------------------------------------
+# Substituem o "rascunho da loja" da Fase 5 (`rascunhos_pedido`, que fica no
+# banco sem uso — nada se apaga enquanto o app antigo está publicado).
+
+class AreaPedido(Base):
+    """O que o usuário mudou no pedido de uma loja, gravado a cada clique —
+    recarregar a página ou voltar outro dia traz tudo igual. Só guarda o que
+    difere do padrão: `quantidade` None = segue a sugestão; `selecionado`
+    None = marcado se a quantidade > 0."""
+    __tablename__ = "pedido_area"
+    __table_args__ = (UniqueConstraint("usuario_id", "loja_id", "linha", name="uq_pedido_area"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(Integer, index=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), index=True)
+    linha: Mapped[str] = mapped_column(String(40))
+    quantidade: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    selecionado: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class AreaPedidoEstado(Base):
+    """Por usuário + loja: a última gravação (o "salvo às hh:mm") e a lista
+    aberta — exportar apaga a lista que estava aberta."""
+    __tablename__ = "pedido_area_estado"
+    __table_args__ = (UniqueConstraint("usuario_id", "loja_id", name="uq_pedido_area_estado"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(Integer, index=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"))
+    lista_aberta_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class ListaPedido(Base):
+    """Pedido salvo com nome ("Salvar como lista"), visível pra TODOS — é o
+    que evita duas pessoas fazerem o mesmo pedido. Fica até alguém exportar
+    a partir dela ou excluir."""
+    __tablename__ = "pedido_listas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), index=True)
+    nome: Mapped[str] = mapped_column(String(120))
+    criado_por: Mapped[str] = mapped_column(String(120))
+    criado_por_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    itens: Mapped[int] = mapped_column(Integer, default=0)
+    unidades: Mapped[int] = mapped_column(Integer, default=0)
+    valor: Mapped[float] = mapped_column(Numeric(14, 2), default=0)
+
+
+class ListaPedidoItem(Base):
+    __tablename__ = "pedido_listas_itens"
+
+    lista_id: Mapped[int] = mapped_column(ForeignKey("pedido_listas.id"), primary_key=True)
+    linha: Mapped[str] = mapped_column(String(40), primary_key=True)
+    quantidade: Mapped[int] = mapped_column(Integer)
+    selecionado: Mapped[bool] = mapped_column(Boolean, default=True)
+
+
+class AvisoPedidoVisto(Base):
+    """Os pop-ups de alerta ao abrir a loja no Assistente de pedido
+    (01/10/2026): "estoque negativo" e "sem classificação" aparecem UMA vez
+    por foto do GPS, por usuário + loja — perguntar a mesma coisa a cada
+    abertura vira clique automático. `data_foto` = a foto respondida; foto
+    nova, pergunta de novo. Tabela própria (e não `pedido_area_estado`) pra
+    não mexer no "Salvo automaticamente · hh:mm"."""
+    __tablename__ = "pedido_avisos_vistos"
+    __table_args__ = (UniqueConstraint("usuario_id", "loja_id", "tipo", name="uq_pedido_avisos_vistos"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(Integer, index=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"))
+    tipo: Mapped[str] = mapped_column(String(30))
+    data_foto: Mapped[str] = mapped_column(String(10))
+    resposta: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    visto_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class PersonalizacaoPedidoLoja(Base):
+    """Personalização dos parâmetros do Pedido para UMA loja (01/10/2026):
+    só os campos que diferem do padrão (`valores`, JSON de
+    pedido/configuracao.diferencas); o resto segue o padrão, inclusive quando
+    o padrão muda depois. Como em `configuracoes_pedido`, cada gravação é uma
+    LINHA NOVA (histórico de quem e quando); a vigente da loja é a de maior
+    id, e `{}` = personalização removida (a loja volta ao padrão)."""
+    __tablename__ = "personalizacoes_pedido_loja"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), index=True)
+    valores: Mapped[str] = mapped_column(Text)
+    criado_por: Mapped[str] = mapped_column(String(120))
+    criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class FiltroSalvoPedido(Base):
+    """"Meus filtros" do pop-up do Pedido: pessoais (usuário) e de cada
+    loja, no máximo 8 por usuário + loja. SEM USO desde 01/10/2026: o pop-up
+    de filtros saiu (Assistente de pedido) e o módulo foi apagado; a tabela
+    fica porque migração não apaga tabela enquanto o `main` está atrasado.
+    `filtros` = JSON de pedido/calculo.Filtros.para_dict()."""
+    __tablename__ = "pedido_filtro_salvo"
+    __table_args__ = (UniqueConstraint("usuario_id", "loja_id", "nome", name="uq_pedido_filtro_salvo"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(Integer, index=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), index=True)
+    nome: Mapped[str] = mapped_column(String(60))
+    filtros: Mapped[str] = mapped_column(Text)
+    criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)

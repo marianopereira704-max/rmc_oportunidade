@@ -10,11 +10,12 @@ from __future__ import annotations
 import plotly.graph_objects as go
 import streamlit as st
 
-from core import analise, theme, ui
+from core import analise, auth, theme, ui
 from core.config import settings
 from core.db import get_session
 from core.queries import historico_compras
 from views import analise_comum as comum
+from views import loja_barra
 from views import tabela as tb
 
 _KEY = "op_produto"
@@ -113,10 +114,15 @@ def render() -> None:
 def _render() -> None:
     # Sem cabeçalho de página (pedido de 25/09/2026): a tela abre direto na
     # faixa Laboratório — o botão ativo na sidebar já diz em que tela se está.
+    # A loja vem da barra lateral (02/10/2026): "Todas" = a rede (ou as lojas
+    # do usuário); uma loja = só os produtos dela.
+    escolha = loja_barra.escolha(auth.usuario_atual())
+    uma_loja = not escolha.todas
     laboratorio = comum.faixa_laboratorio(_KEY)
     # Cards entre a faixa e os filtros, preenchidos depois de ler os filtros.
     area_indicadores = st.container()
-    filtros = comum.filtros(_KEY, laboratorio, "Buscar produto, laboratório, loja ou CNPJ")
+    filtros = comum.filtros(_KEY, laboratorio, "Buscar produto ou laboratório" if uma_loja
+                            else "Buscar produto, laboratório, loja ou CNPJ", escolha)
     if laboratorio is None:
         comum.aviso_sem_laboratorio()
         return
@@ -124,7 +130,7 @@ def _render() -> None:
     todas = comum.resultado(laboratorio, filtros.periodo_meses)
     linhas = analise.filtrar(todas, filtros)
     with area_indicadores:
-        comum.indicadores("produto", linhas, laboratorio, filtros)
+        comum.indicadores("produto", linhas, laboratorio, filtros, uma_loja=uma_loja)
 
     assinatura = f"{laboratorio}|{filtros}"
     ui.resetar_pagina_se_filtro_mudou(_KEY, assinatura)
@@ -132,7 +138,7 @@ def _render() -> None:
     ordem = comum.ordem_atual(_KEY)
     fatia, pagina = comum.pagina(analise.ordenar(linhas, *ordem), _KEY)
     comum.tabela_produtos(
-        f"{_KEY}_tabela", _KEY, fatia.to_dict("records"), laboratorio, com_loja=True, acao="Ver detalhes",
+        f"{_KEY}_tabela", _KEY, fatia.to_dict("records"), laboratorio, com_loja=not uma_loja, acao="Ver detalhes",
     )
 
     clicada = tb.acao_clicada(f"{_KEY}_tabela")

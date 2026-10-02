@@ -899,6 +899,10 @@ def reprocessar_fila_resolucao(session: Session) -> ResultadoReprocessamentoFila
         melhor = buscar_candidatos(session, descricao_norm, cache=cache_candidatos)
         score = melhor[1] if melhor else 0.0
         decisao = classificar(score, settings.reconciliacao.limiar_auto_aceite, settings.reconciliacao.limiar_fila_media)
+        # "Loja (API)" nunca resolve sozinho, nem com nota alta: vira só
+        # sugestão pra alguém confirmar (integrations/fila_loja.py, Q23).
+        if decisao == "auto" and item.origem == OrigemFila.LOJA_API:
+            decisao = "fila_sugestao"
 
         if decisao == "auto" and melhor is not None:
             base_generico, score_final = melhor
@@ -944,17 +948,31 @@ def listar_fila_priorizada(
     origem_filtro: OrigemFila | None = None,
     apenas_pendentes: bool = True,
     limite: int = 200,
+    por_lojas: bool = False,
 ) -> list[FilaResolucaoEAN]:
     """Prioriza por valor acumulado (Pareto): o EAN com mais dinheiro de
     compra em jogo primeiro. O critério "aparece em estoque" saiu junto com o
-    estoque da análise (09/2026)."""
+    estoque da análise (09/2026).
+
+    `por_lojas` (01/10/2026, itens Loja (API)): pareto pelo nº de lojas que
+    vendem o EAN (`qtd_ocorrencias`) — cadastrar os do topo resolve a maior
+    parte das aparições; desempate pelo valor vendido."""
     stmt = select(FilaResolucaoEAN)
     if apenas_pendentes:
         stmt = stmt.where(FilaResolucaoEAN.status == StatusFila.PENDENTE)
     if origem_filtro is not None:
         stmt = stmt.where(FilaResolucaoEAN.origem == origem_filtro)
-    stmt = stmt.order_by(FilaResolucaoEAN.valor_total_acumulado.desc(), FilaResolucaoEAN.id).limit(limite)
+    ordem = ([FilaResolucaoEAN.qtd_ocorrencias.desc()] if por_lojas else []) + [
+        FilaResolucaoEAN.valor_total_acumulado.desc(), FilaResolucaoEAN.id]
+    stmt = stmt.order_by(*ordem).limit(limite)
     return list(session.execute(stmt).scalars().all())
+
+
+def soma_ocorrencias_pendentes(session: Session, origem: OrigemFila) -> int:
+    """Total de aparições (lojas, na Loja (API)) dos itens pendentes — a base
+    do % acumulado do pareto, inclusive dos que passam do limite da tela."""
+    return int(session.scalar(select(func.coalesce(func.sum(FilaResolucaoEAN.qtd_ocorrencias), 0)).where(
+        FilaResolucaoEAN.status == StatusFila.PENDENTE, FilaResolucaoEAN.origem == origem)) or 0)
 
 
 def recalcular_valores_fila_ean(session: Session) -> int:
@@ -980,9 +998,11 @@ def recalcular_valores_fila_ean(session: Session) -> int:
     def _contagem(tabela):
         return select(func.count()).select_from(tabela).where(tabela.ean == FilaResolucaoEAN.ean).scalar_subquery()
 
+    # "Loja (API)" fica de fora: o valor dele é o VENDIDO nas lojas, regravado
+    # por integrations/fila_loja.py — aqui viraria 0 (não há compra GPS).
     stmt = (
         update(FilaResolucaoEAN)
-        .where(FilaResolucaoEAN.status == StatusFila.PENDENTE)
+        .where(FilaResolucaoEAN.status == StatusFila.PENDENTE, FilaResolucaoEAN.origem != OrigemFila.LOJA_API)
         .values(
             valor_total_acumulado=_soma_valor(RegistroCompraGPS) + _soma_valor(CompraGPSOrfa),
             qtd_ocorrencias=_contagem(RegistroCompraGPS) + _contagem(CompraGPSOrfa),

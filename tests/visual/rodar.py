@@ -11,7 +11,9 @@ O que faz:
 2. Percorre as telas (login, Por Loja, Por Produto, Detalhes, Dados, Pedido,
    Dashboard) em 1280 e 1920 px.
 3. TABELAS: em toda tabela, os vãos entre colunas têm de ser iguais (±8 px)
-   e nenhum título de coluna pode quebrar linha.
+   e nenhum título de coluna pode quebrar linha. ASSISTENTE DE PEDIDO (loja
+   fictícia, tests/visual/loja_ficticia.py — com personalização): o pop-up
+   de alerta ao abrir a loja, as pílulas de parâmetros e a lista.
 4. CONTRATO: em cada tela, confere se os seletores da estrutura interna do
    Streamlit de que o tema depende (core/theme.py, SELETORES_STREAMLIT) ainda
    encontram o elemento. Se o Streamlit mudou o HTML numa atualização, é
@@ -123,6 +125,9 @@ def _limpar(pasta: Path) -> None:
 def _preparar_banco(env: dict) -> None:
     _limpar(TRABALHO)
     subprocess.run([sys.executable, "-m", "data.seed"], cwd=RAIZ, env=env, check=True,
+                   stdout=subprocess.DEVNULL)
+    # Loja com dados do Pedido: sem ela o pop-up de filtros nem abre.
+    subprocess.run([sys.executable, "-m", "tests.visual.loja_ficticia"], cwd=RAIZ, env=env, check=True,
                    stdout=subprocess.DEVNULL)
 
 
@@ -240,23 +245,84 @@ def _telas(page, url):
     yield "por_produto_detalhe", []
     page.keyboard.press("Escape")
 
-    for secao in ("Pedido", "Dashboard"):
-        page.get_by_role("button", name=secao).click()
+    # Pela chave do botão (st-key-nav_<seção>), não pelo nome: o nome
+    # acessível inclui o ícone e "Pedido" também casava com "Configurações
+    # de Pedidos" (28/09/2026).
+    for secao in ("pedido", "dashboard", "config_pedido"):
+        page.locator(f'[class*="st-key-nav_{secao}"] button').click()
         page.locator('[class*="st-key-tela-"]').first.wait_for(timeout=60_000)
-        yield secao.lower(), []
+        yield secao, []
 
-    page.get_by_role("button", name="Dados").click()
-    page.get_by_role("tab", name="Explorador de Arquivos").wait_for(timeout=120_000)
-    yield "dados_explorador", []
-    page.get_by_role("tab", name="Importar Planilhas").click()
+    # Assistente de pedido com a loja fictícia (01/10/2026): ao abrir a loja,
+    # os pop-ups de alerta (estoque negativo → sem classificação) e, como ela
+    # tem personalização, as pílulas de parâmetros antes da lista.
+    # A loja é escolhida na barra lateral desde 02/10/2026.
+    page.locator('[class*="st-key-nav_pedido"] button').click()
+    campo = page.locator('[class*="st-key-loja_barra"] input')
+    campo.wait_for(timeout=60_000)
+    campo.click()
+    page.keyboard.type("FICTÍCIA")
+    page.get_by_role("option").first.click()
+    # Os pop-ups aparecem uma vez por foto do GPS por usuário: na 2ª largura
+    # (mesmo banco) já foram respondidos e a tela vai direto às pílulas.
+    dialogo = page.locator('div[data-testid="stDialog"] section[role="dialog"]')
+    parametros = page.locator('[class*="st-key-pedido-parametros"]')
+    dialogo.or_(parametros).first.wait_for(timeout=120_000)
+    if dialogo.count():
+        yield "pedido_alerta", []
+        page.get_by_role("button", name="Considerar todos zero").click()
+        page.get_by_role("button", name="Entendi").click()
+        dialogo.wait_for(state="detached", timeout=60_000)
+    parametros.wait_for(timeout=60_000)
+    yield "pedido_parametros", []
+    page.get_by_role("radio", name="Personalizado desta loja").click()
+    page.locator(".linha.corpo").first.wait_for(timeout=120_000)
+    yield "pedido_loja", []
+    # Uma categoria escolhida: a etiqueta do multiselect com a cara dos chips.
+    # A 1ª opção da lista é "Select all" do Streamlit — pega a 2ª.
+    # Com nova tentativa: clicado enquanto a tela ainda recalculava (logo
+    # depois da pílula), o menu fechava sem escolher (visto em 1920 px).
+    etiqueta = page.locator('[data-testid="stMultiSelectTagsContainer"] span[role="group"]')
+    for _ in range(3):
+        _estabilizar(page)
+        page.locator('[class*="st-key-pedido_cat_"] input').click()
+        page.get_by_role("option").nth(1).wait_for(timeout=30_000)
+        page.get_by_role("option").nth(1).click()
+        page.keyboard.press("Escape")
+        try:
+            etiqueta.first.wait_for(timeout=15_000)
+            break
+        except Exception:  # noqa: BLE001 — tenta de novo
+            continue
+    etiqueta.first.wait_for(timeout=15_000)
+    _estabilizar(page)
+    yield "pedido_filtrado", []
+
+    # Aba Dados reorganizada em 29/09/2026: Pendências / Importar / Rotinas /
+    # Explorador. O aviso "foi reorganizada" sai antes das fotos (senão elas
+    # mudariam sozinhas quando ele deixar de aparecer, em 31/10/2026).
+    page.locator('[class*="st-key-nav_dados"] button').click()
+    page.get_by_role("tab", name="Pendências").wait_for(timeout=120_000)
+    aviso = page.get_by_role("button", name="Ok, entendi")
+    if aviso.count():
+        aviso.click()
+    page.get_by_text("Fila de Resolução de EAN").first.wait_for(timeout=60_000)
+    yield "dados_fila_ean", []
+    for texto, nome in (("CNPJ órfão", "dados_fila_cnpj"), ("Vínculo de lojas GPS", "dados_vinculo"),
+                        ("Sem Classificação", "dados_sem_classificacao")):
+        page.get_by_test_id("stButtonGroup").get_by_text(texto).click()
+        page.locator('[data-testid="stMarkdownContainer"]').filter(has_text="O que é:").first.wait_for(timeout=60_000)
+        yield nome, []
+    page.get_by_role("tab", name="Importar").click()
     page.get_by_text("Compras das Lojas (GPS)").first.wait_for(timeout=60_000)
     # Mês/ano padrão = data de hoje: mascarados, senão a foto muda todo mês.
     yield "dados_importar", [page.get_by_test_id("stSelectbox").filter(has_text="Mês de referência"),
                              page.get_by_test_id("stNumberInput")]
-    page.get_by_role("tab", name="Fila de Resolução de EAN").click()
-    yield "dados_fila_ean", []
-    page.get_by_role("tab", name="Fila de CNPJ Órfão").click()
-    yield "dados_fila_cnpj", []
+    page.get_by_role("tab", name="Rotinas").click()
+    page.get_by_text("Rotina do GPS").first.wait_for(timeout=60_000)
+    yield "dados_rotinas", []
+    page.get_by_role("tab", name="Explorador de Arquivos").click()
+    yield "dados_explorador", []
 
 
 def _comparar(atual: Path, referencia: Path, diferenca: Path) -> tuple[bool, float]:
@@ -340,6 +406,10 @@ def _registrar(page, tela, largura, mascaras, atualizar, falhas_contrato, confer
                 falhas_contrato.append(f"{nome} ({seletor}) não encontrado na tela {tela} @ {largura}px")
     arquivo = f"{tela}_{largura}.png"
     atual = RESULTADO / arquivo
+    # "Atualização dos dados" no pé da barra (02/10/2026): os meses do
+    # data.seed vêm do dia de hoje — sem a máscara, toda imagem "mudaria"
+    # na virada do mês.
+    mascaras = list(mascaras) + [page.locator(".rmc-atualizacao")]
     page.screenshot(path=str(atual), mask=mascaras, mask_color="#9AA3AF")
     if atualizar:
         shutil.copy(atual, REFERENCIA / arquivo)

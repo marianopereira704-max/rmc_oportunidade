@@ -9,9 +9,10 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from core import analise, theme, ui
+from core import analise, auth, theme, ui
 from core.config import settings
 from views import analise_comum as comum
+from views import loja_barra
 from views import tabela as tb
 
 _KEY = "op_loja"
@@ -55,7 +56,7 @@ def _localizacao(loja: dict) -> str | None:
     return "/".join(partes) or None
 
 
-def _linha(loja: dict) -> dict:
+def _linha(loja: dict, destaque_id: int | None = None) -> dict:
     economia = float(loja["economia"] or 0)
     selo = (
         tb.pedaco(ui.formatar_moeda(economia), "selo-sucesso") if economia > 0
@@ -73,6 +74,8 @@ def _linha(loja: dict) -> dict:
         responsaveis.append(tb.pedaco(curto, "aux unica", dica=nome if curto != nome else None))
     return {
         "id": str(loja["loja_id"]),
+        # A loja escolhida na barra lateral, destacada na visão da rede.
+        "classe": "destaque" if destaque_id is not None and loja["loja_id"] == destaque_id else None,
         "celulas": {
             "razao_social": tb.celula(
                 tb.pedaco(loja["razao_social"], "forte"),
@@ -146,6 +149,12 @@ def _render() -> None:
         comum.indicadores("loja", linhas, laboratorio, filtros)
 
     ui.resetar_pagina_se_filtro_mudou(_KEY, f"{laboratorio}|{filtros}")
+    # Por Loja é a visão da REDE (só ADM): a loja da barra lateral não filtra,
+    # fica destacada (Q1 de 02/10/2026).
+    escolhida = loja_barra.escolha(auth.usuario_atual()).loja
+    if escolhida is not None:
+        st.caption(f"Visão da rede: esta tela mostra todas as lojas. A loja escolhida na barra lateral "
+                   f"({loja_barra.rotulo(escolhida)}) aparece destacada.")
 
     lojas = analise.por_loja(linhas)
     lojas["localizacao"] = [_localizacao(l) for l in lojas.to_dict("records")]
@@ -153,7 +162,7 @@ def _render() -> None:
     fatia, pagina = comum.pagina(analise.ordenar(lojas, *ordem), _KEY)
 
     tb.tabela(
-        f"{_KEY}_tabela", _COLUNAS, [_linha(l) for l in fatia.to_dict("records")], ordem,
+        f"{_KEY}_tabela", _COLUNAS, [_linha(l, escolhida["id"] if escolhida else None) for l in fatia.to_dict("records")], ordem,
         ao_ordenar=lambda coluna: comum.alternar_ordem(_KEY, coluna.campo, coluna.numerica),
         acao="Ver detalhes",
     )

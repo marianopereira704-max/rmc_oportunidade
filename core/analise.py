@@ -75,6 +75,10 @@ class Filtros:
     atendente_comercial: str | None = None
     grupo_economico: str | None = None
     loja_ids: list[int] | None = None
+    # Lojas que o USUÁRIO pode ver (Comprador/Proprietário, 02/10/2026);
+    # None = todas. Diferente de `loja_ids` (escolha da tela): é o corte de
+    # acesso, aplicado sempre — inclusive na seta do período anterior.
+    lojas_permitidas: tuple[int, ...] | None = None
 
 
 def laboratorios_disponiveis(session: Session) -> list[str]:
@@ -368,6 +372,8 @@ def filtrar(df: pd.DataFrame, filtros: Filtros) -> pd.DataFrame:
     if df.empty:
         return df
     mascara = pd.Series(True, index=df.index)
+    if filtros.lojas_permitidas is not None:
+        mascara &= df["loja_id"].isin(filtros.lojas_permitidas)
     if filtros.uf:
         mascara &= df["uf"] == filtros.uf
     if filtros.atendente_comercial:

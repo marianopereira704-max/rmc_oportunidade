@@ -133,6 +133,9 @@ def lista_grupos_economicos(session: Session) -> list[str]:
 
 
 def lista_lojas(session: Session) -> list[dict]:
-    """Pra multi-seleção de loja em chips (Bloco 4) — id, razão social, CNPJ, UF."""
-    stmt = select(Loja.id, Loja.razao_social, Loja.cnpj, Loja.uf).order_by(Loja.razao_social)
+    """Pra multi-seleção de loja em chips (Bloco 4) — id, razão social, CNPJ, UF,
+    atendente e grupo (estes dois montam as opções dos filtros de quem só vê
+    algumas lojas — 02/10/2026)."""
+    stmt = select(Loja.id, Loja.razao_social, Loja.cnpj, Loja.uf, Loja.atendente_comercial,
+                  Loja.grupo_economico).order_by(Loja.razao_social)
     return [dict(r) for r in session.execute(stmt).mappings().all()]

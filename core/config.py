@@ -140,6 +140,41 @@ class SistemaInternoConfig:
 
 
 @dataclass
+class PedidoConfig:
+    """Rotina de dados da aba Pedido (pacote `pedido/`, roda no GitHub
+    Actions). Números medidos na API do GPS em 25–27/09/2026 — ver
+    docs/mapa_api_gps.md.
+
+    `timeout_consulta_segundos`: a API corta qualquer processamento acima de
+    ~10 min; abortamos antes (8 min) e a unidade volta pra fila, em vez de
+    ficar presa. Quando uma consulta pesada estoura, o servidor do GPS
+    costuma terminar o cálculo mesmo assim e a nova tentativa responde em
+    segundos (visto na Hudson: >400 s, depois 31 s).
+
+    `orcamento_minutos`: tempo máximo de uma execução. O GitHub Actions mata
+    o job em 6 h; paramos antes, com folga pra gravar o relatório, e a
+    próxima execução continua de onde esta parou (o que já está salvo no
+    Spaces é pulado)."""
+    prefixo: str = field(default_factory=lambda: _get("PEDIDO_PREFIXO", "pedido"))
+    meses_fechados: int = field(default_factory=lambda: int(_get("PEDIDO_MESES_FECHADOS", "3")))
+    timeout_consulta_segundos: int = field(default_factory=lambda: int(_get("PEDIDO_TIMEOUT_CONSULTA_SEGUNDOS", "480")))
+    tentativas_por_unidade: int = field(default_factory=lambda: int(_get("PEDIDO_TENTATIVAS_POR_UNIDADE", "3")))
+    orcamento_minutos: int = field(default_factory=lambda: int(_get("PEDIDO_ORCAMENTO_MINUTOS", "330")))
+    fuso: str = field(default_factory=lambda: _get("PEDIDO_FUSO", "America/Sao_Paulo"))
+
+    # Regras da sugestão (pedido/calculo.py). Padrões do resumo de 27/09/2026;
+    # a tela Configurações de Pedidos (Fase 4) passa a editá-los no banco.
+    dias_medicamento: int = field(default_factory=lambda: int(_get("PEDIDO_DIAS_MEDICAMENTO", "7")))
+    dias_perfumaria: int = field(default_factory=lambda: int(_get("PEDIDO_DIAS_PERFUMARIA", "15")))
+    dias_ruptura: int = field(default_factory=lambda: int(_get("PEDIDO_DIAS_RUPTURA", "3")))
+    giro_baixo_dias: int = field(default_factory=lambda: int(_get("PEDIDO_GIRO_BAIXO_DIAS", "90")))
+    giro_baixo_max_unidades: float = field(default_factory=lambda: float(_get("PEDIDO_GIRO_BAIXO_MAX_UNIDADES", "1")))
+    curva_a: float = field(default_factory=lambda: float(_get("PEDIDO_CURVA_A", "0.5")))
+    curva_b: float = field(default_factory=lambda: float(_get("PEDIDO_CURVA_B", "0.4")))
+    tolerancia_preco: float = field(default_factory=lambda: float(_get("PEDIDO_TOLERANCIA_PRECO", "0.5")))
+
+
+@dataclass
 class GpsApiConfig:
     """API de consulta do GPS Farma (ERP) — a que deve substituir o upload
     manual da planilha GPS. Enquanto `configured` for False, o adapter reporta
@@ -368,6 +403,7 @@ class AppConfig:
     spaces: SpacesConfig = field(default_factory=SpacesConfig)
     sistema_interno: SistemaInternoConfig = field(default_factory=SistemaInternoConfig)
     gps_api: GpsApiConfig = field(default_factory=GpsApiConfig)
+    pedido: PedidoConfig = field(default_factory=PedidoConfig)
     cookie: CookieConfig = field(default_factory=CookieConfig)
     reconciliacao: ReconciliacaoConfig = field(default_factory=ReconciliacaoConfig)
     analise: AnaliseConfig = field(default_factory=AnaliseConfig)

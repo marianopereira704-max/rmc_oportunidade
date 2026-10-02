@@ -23,11 +23,14 @@ from core.config import settings
 from core.db import get_session
 from core.models import (
     BaseGenerico,
+    FilaCnpjOrfao,
+    FilaResolucaoEAN,
     ItemTabelaGruppy,
     Loja,
     ModoCustoGruppy,
     OrigemFila,
     RegistroCompraGPS,
+    StatusFila,
     TabelaGruppy,
     TipoNode,
     UploadGPS,
@@ -43,6 +46,7 @@ from integrations.planilha_navegador import ler_rodape
 from reconciliation import motor as reconciliation_motor
 from storage import filesystem as fs
 from views import analise_comum
+from views import pedido as pedido_view
 from views import leitor_planilha as leitor
 
 logger = logging.getLogger(__name__)
@@ -52,6 +56,8 @@ _SEM_SELECAO = "— selecione —"
 _LEITOR_GPS = "gps_leitor"
 _LEITOR_GRUPPY = "gruppy_leitor"
 _LEITOR_BASE = "base_genericos_leitor"
+_LEITOR_CATEGORIAS = "categorias_leitor"
+_LEITOR_CATEGORIAS_PENDENCIAS = "categorias_pendencias_leitor"
 
 
 _ROTULOS_CAMPOS_GRUPPY = {
@@ -237,6 +243,12 @@ def _baixar_arquivo_ui(item: fs.FSNode) -> None:
 def _explorador() -> None:
     usuario = auth.usuario_atual()
     pasta_id = _pasta_atual_id()
+    _explicacao(
+        "todos os arquivos enviados ao sistema (planilhas GPS, Gruppy, Base Genéricos, categorias), em pastas.",
+        "cada envio das outras sub-abas guarda o arquivo original aqui, sozinho.",
+        "\"Inativar\" só esconde (vai para _Inativos). \"Excluir definitivamente\" apaga o arquivo e desfaz o "
+        "envio (as compras ou preços que vieram dele).",
+    )
 
     if "explorador_exclusao_resultado" in st.session_state:
         r = st.session_state.pop("explorador_exclusao_resultado")
@@ -536,10 +548,11 @@ def _dialog_mapeamento_gps(usuario: dict, ano_mes: str) -> None:
 
 def _importar_gruppy(usuario: dict) -> None:
     st.markdown("##### Tabela de Preços RMC (Gruppy)")
-    st.caption(
-        "Cada upload é a tabela de UM laboratório. A vigência é granular por UF: subir uma "
-        "tabela nova só substitui (inativa) as UFs que se repetem — as demais continuam valendo "
-        "da tabela anterior."
+    _explicacao(
+        "o preço de cada genérico num laboratório — a referência da Análise de Oportunidade.",
+        "a planilha da Gruppy de UM laboratório, enviada aqui, com as UFs que ela cobre.",
+        "envie a tabela nova do laboratório: só as UFs que se repetem são substituídas, as demais continuam "
+        "valendo pela anterior. Para desfazer: Explorador de Arquivos → o arquivo → Excluir definitivamente.",
     )
 
     if "gruppy_upload_sucesso" in st.session_state:
@@ -659,11 +672,11 @@ def _ultimo_envio_gps() -> None:
 
 def _importar_gps(usuario: dict) -> None:
     st.markdown("##### Compras das Lojas (GPS)")
-    st.caption(
-        "Cada envio cobre um mês e **substitui, nesse mês, as compras dos CNPJs presentes no arquivo** — "
-        "os demais CNPJs continuam como estão (dá pra dividir a exportação por UF e enviar em partes). "
-        "Entram as linhas com VlrUnitario e Quantidade preenchidos (valor de compra sem ST); linhas só de "
-        "venda são ignoradas."
+    _explicacao(
+        "o que cada loja comprou no mês (quantidade e valor sem ST) — o \"preço pago\" da Análise de Oportunidade.",
+        "a planilha exportada do BI do GPS, um ou mais arquivos por mês (divididos por atributo de loja).",
+        "envie de novo o mês: o envio **substitui, nesse mês, as compras dos CNPJs presentes no arquivo** — os "
+        "demais continuam. Para desfazer: Explorador de Arquivos → o arquivo → Excluir definitivamente.",
     )
 
     _painel_processamento_gps()
@@ -736,10 +749,11 @@ def _sincronizar_lojas_automatico() -> None:
 
 def _sincronizar_lojas() -> None:
     st.markdown("##### Base de Lojas (sistema interno)")
-    st.caption(
-        "Traz CNPJ, razão social, UF, cidade e time de atendimento direto da API do sistema "
-        "interno. CNPJ do GPS que ainda não tem loja fica na fila de CNPJ órfão e passa pra loja quando "
-        "ela for vinculada — a ordem entre sincronizar lojas e enviar o GPS não importa."
+    _explicacao(
+        "as lojas ativas da rede: CNPJ, razão social, UF, cidade, responsáveis e o código (legacyId).",
+        "a API do sistema interno, sozinha, na primeira abertura desta aba em cada dia.",
+        "nada a fazer: o cadastro é do sistema interno. \"Forçar sincronização agora\" traz na hora o que "
+        "mudou lá.",
     )
 
     with get_session() as session:
@@ -767,10 +781,11 @@ def _sincronizar_lojas() -> None:
 
 def _importar_base_genericos(usuario: dict) -> None:
     st.markdown("##### Base Genéricos (planilha curada)")
-    st.caption(
-        "Importação em massa de EAN já revisados por gente, ligados ao nome canônico do "
-        "genérico — sem passar pelo fuzzy-match. EAN que já tem resolução (automática, manual "
-        "ou de uma importação anterior) nunca é sobrescrito, só pulado."
+    _explicacao(
+        "qual EAN é qual genérico (nome canônico) — junta os EANs do mesmo genérico na análise e no Pedido.",
+        "a planilha curada da rede (EAN + descrição), enviada aqui, e as resoluções da Fila de EAN.",
+        "envie a planilha com os EANs novos. EAN que já tem resolução nunca é sobrescrito, só pulado; depois, "
+        "use \"Reprocessar fila contra a base atual\" em Pendências → Fila de EAN.",
     )
 
     leitor.leitor_planilha(_LEITOR_BASE, "Selecionar planilha Base Genéricos (.xlsx)")
@@ -794,17 +809,6 @@ def _importar_base_genericos(usuario: dict) -> None:
             st.error(f"Erro ao processar planilha: {exc}")
 
 
-def _importar_planilhas() -> None:
-    usuario = auth.usuario_atual()
-    _sincronizar_lojas()
-    st.divider()
-    _importar_base_genericos(usuario)
-    st.divider()
-    _importar_gruppy(usuario)
-    st.divider()
-    _importar_gps(usuario)
-
-
 # ---------------------------------------------------------------------------
 # Fila de Resolução de EAN
 # ---------------------------------------------------------------------------
@@ -812,10 +816,23 @@ def _importar_planilhas() -> None:
 def _fila_ean() -> None:
     usuario = auth.usuario_atual()
     st.markdown("##### Fila de Resolução de EAN")
-    st.caption(
-        "Priorizada pelo valor de compra em jogo (quantidade × valor unitário nas compras vigentes) — "
-        "recalculado a cada envio, nunca somado envio a envio."
+    _explicacao(
+        "EANs que ainda não estão ligados a um genérico da Base Genéricos — ficam fora da análise e, no Pedido, "
+        "não somam com os outros EANs do mesmo genérico.",
+        "compras do GPS, tabelas da Gruppy e, desde 29/09/2026, genéricos vendidos pelas lojas (\"Loja (API)\", "
+        "conferidos uma vez por dia). Prioridade: dinheiro em jogo (compra; na Loja (API), o vendido).",
+        "confirme a sugestão, vincule a um genérico existente, cadastre um genérico novo ou ignore. Itens "
+        "\"Loja (API)\" nunca se resolvem sozinhos: sempre pedem confirmação.",
     )
+    if "fila_loja_resultado" in st.session_state:
+        st.success(st.session_state.pop("fila_loja_resultado"))
+    if st.button("Conferir agora os genéricos vendidos nas lojas", key="fila_loja_atualizar"):
+        with st.spinner("Lendo os produtos das lojas..."):
+            try:
+                st.session_state["fila_loja_resultado"] = _atualizar_fila_loja()
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["fila_loja_resultado"] = f"Não foi possível conferir agora: {exc}"
+        st.rerun()
 
     if "fila_ean_reprocesso_resultado" in st.session_state:
         r = st.session_state.pop("fila_ean_reprocesso_resultado")
@@ -844,11 +861,16 @@ def _fila_ean() -> None:
             st.session_state["fila_ean_reprocesso_resultado"] = resultado
             st.rerun()
 
-    origem_opcoes = {"Todos": None, "GPS": OrigemFila.GPS, "Gruppy": OrigemFila.GRUPPY}
+    origem_opcoes = {"Todos": None, "GPS": OrigemFila.GPS, "Gruppy": OrigemFila.GRUPPY, "Loja (API)": OrigemFila.LOJA_API}
     origem_label = st.selectbox("Origem", options=list(origem_opcoes.keys()), key="fila_ean_origem_filtro")
 
+    # Só Loja (API): pareto pelo nº de lojas que vendem (01/10/2026), com o %
+    # acumulado no título de cada item.
+    por_lojas = origem_opcoes[origem_label] == OrigemFila.LOJA_API
     with get_session() as session:
-        itens = reconciliation_motor.listar_fila_priorizada(session, origem_filtro=origem_opcoes[origem_label])
+        itens = reconciliation_motor.listar_fila_priorizada(session, origem_filtro=origem_opcoes[origem_label],
+                                                            por_lojas=por_lojas)
+        total_lojas = reconciliation_motor.soma_ocorrencias_pendentes(session, OrigemFila.LOJA_API) if por_lojas else 0
         genericos = session.execute(
             select(BaseGenerico).where(BaseGenerico.ativo.is_(True)).order_by(BaseGenerico.nome_canonico)
         ).scalars().all()
@@ -859,20 +881,35 @@ def _fila_ean() -> None:
             st.markdown('<p class="rmc-muted">Nenhum item pendente na fila.</p>', unsafe_allow_html=True)
             return
 
+        if por_lojas:
+            st.caption("Em ordem de pareto: os genéricos vendidos em mais lojas primeiro. O % acumulado diz quanto das "
+                       "aparições fica resolvido cadastrando até aquele item.")
+        acumulado = 0
         for item in itens:
+            titulo = f"{item.descricao_observada}  —  EAN {item.ean}"
+            if por_lojas and total_lojas:
+                acumulado += item.qtd_ocorrencias or 0
+                titulo = (f"{item.qtd_ocorrencias} loja(s) · {acumulado / total_lojas:.0%} acumulado  —  "
+                          f"{titulo}")
             # Expander preguiçoso: o seletor com todos os genéricos (milhares
             # de opções) só é montado no item aberto — antes era montado em
             # TODOS os itens listados, a cada clique na tela.
-            painel = st.expander(
-                f"{item.descricao_observada}  —  EAN {item.ean}", key=f"exp_fila_ean_{item.id}", on_change="rerun",
-            )
+            painel = st.expander(titulo, key=f"exp_fila_ean_{item.id}", on_change="rerun")
             if not painel.open:
                 continue
             with painel:
-                st.markdown(
-                    f"{ui.formatar_moeda(float(item.valor_total_acumulado))} acumulado · "
-                    f"{item.qtd_ocorrencias} ocorrência(s) · origem {item.origem.value.upper()}"
-                )
+                if item.origem == OrigemFila.LOJA_API:
+                    # Loja (API): o valor é o VENDIDO nas lojas na janela, e as
+                    # "ocorrências" são as lojas que venderam (integrations/fila_loja.py).
+                    st.markdown(analise_comum.texto_markdown(
+                        f"{ui.formatar_moeda(float(item.valor_total_acumulado))} vendidos · "
+                        f"{item.qtd_ocorrencias} loja(s) · origem Loja (API) — confirme antes de vincular"
+                    ))
+                else:
+                    st.markdown(
+                        f"{ui.formatar_moeda(float(item.valor_total_acumulado))} acumulado · "
+                        f"{item.qtd_ocorrencias} ocorrência(s) · origem {item.origem.value.upper()}"
+                    )
 
                 if item.sugestao_base_generico_id is not None:
                     nome_sugestao = nome_generico_por_id.get(item.sugestao_base_generico_id, "(genérico removido)")
@@ -918,10 +955,10 @@ def _fila_ean() -> None:
 def _fila_cnpj_orfao() -> None:
     usuario = auth.usuario_atual()
     st.markdown("##### Fila de CNPJ Órfão")
-    st.caption(
-        "CNPJs que apareceram numa compra do GPS mas não batem com nenhuma loja cadastrada. "
-        "Vincular a uma loja passa na hora as compras desse CNPJ para a loja — e os próximos envios "
-        "já reconhecem o vínculo."
+    _explicacao(
+        "CNPJs que apareceram numa compra do GPS mas não batem com nenhuma loja cadastrada.",
+        "os envios de compras do GPS (as compras deles ficam guardadas, não se perdem).",
+        "vincule a uma loja (as compras passam na hora, e os próximos envios já reconhecem) ou ignore.",
     )
 
     with get_session() as session:
@@ -984,37 +1021,482 @@ def _fila_cnpj_orfao() -> None:
                     st.rerun()
 
 
+# ---------------------------------------------------------------------------
+# Vínculo de lojas GPS (Pedido)
+# ---------------------------------------------------------------------------
+
+def _explicacao(o_que_e: str, de_onde_vem: str, como_alterar: str) -> None:
+    """As três linhas-padrão de cada item da aba Dados (decisão de 27/09/2026:
+    com mais itens na aba, cada um diz o que é e como mexer, sempre igual)."""
+    st.markdown(
+        f"**O que é:** {o_que_e}  \n**De onde vem:** {de_onde_vem}  \n**Como alterar:** {como_alterar}"
+    )
+
+
+def _vinculo_lojas_gps() -> None:
+    from core.models import SituacaoVinculoGps, VinculoLojaGps
+    from integrations import gps_vinculo
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    usuario = auth.usuario_atual()
+    st.markdown("##### Vínculo de lojas GPS")
+    _explicacao(
+        "qual loja do GPS é qual loja do RMC — é o que liga a aba Pedido às vendas, compras e estoque de cada loja.",
+        "a rotina da madrugada grava as lojas do GPS; o sistema casa sozinho pelo CNPJ (quase todas) ou pelo "
+        "número do endereço + nome (lojas que o GPS manda sem CNPJ).",
+        "confirme as sugestões abaixo, troque a loja se estiver errada, ou marque \"Não é cliente\". "
+        "O que você decidir aqui fica salvo e nunca é desfeito pelo recálculo.",
+    )
+
+    if st.button("Atualizar vínculos (ler as lojas do GPS)", key="vinculo_gps_atualizar"):
+        lojas_gps = gps_vinculo.lojas_gps_salvas(do_ambiente(), Chaves(settings.pedido.prefixo))
+        if not lojas_gps:
+            st.info("A rotina do Pedido ainda não gravou nenhuma loja do GPS — ela roda de madrugada.")
+        else:
+            with get_session() as s2:
+                r = gps_vinculo.recalcular(s2, lojas_gps)
+            st.success(
+                f"{r.lojas_gps} loja(s) do GPS: {r.automaticos} vinculada(s) automaticamente, "
+                f"{r.a_confirmar} para confirmar, {r.sem_candidato} sem loja parecida no RMC"
+                + (f", {r.decisoes_preservadas} decisão(ões) sua(s) mantida(s)." if r.decisoes_preservadas else ".")
+            )
+
+    with get_session() as session:
+        vinculos = session.scalars(select(VinculoLojaGps).order_by(VinculoLojaGps.nome_loja_gps)).all()
+        lojas = session.execute(select(Loja).order_by(Loja.razao_social)).scalars().all()
+        rotulo_loja = {l.id: f"{l.razao_social} — {ui.formatar_cnpj(l.cnpj)}"
+                       + (f" (cód. {l.legacy_id})" if l.legacy_id else "") for l in lojas}
+
+        if not vinculos:
+            st.markdown('<p class="rmc-muted">Nenhum vínculo calculado ainda.</p>', unsafe_allow_html=True)
+            return
+
+        por_situacao: dict = {}
+        for v in vinculos:
+            por_situacao.setdefault(v.situacao, []).append(v)
+        st.caption(
+            " · ".join(f"{rotulo}: {len(por_situacao.get(sit, []))}" for sit, rotulo in (
+                (SituacaoVinculoGps.AUTOMATICO, "automáticos"), (SituacaoVinculoGps.CONFIRMADO, "confirmados"),
+                (SituacaoVinculoGps.CONFIRMAR, "para confirmar"), (SituacaoVinculoGps.NAO_CLIENTE, "não são clientes"),
+                (SituacaoVinculoGps.SEM_CANDIDATO, "sem loja parecida"),
+            ))
+        )
+        st.divider()
+
+        pendentes = por_situacao.get(SituacaoVinculoGps.CONFIRMAR, []) + por_situacao.get(SituacaoVinculoGps.SEM_CANDIDATO, [])
+        if not pendentes:
+            st.markdown('<p class="rmc-muted">Nada para confirmar.</p>', unsafe_allow_html=True)
+        for v in pendentes:
+            local = "/".join(x for x in (v.cidade_gps, v.uf_gps) if x)
+            titulo = f"{v.nome_loja_gps or 'Loja sem nome'} — {local} · nº {v.numero_gps or 's/n'}"
+            painel = st.expander(titulo, key=f"exp_vinc_gps_{v.id}", on_change="rerun")
+            if not painel.open:
+                continue
+            with painel:
+                st.caption(f"Por que está aqui: {v.motivo or '—'}")
+                opcoes = ["—"] + list(rotulo_loja.keys())
+                escolha = st.selectbox(
+                    "Loja do RMC", options=opcoes, index=opcoes.index(v.loja_id) if v.loja_id in rotulo_loja else 0,
+                    format_func=lambda i: "—" if i == "—" else rotulo_loja[i], key=f"vinc_gps_loja_{v.id}",
+                )
+                c1, c2 = st.columns(2)
+                if c1.button("Confirmar vínculo", key=f"vinc_gps_ok_{v.id}", use_container_width=True,
+                             disabled=escolha == "—"):
+                    with get_session() as s2:
+                        gps_vinculo.confirmar(s2, v.id, escolha, usuario["nome"])
+                    st.rerun()
+                if c2.button("Não é cliente", key=f"vinc_gps_nao_{v.id}", use_container_width=True):
+                    with get_session() as s2:
+                        gps_vinculo.marcar_nao_cliente(s2, v.id, usuario["nome"])
+                    st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Categorias de produtos (Pedido)
+# ---------------------------------------------------------------------------
+
+def _xlsx(df: pd.DataFrame) -> bytes:
+    import io
+
+    buffer = io.BytesIO()
+    df.to_excel(buffer, index=False)
+    return buffer.getvalue()
+
+
+def _milhar(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
+def _categorias_contexto():
+    from integrations import categorias as categorias_integ
+    from pedido import categorias
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    return categorias_integ, categorias, do_ambiente(), Chaves(settings.pedido.prefixo)
+
+
+def _mensagem_categorias() -> None:
+    mensagem = st.session_state.pop("categorias_msg", None)
+    if mensagem:
+        st.success(mensagem)
+
+
+def _categorias_importar() -> None:
+    """Importar → Categorias de produtos: contagem, carga inicial e envio."""
+    categorias_integ, categorias, armaz, chaves = _categorias_contexto()
+    usuario = auth.usuario_atual()
+    st.markdown("##### Categorias de produtos")
+    _explicacao(
+        "a categoria de cada EAN. Decide quantos dias de estoque o Pedido sugere (medicamento, perfumaria — "
+        "ver Configurações de Pedidos); produto Sem Classificação não recebe sugestão.",
+        "a lista da FEBRAFAR e a da CMED/ANVISA (já prontas no sistema, é só carregar uma vez) e as planilhas "
+        "enviadas aqui para os produtos que elas não cobrem.",
+        "envie uma planilha com EAN e CATEGORIA (abaixo). O que você enviar vale na hora e nunca é desfeito "
+        "por uma nova carga da FEBRAFAR/CMED. A lista do que falta classificar está em Pendências → Sem Classificação.",
+    )
+    _mensagem_categorias()
+    with get_session() as session:
+        cont = categorias_integ.contagens(session)
+    if cont["total"]:
+        g, o = cont["por_grupo"], cont["por_origem"]
+        grupos = " · ".join(f"{categorias.ROTULO_GRUPO[k]} {_milhar(g.get(k, 0))}"
+                            for k in (categorias.MEDICAMENTO, categorias.PERFUMARIA, categorias.SEM_CLASSIFICACAO))
+        origens = " · ".join(f"{nome} {_milhar(o.get(chave, 0))}"
+                             for chave, nome in (("FEBRAFAR", "FEBRAFAR"), ("CMED", "CMED"), ("MANUAL", "Manual")))
+        st.caption(f"Na base: **{_milhar(cont['total'])}** EANs — {grupos}  |  origem: {origens}")
+
+    st.markdown("###### Base inicial (FEBRAFAR + CMED)")
+    info = categorias_integ.base_inicial_disponivel(armaz, chaves)
+    if info is None:
+        st.info("O arquivo da base inicial ainda não está no armazenamento. Ele é gerado uma vez com "
+                "`python -m pedido.carga_categorias --febrafar <planilha> --cmed <planilha> --executar`.")
+    else:
+        st.caption(f"Arquivo pronto: {_milhar(int(info.get('eans', 0)))} EANs, "
+                   f"gerado em {str(info.get('gerado_em', '?'))[:10]}.")
+        rotulo = "Recarregar base inicial (mantém as categorias manuais)" if cont["total"] else "Carregar base inicial"
+        if st.button(rotulo, key="categorias_carregar"):
+            with st.spinner("Carregando a base de categorias..."):
+                base = armaz.ler_df(chaves.base_categorias())
+                with get_session() as s2:
+                    r = categorias_integ.carregar_base_inicial(s2, base, usuario["nome"])
+            _sem_classificacao_calculado.clear()
+            st.session_state["categorias_msg"] = (
+                f"{_milhar(r.eans_no_arquivo)} EANs carregados em {r.segundos:.0f}s"
+                + (f"; {r.manuais_mantidas} categoria(s) manual(is) mantida(s)." if r.manuais_mantidas else ".")
+            )
+            st.rerun()
+
+    st.markdown("###### Enviar categorias")
+    _envio_categorias(_LEITOR_CATEGORIAS)
+
+
+@st.cache_data(ttl=600, show_spinner="Lendo os produtos das lojas...")
+def _sem_classificacao_calculado(versao: tuple) -> tuple[pd.DataFrame, int]:
+    """(todos os produtos sem classificação, total de produtos nas lojas).
+    Guardado por 10 min e pela versão da base de categorias: é o contador de
+    Pendências, e ler os catálogos + a base custa alguns segundos."""
+    categorias_integ, _cat, armaz, chaves = _categorias_contexto()
+    catalogo = categorias_integ.catalogos(armaz, chaves)
+    with get_session() as session:
+        base = categorias_integ.tabela(session)
+    return categorias_integ.sem_classificacao(catalogo, base), len(catalogo)
+
+
+def _versao_categorias() -> tuple:
+    from integrations import categorias as categorias_integ
+
+    with get_session() as session:
+        return categorias_integ.versao(session)
+
+
+def _sem_classificacao() -> None:
+    """Pendências → Sem Classificação: relatório, exportação e envio de volta
+    no mesmo lugar (ciclo fechado, decisão de 27/09/2026)."""
+    from integrations import categorias as categorias_integ
+
+    st.markdown("##### Produtos Sem Classificação")
+    _explicacao(
+        "produtos das lojas sem categoria (ou \"em classificação\" na FEBRAFAR). No Pedido eles aparecem sem "
+        "sugestão.",
+        "os produtos que a rotina da madrugada traz do estoque de cada loja, comparados com a base de categorias.",
+        "baixe a lista, preencha a coluna CATEGORIA e envie o mesmo arquivo aqui embaixo. Vale na hora.",
+    )
+    _mensagem_categorias()
+    relatorio, total = _sem_classificacao_calculado(_versao_categorias())
+    if not total:
+        st.info("A rotina do Pedido ainda não gravou os produtos das lojas — ela roda de madrugada.")
+    elif relatorio.empty:
+        st.success(f"Todos os {_milhar(total)} produtos das lojas estão classificados.")
+    else:
+        so_estoque = st.checkbox("Só produtos com estoque em alguma loja", value=True, key="categorias_so_estoque")
+        lista = relatorio[relatorio["LOJAS COM ESTOQUE"] > 0] if so_estoque else relatorio
+        # Pareto (01/10/2026): vendido em mais lojas primeiro, com o % acumulado
+        # das aparições — "classificando até aqui, resolvo X%".
+        lista = lista.assign(**{"% ACUMULADO": categorias_integ.pareto_acumulado(lista["LOJAS COM VENDA"])})
+        st.caption(f"**{_milhar(len(lista))}** de {_milhar(total)} produtos das lojas sem classificação "
+                   "(pareto: os vendidos em mais lojas primeiro — a coluna % ACUMULADO mostra quanto das aparições "
+                   "fica resolvido classificando até aquela linha; a tela mostra os 200 primeiros, o arquivo tem todos).")
+        # As colunas do pareto na frente: no fim da tabela ficavam fora da tela.
+        st.dataframe(
+            lista.head(200), hide_index=True, use_container_width=True,
+            column_order=["EAN", "PRODUTO", "LOJAS COM VENDA", "% ACUMULADO", "LOJAS COM ESTOQUE", "LOJAS",
+                          "LABORATORIO", "GRUPO NO GPS", "CATEGORIA NO GPS", "SITUACAO"],
+            column_config={"% ACUMULADO": st.column_config.NumberColumn(format="%.1f%%")},
+        )
+        st.download_button(
+            "Baixar lista (.xlsx)", data=_xlsx(lista), file_name="produtos_sem_classificacao.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="categorias_baixar",
+        )
+    st.markdown("###### Enviar a lista preenchida")
+    _envio_categorias(_LEITOR_CATEGORIAS_PENDENCIAS)
+
+
+def _envio_categorias(chave_leitor: str) -> None:
+    categorias_integ, categorias, _armaz, _chaves = _categorias_contexto()
+    usuario = auth.usuario_atual()
+    st.caption("Planilha com as colunas **EAN** e **CATEGORIA**. Linha com CATEGORIA vazia é ignorada. "
+               "Categorias aceitas: " + ", ".join(categorias.CATEGORIAS_MANUAIS) + ".")
+    leitor.leitor_planilha(chave_leitor, "Selecionar planilha de categorias (.xlsx)")
+    _mostrar_planilha_recebida(chave_leitor)
+    recebida = leitor.planilha_recebida(chave_leitor)
+    if recebida is None:
+        return
+    try:
+        lida = categorias_integ.ler_planilha_manual(recebida.df)
+    except ValueError as exc:
+        st.error(str(exc))
+        return
+    if lida.invalidas:
+        st.warning(f"{len(lida.invalidas)} linha(s) com erro não serão gravadas: "
+                   + "; ".join(f"linha {n}: {motivo}" for n, motivo in lida.invalidas[:10])
+                   + (" …" if len(lida.invalidas) > 10 else ""))
+    st.caption(f"{_milhar(len(lida.validas))} EAN(s) com categoria serão gravados.")
+    if len(lida.validas) and st.button("Gravar categorias", key=f"{chave_leitor}_gravar"):
+        with get_session() as s2:
+            fs.guardar_planilha(
+                s2, _subpasta(s2, "Categorias"), recebida.nome, usuario["nome"],
+                conteudo=recebida.conteudo, storage_key=recebida.storage_key, tamanho_bytes=recebida.tamanho_bytes,
+            )
+            gravados = categorias_integ.aplicar_manual(s2, lida.validas, usuario["nome"])
+        leitor.consumir(chave_leitor)
+        _sem_classificacao_calculado.clear()
+        st.session_state["categorias_msg"] = f"{_milhar(gravados)} categoria(s) gravada(s). Já valem no Pedido."
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Fila de EAN "Loja (API)"
+# ---------------------------------------------------------------------------
+
+def _atualizar_fila_loja() -> str:
+    """Genéricos vendidos nas lojas e fora da Base Genéricos → fila de EAN
+    (integrations/fila_loja.py). Devolve a frase do resultado."""
+    from integrations import fila_loja
+
+    categorias_integ, _cat, armaz, chaves = _categorias_contexto()
+    catalogo = categorias_integ.catalogos(armaz, chaves)
+    with get_session() as session:
+        base = categorias_integ.tabela(session)
+        r = fila_loja.atualizar(session, catalogo, base)
+    return (f"{_milhar(r.genericos_vendidos)} genérico(s) vendido(s) nas lojas; {_milhar(r.ja_na_base)} já na Base "
+            f"Genéricos; {_milhar(r.novos_na_fila)} novo(s) na fila; {_milhar(r.atualizados)} atualizado(s)"
+            + (f"; {r.em_outra_origem} já estavam na fila vindos do GPS/Gruppy" if r.em_outra_origem else "") + ".")
+
+
+def _fila_loja_automatica() -> None:
+    """Uma vez por dia, na primeira abertura da aba Dados (mesmo esquema da
+    sincronização de lojas). Falha não quebra a tela: vira aviso na fila."""
+    if st.session_state.get("_fila_loja_ja_verificada"):
+        return
+    st.session_state["_fila_loja_ja_verificada"] = True
+    with st.spinner("Conferindo os genéricos vendidos nas lojas (primeira abertura do dia)..."):
+        rotinas.executar_se_necessario(rotinas.ROTINA_FILA_EAN_LOJA_API, _atualizar_fila_loja)
+
+
+# ---------------------------------------------------------------------------
+# Rotinas
+# ---------------------------------------------------------------------------
+
+def _rotina_gps() -> None:
+    from pedido import coleta
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    st.markdown("##### Rotina do GPS (dados do Pedido)")
+    _explicacao(
+        "a coleta de vendas, compras e estoque de cada loja na API do GPS, que alimenta o Pedido.",
+        "roda sozinha à meia-noite no GitHub Actions, em 4 partes (passo a passo em docs/rotina_pedido.md).",
+        "nada a fazer aqui: o que falhar é tentado de novo na mesma execução e na seguinte. Para rodar na hora: "
+        "GitHub → Actions → Rotina Pedido → Run workflow.",
+    )
+    try:
+        data, relatorios = coleta.ultimas_execucoes(do_ambiente(), Chaves(settings.pedido.prefixo))
+    except Exception as exc:  # noqa: BLE001
+        st.warning(f"Não consegui ler os relatórios da rotina ({type(exc).__name__}).")
+        return
+    if not relatorios:
+        st.info("A rotina ainda não rodou (ou não gravou relatório).")
+        return
+    st.caption(f"Última execução: {data[8:10]}/{data[5:7]}/{data[:4]}.")
+    st.dataframe(pd.DataFrame([{
+        "Parte": r.get("parte"),
+        "Empresas": f"{r.get('empresas_processadas', 0)}/{r.get('empresas_na_parte', 0)}",
+        "Lojas": r.get("lojas", 0),
+        "Consultas ok": r.get("unidades_ok", 0),
+        "Falhas": r.get("unidades_com_falha", 0),
+        "Pendentes p/ próxima": len(r.get("pendentes_para_proxima", [])),
+        "Lojas prontas": r.get("prontos_montados", 0),
+        "Minutos": round(float(r.get("segundos", 0)) / 60, 1),
+        "Parou pelo tempo": "sim" if r.get("parou_por_tempo") else "não",
+    } for r in relatorios]), hide_index=True, use_container_width=True)
+    falhas = [f for r in relatorios for f in r.get("falhas", [])]
+    if falhas:
+        with st.expander(f"{len(falhas)} falha(s) nesta execução"):
+            st.dataframe(pd.DataFrame(falhas).rename(columns={"unidade": "Consulta", "erro": "Erro"}),
+                         hide_index=True, use_container_width=True)
+
+
+def _fontes_categorias() -> None:
+    categorias_integ, _cat, armaz, chaves = _categorias_contexto()
+    st.markdown("##### Listas de categorias (FEBRAFAR e CMED)")
+    _explicacao(
+        "as duas listas públicas/comerciais que dão a categoria da maioria dos produtos.",
+        "FEBRAFAR (planilha da rede) e CMED/ANVISA (lista de preços do gov.br), unidas num arquivo só.",
+        "gere o arquivo novo com `python -m pedido.carga_categorias … --executar` e clique em Importar → "
+        "Categorias de produtos → Recarregar base inicial.",
+    )
+    info = categorias_integ.base_inicial_disponivel(armaz, chaves)
+    if info is None:
+        st.caption("Arquivo ainda não gerado.")
+        return
+    fontes = info.get("fontes", {})
+    st.caption(f"Arquivo gerado em {str(info.get('gerado_em', '?'))[:10]} com "
+               f"{_milhar(int(info.get('eans', 0)))} EANs — FEBRAFAR: {fontes.get('febrafar', '?')}; "
+               f"CMED: {fontes.get('cmed', '?')}. A CMED é publicada todo mês pela ANVISA.")
+
+
+# ---------------------------------------------------------------------------
+# As quatro sub-abas
+# ---------------------------------------------------------------------------
+
+_REORGANIZADA_ATE = dt.date(2026, 10, 31)
+
+
+def _aviso_reorganizacao() -> None:
+    """Aviso de onde cada coisa foi parar (Q35 de 27/09/2026), até o fim de
+    outubro/2026 ou até clicar em "Ok, entendi" na sessão."""
+    if dt.date.today() > _REORGANIZADA_ATE or st.session_state.get("_aviso_dados_visto"):
+        return
+    with st.container(border=True):
+        st.markdown(
+            "**A aba Dados foi reorganizada.** As filas (EAN, CNPJ órfão), o vínculo de lojas GPS e os produtos "
+            "sem classificação estão em **Pendências**. A sincronização de lojas e a rotina do GPS, em "
+            "**Rotinas**. Os envios de planilha continuam em **Importar**."
+        )
+        if st.button("Ok, entendi", key="aviso_dados_ok"):
+            st.session_state["_aviso_dados_visto"] = True
+            st.rerun()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _contadores_banco() -> dict:
+    from core.models import SituacaoVinculoGps, VinculoLojaGps
+
+    with get_session() as session:
+        return {
+            "ean": session.scalar(select(func.count()).select_from(FilaResolucaoEAN)
+                                  .where(FilaResolucaoEAN.status == StatusFila.PENDENTE)) or 0,
+            "cnpj": session.scalar(select(func.count()).select_from(FilaCnpjOrfao)
+                                   .where(FilaCnpjOrfao.status == StatusFila.PENDENTE)) or 0,
+            "vinculo": session.scalar(select(func.count()).select_from(VinculoLojaGps).where(
+                VinculoLojaGps.situacao.in_([SituacaoVinculoGps.CONFIRMAR, SituacaoVinculoGps.SEM_CANDIDATO]))) or 0,
+        }
+
+
+_PENDENCIAS = {
+    "ean": ("Fila de EAN", _fila_ean),
+    "cnpj": ("CNPJ órfão", _fila_cnpj_orfao),
+    "vinculo": ("Vínculo de lojas GPS", _vinculo_lojas_gps),
+    "sem_classificacao": ("Sem Classificação", _sem_classificacao),
+}
+
+
+def _pendencias() -> None:
+    contadores = dict(_contadores_banco())
+    try:
+        relatorio, _total = _sem_classificacao_calculado(_versao_categorias())
+        contadores["sem_classificacao"] = int((relatorio["LOJAS COM ESTOQUE"] > 0).sum()) if not relatorio.empty else 0
+    except Exception:  # noqa: BLE001 — sem Spaces/catálogo: o contador fica em branco
+        contadores["sem_classificacao"] = None
+
+    def rotulo(chave: str) -> str:
+        n = contadores.get(chave)
+        return _PENDENCIAS[chave][0] + ("" if n is None else f" ({_milhar(n)})")
+
+    escolhida = st.segmented_control(
+        "O que resolver", options=list(_PENDENCIAS), format_func=rotulo, default="ean",
+        key="dados_pendencia", label_visibility="collapsed",
+    ) or "ean"
+    st.divider()
+    _PENDENCIAS[escolhida][1]()
+
+
+def _importar() -> None:
+    usuario = auth.usuario_atual()
+    _importar_base_genericos(usuario)
+    st.divider()
+    _importar_gruppy(usuario)
+    st.divider()
+    _importar_gps(usuario)
+    st.divider()
+    _categorias_importar()
+
+
+def _rotinas_aba() -> None:
+    _sincronizar_lojas()
+    st.divider()
+    _rotina_gps()
+    st.divider()
+    _fontes_categorias()
+
+
 def render() -> None:
     with theme.tela("dados"):
         _render()
 
 
 def _render() -> None:
-    theme.cabecalho("Dados", "Status das integrações, importação de planilhas e filas de pendência.")
+    theme.cabecalho("Dados", "Pendências, importação de planilhas, rotinas automáticas e arquivos.")
     # Toda ação que muda os dados da análise (envios, EAN/CNPJ resolvido,
     # exclusões) acontece nesta aba: descartar o cálculo guardado aqui faz
     # as telas de análise sempre refletirem o que acabou de mudar.
     analise_comum.invalidar()
+    pedido_view.invalidar()  # categorias/genéricos mudam aqui também
+    _contadores_banco.clear()
     _sincronizar_lojas_automatico()
+    _fila_loja_automatica()
     _painel_integracoes()
     st.markdown(f'<p class="rmc-muted">Armazenamento: {fs.modo_storage()}</p>', unsafe_allow_html=True)
+    _aviso_reorganizacao()
 
     # Abas preguiçosas: só a aba aberta é calculada. Sem isso, qualquer clique
-    # (inclusive escolher uma planilha) redesenhava as quatro — e as filas,
-    # com centenas de itens, custavam segundos por clique.
-    aba_explorador, aba_importar, aba_fila_ean, aba_fila_cnpj = st.tabs(
-        ["Explorador de Arquivos", "Importar Planilhas", "Fila de Resolução de EAN", "Fila de CNPJ Órfão"],
-        key="dados_abas", on_change="rerun",
+    # (inclusive escolher uma planilha) redesenhava todas — e as filas, com
+    # centenas de itens, custavam segundos por clique. Organização de
+    # 27/09/2026 (Q35): pelo que o admin está fazendo.
+    aba_pendencias, aba_importar, aba_rotinas, aba_explorador = st.tabs(
+        ["Pendências", "Importar", "Rotinas", "Explorador de Arquivos"], key="dados_abas", on_change="rerun",
     )
+    if aba_pendencias.open:
+        with aba_pendencias:
+            _pendencias()
+    if aba_importar.open:
+        with aba_importar:
+            _importar()
+    if aba_rotinas.open:
+        with aba_rotinas:
+            _rotinas_aba()
     if aba_explorador.open:
         with aba_explorador:
             _explorador()
-    if aba_importar.open:
-        with aba_importar:
-            _importar_planilhas()
-    if aba_fila_ean.open:
-        with aba_fila_ean:
-            _fila_ean()
-    if aba_fila_cnpj.open:
-        with aba_fila_cnpj:
-            _fila_cnpj_orfao()

@@ -55,6 +55,26 @@ def pedaco(texto: str, classe: str | None = None, dica: str | None = None) -> di
     return p
 
 
+def entrada(valor: int, classe: str | None = None, dica: str | None = None) -> dict:
+    """Campo numérico (inteiro ≥ 0) dentro da célula — a quantidade do
+    Pedido. Mudou o número (Enter ou sair do campo): `ao_editar(id da linha,
+    texto digitado)` no Python. Classe "alterada": o valor não é o sugerido."""
+    p = {"t": "", "entrada": int(valor)}
+    if classe:
+        p["c"] = classe
+    if dica:
+        p["dica"] = dica
+    return p
+
+
+def pilha(pedacos: list[dict]) -> list[dict]:
+    """Linha de tags empilhadas (uma embaixo da outra) — a coluna Status do
+    Pedido, quando há mais de 2 tags."""
+    if pedacos:
+        pedacos[0] = {**pedacos[0], "pilha": True}
+    return pedacos
+
+
 def celula(*linhas) -> list[list[dict]]:
     """Cada argumento é uma linha: um pedaço, ou uma lista de pedaços."""
     return [linha if isinstance(linha, list) else [linha] for linha in linhas]
@@ -115,6 +135,15 @@ _CSS = """
 }
 .vazio { grid-column: 1 / -1; }
 .linha.corpo:hover { background: rgba(23, 55, 94, 0.03); }
+/* Linha em destaque (`"classe": "revisar"` na linha): "a revisar" do
+   Assistente de pedido — âmbar, não vermelho (vermelho é erro; 01/10/2026).
+   Barra por box-shadow: não ocupa largura, o grid não se mexe. */
+.linha.corpo.revisar { background: #FDF6EA; box-shadow: inset 3px 0 0 #D29B3A; }
+.linha.corpo.revisar:hover { background: #FBF0DC; }
+/* `"classe": "destaque"`: a loja escolhida na barra lateral, na Por Loja
+   (visão da rede, 02/10/2026) — azul claro, a cor de "selecionado". */
+.linha.corpo.destaque { background: #EEF4FB; box-shadow: inset 3px 0 0 var(--navy, #17375E); }
+.linha.corpo.destaque:hover { background: #E4EDF8; }
 /* Tabela de muitas colunas (Por Produto, Detalhes): vão menor entre colunas,
    pra caber em 1280 px sem quebrar os títulos. */
 /* 12px mínimos: com 16, a Por Produto real passava 4px da borda em 1280. */
@@ -188,6 +217,45 @@ button.titulo:focus-visible { outline: 2px solid var(--navy, #17375E); outline-o
 .selo-sucesso { background: #EAF3DE; color: #27500A; }
 .selo-neutro { background: #E7E9EC; color: #3F4750; }
 .selo-sugestao { background: #FAEEDA; color: #854F0B; }
+/* Situação do estoque no Pedido (29/09/2026), em escala de gravidade:
+   negativo (vermelho) > ruptura (laranja-avermelhado) > ruptura próxima
+   (âmbar, o par .selo-sugestao). Azul = alterado à mão (par "alterado
+   manualmente" da identidade visual). */
+.selo-perigo { background: #FDE2E1; color: #9B1C1C; }
+.selo-ruptura { background: #FEE4D2; color: #9A3412; }
+.selo-alterado { background: #DCE9F7; color: #123A63; }
+.txt-vermelho { color: #B3261E; font-weight: 600; }
+.txt-laranja { color: #C2410C; font-weight: 600; }
+.txt-ambar { color: #B45309; font-weight: 600; }
+/* Tags empilhadas: com mais de 2, uma embaixo da outra (pedido de 29/09). */
+.pilha > span { display: table; }
+.pilha > span + span { margin-top: 3px; }
+
+/* Nome de produto com "palavra" longa (SERING.DESC.DESCARPACK): pode quebrar
+   dentro da palavra, senão a coluna não respeita o fit-content e a tabela
+   do Pedido passava da borda em 1280 px (29/09/2026). Só nessa peça — em
+   toda célula, o grid espremia os nomes letra a letra (ver .cel). */
+.quebra { overflow-wrap: anywhere; }
+
+/* Coluna de seleção */
+.cel.sel { justify-self: start; }
+.marca { width: 16px; height: 16px; margin: 0; cursor: pointer; accent-color: var(--navy, #17375E); }
+
+/* Campo de quantidade (Pedido). Azul = alterado à mão (par "alterado
+   manualmente" da identidade visual). Sem as setas do campo numérico. */
+.entrada {
+  width: 64px; box-sizing: border-box; padding: 4px 8px; text-align: right;
+  font: inherit; font-weight: 600; color: var(--navy, #17375E);
+  background: #FFFFFF; border: 1px solid var(--borda, #E4E7EB); border-radius: var(--raio-sm, 6px);
+  -moz-appearance: textfield;
+}
+.entrada::-webkit-outer-spin-button, .entrada::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.entrada:hover { border-color: var(--navy-claro, #4A6E90); }
+.entrada:focus { outline: 2px solid var(--navy, #17375E); outline-offset: 1px; }
+.entrada.alterada { background: #DCE9F7; border-color: #B7CDE6; color: #123A63; }
+/* Destaque pequeno da coluna Sugestão (pedido de 29/09/2026): fundo azul bem
+   leve no campo; o alterado à mão continua no azul mais forte acima. */
+.entrada.destaque:not(.alterada) { background: #F3F7FC; border-color: #D5E2F1; }
 
 /* Botão da linha (Detalhes) */
 .acao {
@@ -265,12 +333,26 @@ function el(tag, classe, texto) {
   return e;
 }
 
-function montarCelula(linhas) {
+function campoEntrada(p, aoEditar) {
+  const campo = el("input", "entrada " + (p.c || ""));
+  campo.type = "number"; campo.min = "0"; campo.step = "1"; campo.inputMode = "numeric";
+  campo.value = String(p.entrada);
+  campo.setAttribute("aria-label", "Quantidade");
+  const original = String(p.entrada);
+  campo.onkeydown = (ev) => { if (ev.key === "Enter") campo.blur(); };
+  campo.onchange = () => { if (campo.value !== original) aoEditar(campo.value); };
+  if (p.dica) campo.title = p.dica;
+  return campo;
+}
+
+function montarCelula(linhas, aoEditar) {
   const frag = document.createDocumentFragment();
   for (const linha of (linhas || [])) {
     const div = el("div");
+    if (linha.length && linha[0].pilha) div.className = "pilha";
     linha.forEach((p, i) => {
-      if (i) div.appendChild(document.createTextNode(" "));
+      if (i && !div.className) div.appendChild(document.createTextNode(" "));
+      if (p.entrada !== undefined && aoEditar) { div.appendChild(campoEntrada(p, aoEditar)); return; }
       const span = el("span", p.c || "", p.t);
       if (p.dica) { span.dataset.dica = p.dica; span.classList.add("dica-acima"); }
       div.appendChild(span);
@@ -286,6 +368,8 @@ export default function (component) {
   const colunas = data.colunas || [];
   const linhas = data.linhas || [];
   const trilhas = colunas.map(c => c.largura || "auto");
+  const selecao = data.selecao || null;   // {id: true|false} — coluna de checkbox
+  if (selecao) trilhas.unshift("auto");
   // "auto", não "32px": no subgrid o padding lateral da linha entra como
   // margem das colunas das pontas — com 32px fixos, o botão (32px) invadia o
   // vão de Economia em 16px (medido pela checagem de vãos em 25/09/2026).
@@ -308,6 +392,21 @@ export default function (component) {
 
   const cab = el("div", "linha cabecalho");
   cab.setAttribute("role", "row");
+  if (selecao) {
+    // Marca/desmarca a PÁGINA (as linhas desta tabela) — Q3b de 29/09/2026.
+    const ids = linhas.map(l => l.id);
+    const marcadas = ids.filter(i => selecao[i]).length;
+    const cel = el("div", "cel sel");
+    const caixa = el("input", "marca");
+    caixa.type = "checkbox";
+    caixa.checked = ids.length > 0 && marcadas === ids.length;
+    caixa.indeterminate = marcadas > 0 && marcadas < ids.length;
+    caixa.setAttribute("aria-label", "Marcar todos desta página");
+    caixa.title = "Marcar/desmarcar todos desta página";
+    caixa.onchange = () => setTriggerValue("marcar", { ids, valor: caixa.checked });
+    cel.appendChild(caixa);
+    cab.appendChild(cel);
+  }
   for (const c of colunas) {
     const cel = el("div", "cel" + (c.direita ? " direita" : ""));
     cel.setAttribute("role", "columnheader");
@@ -337,8 +436,18 @@ export default function (component) {
   quadro.appendChild(cab);
 
   for (const l of linhas) {
-    const linha = el("div", "linha corpo");
+    const linha = el("div", "linha corpo" + (l.classe ? " " + l.classe : ""));
     linha.setAttribute("role", "row");
+    if (selecao) {
+      const cel = el("div", "cel sel");
+      const caixa = el("input", "marca");
+      caixa.type = "checkbox";
+      caixa.checked = !!selecao[l.id];
+      caixa.setAttribute("aria-label", "Incluir no pedido");
+      caixa.onchange = () => setTriggerValue("marcar", { ids: [l.id], valor: caixa.checked });
+      cel.appendChild(caixa);
+      linha.appendChild(cel);
+    }
     for (const c of colunas) {
       const cel = el("div", "cel" + (c.direita ? " direita" : ""));
       cel.setAttribute("role", "cell");
@@ -349,7 +458,7 @@ export default function (component) {
         texto.appendChild(montarCelula(l.celulas[c.id]));
         cel.appendChild(texto);
       } else {
-        cel.appendChild(montarCelula(l.celulas[c.id]));
+        cel.appendChild(montarCelula(l.celulas[c.id], (valor) => setTriggerValue("editar", { id: l.id, valor })));
       }
       linha.appendChild(cel);
     }
@@ -389,6 +498,9 @@ def tabela(
     acao: str | None = None,
     vazio: tuple[str, str] = ("Nenhuma oportunidade encontrada", "Tente alterar os filtros"),
     densa: bool = False,
+    ao_editar: Callable[[str, str], None] | None = None,
+    selecao: dict[str, bool] | None = None,
+    ao_marcar: Callable[[dict[str, bool]], None] | None = None,
 ) -> None:
     """Desenha a tabela.
 
@@ -397,13 +509,28 @@ def tabela(
     `ao_ordenar(coluna)`: chamado no clique do título, antes do rerun.
     `acao`: texto da dica do botão de cada linha (None = sem botão). O id da
     linha clicada fica em `acao_clicada(key)` no rerun seguinte.
-    `densa`: vão menor entre colunas (tabelas de 8+ colunas)."""
+    `densa`: vão menor entre colunas (tabelas de 8+ colunas).
+    `ao_editar(id da linha, texto)`: chamado quando um campo `entrada()`
+    muda, antes do rerun.
+    `selecao`: {id da linha: marcada?} — com ele, a 1ª coluna é um checkbox
+    por linha e o do cabeçalho marca/desmarca a PÁGINA. `ao_marcar({id:
+    valor})`: chamado no clique, antes do rerun."""
     por_campo = {c.campo: c for c in colunas if c.campo}
 
     def _ordenar() -> None:
         campo = st.session_state[key].ordenar
         if campo in por_campo:
             ao_ordenar(por_campo[campo])
+
+    def _editar() -> None:
+        valor = st.session_state[key].editar
+        if ao_editar and isinstance(valor, dict) and valor.get("id") is not None:
+            ao_editar(str(valor["id"]), str(valor.get("valor", "")))
+
+    def _marcar() -> None:
+        valor = st.session_state[key].marcar
+        if ao_marcar and isinstance(valor, dict) and valor.get("ids"):
+            ao_marcar({str(i): bool(valor.get("valor")) for i in valor["ids"]})
 
     def _acao() -> None:
         linha_id = st.session_state[key].acao
@@ -424,9 +551,12 @@ def tabela(
             "vazio_titulo": vazio[0],
             "vazio_texto": vazio[1],
             "densa": densa,
+            "selecao": selecao,
         },
         on_ordenar_change=_ordenar,
         on_acao_change=_acao,
+        on_editar_change=_editar,
+        on_marcar_change=_marcar,
     )
 
 

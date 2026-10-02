@@ -111,6 +111,29 @@ SELETORES_STREAMLIT: dict[str, tuple[str, str]] = {
     "cabecalho_app": ('[data-testid="stHeader"]', "login"),
     "fundo_app": ('[data-testid="stAppViewContainer"]', "login"),
     "iframe": ('[data-testid="stIFrame"]', "login"),
+    # Camada que o 1.62 põe em volta de cada st.container, da MESMA altura
+    # dele: `position: sticky` no container não gruda (o pai não tem folga).
+    # Grudar esta camada, cujo pai é a página inteira (medido 29/09/2026).
+    "envoltorio_layout": ('div[data-testid="stLayoutWrapper"]', "por_loja"),
+    "bloco_horizontal": ('div[data-testid="stHorizontalBlock"]', "por_loja"),
+    # Assistente de pedido (01/10/2026) — nomes conferidos no DOM do 1.62:
+    # o diálogo é uma <section role="dialog"> dentro de div[stDialog]; a
+    # pílula não tem data-testid, só data-variant (marcada = aria-checked na
+    # escolha única, aria-pressed na múltipla).
+    "dialogo": ('div[data-testid="stDialog"] section[role="dialog"]', "pedido_alerta"),
+    "pilula": ('button[data-variant="pills"]', "pedido_parametros"),
+    "campo_texto": ('div[data-testid="stTextInputRootElement"]', "pedido_loja"),
+    "caixa_multiselect": ('div[data-testid="stMultiSelect"] .react-aria-ComboBox', "pedido_loja"),
+    # Texto digitado/de exemplo dos campos (01/10/2026): o Streamlit usa
+    # 0,875 × a base = 12,25px, fora da escala e MENOR que o rótulo.
+    "campo_entrada": ('[data-testid="stTextInputField"], [data-testid="stNumberInputField"], '
+                      '[data-testid="stSelectbox"] input, [data-testid="stMultiSelect"] input', "por_loja"),
+    # Etiqueta de valor escolhido no multiselect: sem data-testid; é o span
+    # dentro do grupo (role="group") do container de etiquetas (DOM do 1.62).
+    # Caixa da seleção (selectbox) — no 1.62, o fundo é o div[role="group"]
+    # dentro do ComboBox do react-aria (conferido no DOM em 02/10/2026).
+    "caixa_selecao": ('[data-testid="stSelectbox"] .react-aria-ComboBox div[role="group"]', "por_loja"),
+    "etiqueta_multiselect": ('[data-testid="stMultiSelectTagsContainer"] span[role="group"] > span', "pedido_filtrado"),
 }
 
 
@@ -185,18 +208,63 @@ def _construir_css() -> str:
 {_sel("botao_download")} p {{
     font-size: var(--fs-aux);
 }}
+/* Texto digitado e de exemplo dos campos: 12,25px → 14px, o texto do corpo —
+   o que se lê dentro do campo não pode ser menor que o rótulo dele (Q3 de
+   01/10/2026, vale no app inteiro). */
+{_sel("campo_entrada")} {{
+    font-size: var(--fs-corpo);
+}}
+/* Etiquetas do multiselect com a cara dos chips (pílula azul-clara, texto
+   azul-escuro de 13px): é a mesma informação (Q12 de 01/10/2026). Antes:
+   azul-marinho cheio, cantos de 6px. */
+{_sel("etiqueta_multiselect")} {{
+    background: {STATUS['alterado']['bg']};
+    color: {STATUS['alterado']['fg']};
+    border: 1px solid #C9DAF0;
+    border-radius: var(--raio-pill);
+    font-size: var(--fs-aux);
+}}
+{_sel("etiqueta_multiselect")} span, {_sel("etiqueta_multiselect")} svg {{
+    color: {STATUS['alterado']['fg']};
+}}
 
 /* Sidebar navy, largura travada (min == max == width desativa o arraste
    de redimensionar, que o Streamlit faz via style inline — por isso
-   !important). */
+   !important). Só ABERTA: travada sempre, ela continuava ocupando os 272px
+   depois de recolhida e o conteúdo não se ajustava (01/10/2026). */
 {sidebar} {{
     background: linear-gradient(180deg, var(--navy) 0%, #1c3f68 100%);
+}}
+{sidebar}[aria-expanded="true"] {{
     width: {sidebar_largura}px !important;
     min-width: {sidebar_largura}px !important;
     max-width: {sidebar_largura}px !important;
 }}
 {sidebar} * {{
     color: #FFFFFF;
+}}
+/* Loja na barra (02/10/2026): caixa translúcida no navy, como os botões da
+   barra — branca, o texto (branco pela regra acima) sumia. */
+{sidebar} {_sel("caixa_selecao")} {{
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: var(--raio);
+}}
+{sidebar} {_sel("caixa_selecao")} input::placeholder {{ color: var(--sidebar-texto-2); }}
+/* "Ver todas as lojas" embaixo da caixa: link discreto, não botão. */
+{sidebar} div[class*="st-key-loja_barra_todas"] button {{
+    background: none; border: 0; min-height: 0; padding: 0; color: var(--sidebar-texto-2);
+}}
+{sidebar} div[class*="st-key-loja_barra_todas"] button p {{ font-size: var(--fs-min); }}
+{sidebar} div[class*="st-key-loja_barra_todas"] button:hover {{ color: #FFFFFF; text-decoration: underline; }}
+{sidebar} .rmc-loja-fixa {{
+    padding: var(--esp-2) var(--esp-3); border: 1px solid rgba(255, 255, 255, 0.35); border-radius: var(--raio);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: var(--fs-corpo);
+}}
+/* Atualização dos dados, no pé da barra: discreto, sem destaque (Q5). */
+{sidebar} .rmc-atualizacao {{
+    font-size: var(--fs-min); line-height: 1.5; color: var(--sidebar-texto-2) !important; opacity: .8;
+    margin-top: var(--esp-1);
 }}
 {sidebar} .stCaption, {sidebar} small {{
     color: var(--sidebar-texto-2) !important;
@@ -267,6 +335,15 @@ def _construir_css() -> str:
 }}
 {_sel("botao_download")}:hover {{
     background: var(--fundo-card);
+}}
+/* Download como ação principal (type="primary" — ex.: "Baixar" na
+   exportação do Assistente de pedido): azul-marinho cheio, como os outros
+   botões primários (01/10/2026). */
+{_sel("botao_download")}[kind="primary"] {{
+    background: var(--navy); color: #FFFFFF;
+}}
+{_sel("botao_download")}[kind="primary"]:hover {{
+    background: #123055; border-color: #123055; color: #FFFFFF;
 }}
 
 /* Variações de botão por marcador invisível. */
@@ -385,6 +462,8 @@ def _construir_css() -> str:
 .rmc-kpis .azul .icone {{ background: {STATUS['alterado']['bg']}; color: var(--navy); }}
 .rmc-kpis .verde .icone {{ background: {STATUS['sucesso']['bg']}; color: var(--verde-escuro); }}
 .rmc-kpis .roxo .icone {{ background: {STATUS['multiplo']['bg']}; color: {STATUS['multiplo']['fg']}; }}
+.rmc-kpis .rmc-kpi.ambar {{ background: linear-gradient(135deg, #FDF6EA 0%, #FFFFFF 100%); border-color: #F2E0C0; }}
+.rmc-kpis .ambar .icone {{ background: {STATUS['sugestao']['bg']}; color: {STATUS['sugestao']['fg']}; }}
 .rmc-kpis .corpo {{ min-width: 0; flex: 1; }}
 .rmc-kpis .label {{
     color: var(--navy); font-size: var(--fs-min); font-weight: 700;
@@ -403,6 +482,8 @@ def _construir_css() -> str:
        dos quatro cards na mesma altura. */
     .rmc-kpis .label {{ min-height: 2.6em; }}
 }}
+.rmc-kpis.unico {{ grid-template-columns: minmax(0, 1fr); margin-bottom: 0; height: 100%; }}
+.rmc-kpis.unico .rmc-kpi {{ height: 100%; }}
 .rmc-kpis .rmc-kpi-dentro {{ display: flex; align-items: flex-start; gap: var(--esp-3); width: 100%; min-width: 0; }}
 /* Selo de tendência: pílula com seta + %. Verde = subiu, âmbar = caiu
    (nunca vermelho — regra da identidade). */
@@ -456,7 +537,8 @@ def _construir_css() -> str:
 /* Faixa do filtro principal (Laboratório): mesmo branco/borda dos cards,
    verde só na borda esquerda. Altura mínima fixa: com ou sem o seletor
    (sem laboratório cadastrado), a faixa tem a mesma altura. */
-div[class*="st-key-faixa-laboratorio"] {{
+/* A faixa da Loja (tela Pedido) é a mesma peça, com o mesmo papel. */
+div[class*="st-key-faixa-laboratorio"], div[class*="st-key-faixa-loja"] {{
     background: #FFFFFF;
     border: 1px solid var(--borda);
     border-left: 4px solid var(--verde);
@@ -489,15 +571,83 @@ div[class*="st-key-faixa-laboratorio"] {{
 /* Análise (Por Loja / Por Produto): 16px entre as seções (cabeçalho,
    faixa, cards, filtros, lojas específicas, tabela, paginação). O padrão
    do Streamlit é 1rem = 14px, fora da escala (medido em 25/09/2026). */
-div[class*="st-key-tela-por-loja"], div[class*="st-key-tela-por-produto"] {{ gap: var(--esp-4); }}
+div[class*="st-key-tela-por-loja"], div[class*="st-key-tela-por-produto"], div[class*="st-key-tela-pedido"] {{ gap: var(--esp-4); }}
 /* Mesmo -1rem do Markdown que foi zerado na sidebar: aqui ele "comia" 14px
    de baixo do cabeçalho e dos cards — o vão visível entre os cards e os
    rótulos dos filtros era de ~2px (medido em 25/09/2026). */
-div[class*="st-key-tela-por-loja"] {_sel("markdown")}, div[class*="st-key-tela-por-produto"] {_sel("markdown")} {{
+div[class*="st-key-tela-por-loja"] {_sel("markdown")}, div[class*="st-key-tela-por-produto"] {_sel("markdown")},
+div[class*="st-key-tela-pedido"] {_sel("markdown")} {{
     margin-bottom: 0;
 }}
+/* Assistente de pedido — topo, pílulas de parâmetros, cards e linha de
+   filtros (01/10/2026). */
+.rmc-pedido-titulo {{ font-size: 22px; font-weight: 700; color: var(--navy); line-height: 1.2; }}
+.rmc-pedido-rotulo {{ font-size: var(--fs-min); font-weight: 700; color: var(--navy); text-transform: uppercase;
+    letter-spacing: .03em; display: inline-block; line-height: 28px; }}
+/* O <p> do Markdown tem margem embaixo: o rótulo ficava 7px acima do centro
+   das pílulas (01/10/2026). */
+div[class*="st-key-pedido-parametros"] {_sel("markdown")} p {{ margin: 0; }}
+/* Pílula de parâmetros escolhida: fundo levemente verde (pedido de 01/10/2026).
+   Escolha única = role "radio" + aria-checked (a múltipla usa aria-pressed). */
+/* :hover/:focus junto: com o mouse em cima, o realce do Streamlit vencia o
+   verde (teste visual de 01/10/2026). */
+div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"],
+div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"]:hover,
+div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"]:focus {{
+    background: {STATUS['sucesso']['bg']}; border-color: var(--verde-escuro); color: {STATUS['sucesso']['fg']};
+}}
+div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"] p {{ color: {STATUS['sucesso']['fg']}; }}
+/* Cards em colunas (um por coluna): mesmo vão de 12px do grid de cards. */
+div[class*="st-key-pedido-cards"] {_sel("bloco_horizontal")} {{ gap: var(--esp-3); }}
+/* 4º card ("Sem classificação"): o botão "Saiba mais" cobre o card inteiro,
+   transparente — o card fica clicável sem mudar o desenho. Nada clicável
+   embaixo dele (o card é só texto). */
+div[class*="st-key-pedido-card-sem"] {{ position: relative; height: 100%; }}
+div[class*="st-key-pedido-card-sem"] .rmc-kpi {{ cursor: pointer; transition: border-color .15s, box-shadow .15s; }}
+div[class*="st-key-pedido-card-sem"]:hover .rmc-kpi {{ border-color: var(--navy); box-shadow: 0 2px 8px rgba(23, 55, 94, .08); }}
+div[class*="st-key-pedido-card-sem"] .sub {{ color: var(--navy); font-weight: 600; }}
+div[class*="st-key-pedido_saiba_mais"] {{ position: absolute; inset: 0; z-index: 2; }}
+/* O botão fica dentro de 2 divs do Streamlit: sem 100% em todos, ele
+   cobria só os 51px de cima do card (medido em 01/10/2026). */
+div[class*="st-key-pedido_saiba_mais"] div, div[class*="st-key-pedido_saiba_mais"] button {{ width: 100%; height: 100%; }}
+div[class*="st-key-pedido_saiba_mais"] button {{ opacity: 0; cursor: pointer; }}
+/* Botões do rodapé: 40px (Q11 de 01/10/2026). Só "Exportar" é azul-marinho
+   cheio; Descartar e Listas com contorno — três botões cheios lado a lado
+   anulavam a hierarquia, e "Descartar" como botão principal convidava ao
+   clique errado. (O topo ficou sem botões em 02/10/2026.) */
+div[class*="st-key-rodape-pedido"] {botao} {{ min-height: 40px; }}
+div[class*="st-key-rodape-pedido"] {botao}[kind="secondary"] {{
+    background: #FFFFFF; color: var(--navy); border-color: var(--navy);
+}}
+div[class*="st-key-rodape-pedido"] {botao}[kind="secondary"]:hover {{ background: var(--fundo-card); color: var(--navy); }}
+div[class*="st-key-rodape-pedido"] {botao}[kind="secondary"]:disabled {{
+    background: #FFFFFF; color: var(--texto-muted); border-color: var(--borda);
+}}
+/* Linha de filtros: a busca leva a maior parte; o toggle, o que precisa. */
+div[class*="st-key-pedido-filtros-linha"] > div {{ min-width: 0; }}
+div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_busca"] {{ flex: 1.6 1 0; }}
+div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_cat_"],
+div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_fab_"] {{ flex: 1 1 0; }}
+div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_giro"] {{ flex: none; }}
+
+/* === RODAPÉ FIXO DO PEDIDO (29/09/2026) — bloco isolado: se precisar
+   desfazer, apagar só daqui até "FIM DO RODAPÉ FIXO". Os botões ficam
+   DENTRO da faixa fixa (nunca por cima de outro elemento clicável). === */
+{_sel("envoltorio_layout")}:has(> div[class*="st-key-rodape-pedido"]) {{
+    position: sticky; bottom: 0; z-index: 20;
+}}
+div[class*="st-key-rodape-pedido"] {{
+    background: #FFFFFF; border-top: 1px solid var(--borda);
+    padding: var(--esp-2) 0; margin-top: var(--esp-2);
+    box-shadow: 0 -6px 16px rgba(23, 55, 94, 0.06);
+}}
+/* === FIM DO RODAPÉ FIXO === */
+
 </style>
 """
+
+
+
 
 
 def aplicar_tema() -> None:
@@ -563,6 +713,14 @@ _ICONES_KPI = {
                'stroke-width="1.8" stroke-linecap="round" fill="none"/>',
     "media": '<path d="M4 20V10M10 20V4M16 20v-7M22 20H2" stroke="currentColor" stroke-width="1.8" '
              'stroke-linecap="round" fill="none"/>',
+    "duvida": '<circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8" fill="none"/>'
+              '<path d="M9.6 9.3a2.5 2.5 0 0 1 4.8.9c0 1.7-2.4 2.1-2.4 3.6M12 16.8v.2" stroke="currentColor" '
+              'stroke-width="1.9" stroke-linecap="round" fill="none"/>',
+    "alerta": '<path d="M12 4 2.8 19.5h18.4L12 4z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" '
+              'fill="none"/><path d="M12 10v4.2M12 16.8v.2" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"/>',
+    "carrinho": '<path d="M3 4h2.2l2.3 11h10.8l2-7.5H6.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" '
+                'stroke-linejoin="round" fill="none"/><circle cx="9.5" cy="19" r="1.4" fill="currentColor"/>'
+                '<circle cx="16.5" cy="19" r="1.4" fill="currentColor"/>',
 }
 _SETA_SOBE = '<svg viewBox="0 0 10 10"><path d="M5 1.5L9 7H1z" fill="currentColor"/></svg>'
 _SETA_DESCE = '<svg viewBox="0 0 10 10"><path d="M5 8.5L1 3h8z" fill="currentColor"/></svg>'
@@ -583,9 +741,9 @@ def _tendencia(variacao: float | None, dica: str) -> str:
     return f'<span class="rmc-tendencia {classe}" title="{html.escape(dica)}">{seta}{percentual}</span>'
 
 
-def kpis(cards: list[dict]) -> None:
+def kpis(cards: list[dict], unico: bool = False) -> None:
     """Linha de cards de indicador. Cada card: {"icone": loja|moeda|produto|
-    media, "tom": azul|verde|roxo, "valor", "label", "sub" (opcional),
+    media|alerta|carrinho, "tom": azul|verde|roxo|ambar, "valor", "label", "sub" (opcional),
     "variacao" (float|None), "dica_variacao"}.
 
     O "$" vira entidade HTML: o Markdown do Streamlit leria "R$ … R$" como
@@ -602,7 +760,10 @@ def kpis(cards: list[dict]) -> None:
             f'<div class="linha-valor"><span class="valor">{html.escape(c["valor"])}</span>'
             f'{_tendencia(c.get("variacao"), c.get("dica_variacao", ""))}</div>{sub}</div></div></div>'
         )
-    st.markdown(f'<div class="rmc-kpis">{"".join(partes)}</div>'.replace("$", "&#36;"), unsafe_allow_html=True)
+    # `unico`: um card por chamada, dentro de uma coluna do Streamlit — o
+    # Assistente de pedido precisa de um botão no 4º card (01/10/2026).
+    classe = "rmc-kpis unico" if unico else "rmc-kpis"
+    st.markdown(f'<div class="{classe}">{"".join(partes)}</div>'.replace("$", "&#36;"), unsafe_allow_html=True)
 
 
 def titulo_secao(texto: str) -> None:

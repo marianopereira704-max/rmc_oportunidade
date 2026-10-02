@@ -52,7 +52,7 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
   admin no app publicado em 24/09/2026.
   Como o app antigo publicado e o app local usam o mesmo banco, migração nunca
   pode apagar/renomear coluna nem tabela enquanto o `main` estiver atrasado —
-  só acrescentar ou afrouxar (ex.: NOT NULL → NULL). Última: `0005_campos_recuo_preco_gps`.
+  só acrescentar ou afrouxar (ex.: NOT NULL → NULL). Última: `0014_pedido_avisos_vistos`. A `0010_origem_fila_loja_api` acrescenta valor ao enum `origemfila` com `ALTER TYPE … ADD VALUE` dentro da transação (Postgres 16; nada pode USAR o valor novo na mesma transação).
 - **Bucket `consultoria-interna` é compartilhado** com outros sistemas (backups
   `.sql.gz`, outros projetos). Nunca apagar objetos por padrão de data/nome
   sem conferir. A chave do app não tem permissão de CORS (Get/PutBucketCors).
@@ -67,15 +67,15 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
 - Código, comentários, mensagens de tela e commits em português. O estilo do
   projeto é comentário/docstring explicando o PORQUÊ, com o bug ou a medição
   que motivou a decisão — manter essa densidade.
-- Testes: `python -m pytest -q -p no:warnings` (248 passando em 25/09, ~25s).
+- Testes: `python -m pytest -q -p no:warnings` (353 passando em 02/10, ~35–60s).
   `tests/conftest.py` força storage local temporário em todo teste — sem ele,
   a suíte gravava arquivos no bucket real. Testes usam SQLite; primitivas
   que dependem do banco (ON CONFLICT) ficam em `core/sql.py` pra valer igual
   nos dois.
 - Teste visual e de contrato (fora do pytest, precisa de Playwright):
-  `python -m tests.visual.rodar` — sobe o app num SQLite com `data.seed`,
+  `python -m tests.visual.rodar` — sobe o app num SQLite com `data.seed` + uma loja fictícia do Pedido (`tests/visual/loja_ficticia.py`, 20 produtos inventados, data fixa 27/09/2026, com personalização),
   percorre as telas em 1280/1920 px, confere os seletores internos do
-  Streamlit (`SELETORES_STREAMLIT`), os vãos iguais das tabelas e compara as capturas com
+  Streamlit (`SELETORES_STREAMLIT`), os vãos iguais das tabelas, o fluxo do Assistente de pedido (pop-up de alerta, pílulas de parâmetros — a loja fictícia tem personalização —, lista e uma categoria filtrada) e compara as capturas com
   `tests/visual/referencia/`. Mudança visual de propósito:
   `--atualizar` e versionar as imagens novas. Rodar antes de atualizar o
   Streamlit (versão fixada em `requirements.txt`).
@@ -91,6 +91,7 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
 | `core/analise.py` | Cálculo da oportunidade (menor preço, recuo de preço, bonificação, vencedor, preço médio, economia), filtros/ordenação em memória. |
 | `core/queries.py` | Consultas de apoio: meses carregados, histórico mensal, listas dos filtros. |
 | `views/tabela.py` | Tabela das telas de análise (CCv2): um grid só pra cabeçalho e linhas, ordenação pelo título, botão por linha, dica, estado vazio. Mudou o JS/CSS: reiniciar o `streamlit run`. |
+| `views/loja_barra.py` | **Loja escolhida na barra lateral** (02/10/2026), vale pra todas as telas: grupo LOJA no topo da barra ("60 · RAZÃO SOCIAL", sem "cód." e sem "?"; ADM/Consultor com "Todas as lojas", Proprietário com várias lojas com "Todas" (só as dele), Comprador e quem tem 1 loja sem "Todas" — loja única vira texto fixo; "Ver todas as lojas" embaixo da caixa). Só na sessão (login ainda é único). No pé da barra, discreto: "Atualização dos dados · Pedido (GPS): dd/mm/aa às hh:mm (`gerado_em` do marcador de estoque da empresa; com Todas, a execução mais recente da rotina) · Análise (compras): até mmm/aaaa". Efeitos: Por Loja (só ADM) mostra sempre a rede, com a loja destacada (classe `destaque`); Por Produto com uma loja = só busca e período, card "Preço acima do laboratório" no lugar do de lojas, sem a loja embaixo do produto; com Todas, UF/Atendente/Grupo/lojas específicas limitados às lojas do usuário (`analise.Filtros.lojas_permitidas` corta o dado); Assistente sem faixa Loja (com Todas pede uma loja); Configurações → Personalização abre com a loja da barra. |
 | `views/analise_comum.py` | Faixa do filtro Laboratório, filtros, cabeçalho ordenável, cache do resultado, formatação das células. |
 | `core/rotinas.py` | `controle_rotinas`: rotina diária (`reivindicar`) e trava "um por vez" (`reivindicar_trava`/`liberar_trava`). |
 | `core/sql.py` | Upsert atômico portátil (`insert_com_atualizacao`, `insert_ignorando_conflito`). |
@@ -100,24 +101,35 @@ Stack: Streamlit 1.62 + SQLAlchemy 2 + Alembic + Postgres (produção) / SQLite
 | `integrations/gruppy.py` | Tabela de preço por laboratório, vigência por UF. |
 | `integrations/base_genericos.py` | Importação da planilha curada EAN → nome canônico. |
 | `integrations/sistema_interno.py` | Sincronização de lojas (API interna, upsert em lote, diária). |
-| `integrations/gps_api.py` | Cliente da API do GPS — ainda NÃO usado na ingestão (ver `status_e_pendencias.md` §6). |
+| `integrations/gps_api.py` | Cliente da API do GPS (empresas, lojas, vendas por loja, compras e estoque da empresa). Mapa da API e medições: `docs/mapa_api_gps.md`. |
+| `pedido/` | Rotina de dados da aba Pedido (roda no GitHub Actions, fora do app): API do GPS → Spaces em Parquet (`pedido/bruto/…`). `plano` (o que falta — carga inicial e diária são o mesmo comando), `coleta` (corte de 8 min por consulta, fila de tentativas, orçamento de tempo), `vinculo` (loja GPS ↔ RMC), `transformar`, `armazenamento`. Passo a passo: `docs/rotina_pedido.md`. |
+| `pedido/pronto.py` + `pedido/calculo.py` + `views/pedido.py` | Tela **Pedido**. `pronto` junta os ~60 brutos da loja em 3 arquivos (`pedido/pronto/{empresa}/{loja}/`, com assinatura; a rotina monta de madrugada, a tela monta o que faltar). `calculo` é função pura. Regras revistas em 29/09/2026: demanda/dia (dias sem dado saem da conta); máx. = ⌈demanda × dias⌉ (medicamento 7, perfumaria 15, **Sem Classificação 7 estimados**, com a tag); sugestão = máx. − estoque; só lista abaixo do máx.; **EAN negativo conta como 0** (não trava; tag + lista de correção); **Ruptura = estoque ≤ N un. (padrão 0)**, **Ruptura próxima = acima disso e cobertura ≤ D dias (3)**; giro baixo ≤ 1 un. em 90 dias; curva ABC 2 letras. **Preço no Pedido = última compra não bonificada** (a Análise continua no menor preço); "a revisar" = > 3× ou < 1/3 da mediana das compras da própria loja (o custo de cadastro do GPS bate com a última compra em só ~40–48% dos produtos). **Cadastro × nota (01/10/2026):** divergem mais de 2× → o preço de venda decide (custo coerente = 15–100% da venda): só um coerente → vale ele, tag "custo ajustado"; os dois/nenhum → nota + "a revisar"; sem compra e cadastro fora da faixa → "a revisar" (`revisar_motivo` diz por quê). Hudson: resolveu 9 dos 10 que divergiam; "a revisar" listados 1 → 26 (cadastro com fração errada, ex. Sonrisal R$ 0,05 vendido a R$ 3,00). Coluna **Venda 90 dias** (total, fixo em 90) no lugar de Demanda/dia — só exibição, a sugestão segue a demanda da janela. Caso real: seringa com caixa de 100 lançada sem fração (R$ 79,90/un.) inflava o orçamento da Hudson em ~R$ 4,7 mil na regra antiga. Genéricos da Base Genéricos viram uma linha. **Assistente de pedido** (nome na tela desde 01/10/2026; por dentro continua "pedido"). Ao abrir a loja, em ordem: pop-up Estoque negativo (corrigir manualmente / considerar todos zero) → pop-up Sem classificação (informativo) — cada um UMA vez por foto do GPS por usuário+loja (`pedido_avisos_vistos`) → loja com personalização: pílulas "Personalizado desta loja"/"Padrão", nenhuma marcada, lista só depois da escolha. Topo (02/10/2026): a faixa Loja vem PRIMEIRO; abaixo, só depois da escolha, "Assistente de pedido" + data, sem botões — o "Estoque negativo" saiu (corrigir é pelo pop-up) e "Listas" virou botão do rodapé ("Listas (N)", pop-up com abas "Salvar como lista" e "Listas salvas"). Cards (pedido inteiro): Orçamento (unidades no subtítulo), Itens com sugestão, Ruptura, Sem classificação (card inteiro clicável → "Saiba mais": botão transparente por cima, `st-key-pedido_saiba_mais`). Filtros SEM pop-up, numa linha acima da tabela: busca, Categoria, Fabricante (= laboratório), Ocultar giro baixo. Ordem padrão: "a revisar" primeiro (linha âmbar, classe `revisar` em views/tabela.py), depois valor vendido. Rodapé fixo (`st-key-rodape-pedido`, sticky na camada `envoltorio_layout`). Em 1280 px a tabela cabe no limite (nome do produto quebra dentro da palavra, classe `quebra`). |
+| `pedido/configuracao.py` + `integrations/configuracao_pedido.py` + `views/config_pedido.py` | **Configurações de Pedidos** (só admin, sidebar em Administração): dias de estoque por grupo e por categoria, piso do máximo, ruptura, giro baixo, curva ABC, janela de meses, faixa de custo coerente. Duas seções (01/10/2026): **Padrão de todas as lojas** e **Personalização por loja** (`personalizacoes_pedido_loja`: só o que difere do padrão — `diferencas`/`aplicar`; o resto segue o padrão mesmo se ele mudar; "Copiar personalização de…" copia, não liga; "Remover" grava `{}`; janela de meses fica de fora; a loja não edita nada). A tela Pedido ainda usa só o padrão: a escolha Padrão × Personalizado (pílulas) é a Etapa 2 do Assistente de pedido. Cada gravação é uma linha nova em `configuracoes_pedido` (histórico com quem/quando); a vigente é a de maior id; sem nenhuma, valem os padrões de `settings.pedido`. A janela também vai pro Spaces (`pedido/controle/configuracao.json`) porque a rotina roda sem banco. Botões da sidebar no teste visual: pela chave `st-key-nav_<seção>` — o nome acessível inclui o ícone e "Pedido" casava com "Configurações de Pedidos". |
+| `integrations/pedido_area.py` | Pedido (29/09/2026): **área de trabalho por usuário + loja** (`pedido_area`: só o que difere do padrão — quantidade digitada, marcação feita à mão; grava a cada clique, volta igual no reload) e **listas com nome** (`pedido_listas`, visíveis pra todos, com autor; "Abrir" traz pra área; exportar a partir dela apaga). Avisos contra pedido duplicado (lista de outra pessoa, exportação de hoje de outra pessoa). Substitui o rascunho da loja da Fase 5 (`rascunhos_pedido` fica no banco sem uso). |
+| ~~`integrations/pedido_filtros.py`~~ | Apagado em 01/10/2026 com o pop-up de filtros (Assistente de pedido). A tabela `pedido_filtro_salvo` fica no banco sem uso (migração não apaga tabela).
+| `integrations/pedido_rascunho.py` | Pedido, Fase 5: rascunho DA LOJA (`rascunhos_pedido`; digitar o número sugerido tira o item do rascunho; "Descartar alterações" limpa), correção de estoque negativo (`correcoes_estoque`; só vale enquanto a foto do GPS continuar negativa) e registro das exportações (`exportacoes_pedido`). Tudo com usuário e data/hora. A quantidade é um campo dentro da tabela (`tabela.entrada`, gatilho `editar` do componente). Exportação (02/10/2026), três opções no pop-up "Exportar": **Formato Gruppy** (PRODUTO, QUANTIDADE, EAN 1…N, só marcados com quantidade > 0, Excel ou CSV com `;` e BOM — o único que REGISTRA a exportação e encerra a lista aberta), **Tabela completa** (Excel: aba Pedido = `calculo.tabela_completa`, todos os itens com as colunas da tela; aba Giro baixo) e **Só giro baixo** (`calculo.giro_baixo`: giro baixo COM estoque, maior valor parado primeiro — Hudson: 1.635 produtos, R$ 210 mil). |
+| `core/acesso.py` | Níveis de acesso (revistos em 02/10/2026): ADM (tudo; Por Loja é só dele), CONSULTOR (tudo menos Administração e Por Loja; começa na Por Produto), COMPRADOR/PROPRIETARIO (Por Produto e Assistente das lojas em `usuarios_lojas`; sem loja ligada, nenhuma; "Gerente" virou "Comprador" em 01/10/2026 — `GERENTE` gravado vale como Comprador). Nível em `usuarios.nivel` (texto, não enum do Postgres); vazio = deduzido do papel do login único (admin/consultor). O login individual (`usuarios.login`) é a próxima etapa. |
+| `integrations/fila_loja.py` | Fila de EAN origem **Loja (API)**: genérico (pela base de categorias) VENDIDO nas lojas (catálogo da empresa, `lojas_com_venda`, gravado pela rotina) e fora da Base Genéricos. Valor = vendido na janela, regravado (não soma); fica fora de `recalcular_valores_fila_ean`; nunca resolve sozinho, nem no reprocessamento. Roda 1×/dia na primeira abertura da aba Dados (`ROTINA_FILA_EAN_LOJA_API`) e pelo botão na fila. Teste real (Hudson + 3 Reis): 1.398 genéricos vendidos, 1.328 já na base, 26 novos. |
+| `integrations/gps_vinculo.py` | Vínculo loja GPS ↔ loja RMC no banco (`vinculos_loja_gps`); decisão humana nunca é desfeita pelo recálculo. Tela: Dados → Vínculo de lojas GPS. |
+| `pedido/categorias.py` + `integrations/categorias.py` | Base de categorias do Pedido (`categorias_ean`, EAN → categoria → grupo medicamento/perfumaria/Sem Classificação). Nasce com FEBRAFAR + CMED (`python -m pedido.carga_categorias` monta o arquivo no Spaces; o botão em Dados → Categorias de produtos carrega no banco — o secrets local só alcança o banco dev). Categoria MANUAL nunca é sobrescrita. A planilha FEBRAFAR é de terceiro: nunca no git. Chave do EAN sem zeros à esquerda (`chave_ean`). |
+| `.github/workflows/rotina_pedido.yml` | Agendamento da rotina do Pedido: 00:00 de Brasília, 4 partes paralelas, disparo manual permitido. Chaves em Secrets do GitHub (repositório público: nada de dado em log). |
 | `integrations/gps_cache_orfaos.py` | Legado: atalho de órfãos em arquivo. Não é mais escrito; só usado pra purgar em exclusão de envios antigos. |
 | `reconciliation/motor.py` | Fuzzy-match EAN → genérico, filas de EAN, reprocessamento. |
 | `storage/filesystem.py` | Explorador de Arquivos virtual (FSNode) sobre Spaces/disco; nada se apaga, "inativar" move pra `_Inativos`. |
 | `views/leitor_planilha.py` | Componente (CCv2) que lê o .xlsx NO NAVEGADOR. |
-| `views/dados.py` | Aba Dados (só admin): explorador, importações, filas. |
+| `views/dados.py` | Aba Dados (só admin), organizada pelo que o admin está fazendo (Q35, 29/09/2026): **Pendências** (seletor com contadores: Fila de EAN, CNPJ órfão, Vínculo de lojas GPS, Sem Classificação) · **Importar** (Base Genéricos, Gruppy, GPS, Categorias) · **Rotinas** (sincronização de lojas, rotina do GPS com o último relatório de cada parte, listas FEBRAFAR/CMED) · **Explorador**. Todo item começa com "O que é / De onde vem / Como alterar" (`_explicacao`). Aviso de reorganização até 31/10/2026. |
 | `core/theme.py` | CSS em camadas: 1 tokens (cores, escala de texto 28/20/16/14/13/12, espaçamento 4–32, raios); 2 adaptação do Streamlit — única camada com seletor interno, sempre via `SELETORES_STREAMLIT`; 3 componentes `.rmc-*`/`st-key-*`; 4 telas (`theme.tela("nome")` → `st-key-tela-nome`). |
 | `.streamlit/config.toml` | Tema oficial (primaryColor navy, fonte base 14, raios) e `toolbarMode = "viewer"`. O que der pra resolver aqui não vai pra CSS. Largura máxima do conteúdo: `LARGURA_MAXIMA_PX` (1220). |
 
 ## Perfis
 
-Login único pelo CNPJ da rede; a senha define o papel. **Admin** vê tudo,
-inclusive a aba **Dados**. **Consultor** vê Análise de Oportunidade, Pedido e
-Dashboard (Pedido e Dashboard ainda são telas de "próxima fase").
+Login único pelo CNPJ da rede; a senha define o papel. Os níveis de acesso (Gerente/Proprietário só com o Pedido da própria loja) já existem em `core/acesso.py`, esperando o login individual. **Admin** vê tudo,
+inclusive a aba **Dados** e **Configurações de Pedidos**. **Consultor** vê Análise de Oportunidade, Assistente de pedido e
+Dashboard (Dashboard ainda é tela de "próxima fase"; o Pedido existe desde 28/09/2026, sem edição/exportação — Fase 5).
 
 ## Como os dados entram — passo a passo
 
-Tudo fica em **Dados → Importar Planilhas** (admin). Ordem recomendada: lojas →
+Tudo fica em **Dados → Importar** (admin); a base de lojas é sincronizada em **Dados → Rotinas**. Ordem recomendada: lojas →
 Base Genéricos → Gruppy → GPS → filas. A ordem não é obrigatória (nada se
 perde), mas seguir ela evita trabalho manual nas filas.
 
@@ -219,7 +231,7 @@ converte para CSV compactado (~5 MB) e o servidor só decodifica (~0,5 s). O
 original vai direto ao Spaces por URL assinada; se o bucket recusar (sem
 regra de CORS), o original segue pelo app — funciona igual.
 
-## As filas (Dados → abas de fila)
+## As filas (Dados → Pendências)
 
 ### Fila de CNPJ Órfão — só existe para o GPS
 
@@ -250,18 +262,25 @@ com os genéricos ativos:
 
 Diferença entre as origens:
 
-| | Origem **GPS** | Origem **GRUPPY** |
-|---|---|---|
-| De onde vem | EAN de uma compra | EAN de uma tabela de preço |
-| O que falta enquanto não resolve | a compra não entra na análise (sem genérico, não há com o que comparar) | o preço não entra no "menor preço RMC" (oportunidade some ou sai subestimada) |
-| Valor na fila | quantidade × VlrUnitario de todas as compras vigentes com esse EAN (normais + órfãs) | 0 ao entrar (tabela de preço é catálogo, não dinheiro gasto); passa a ter valor se/quando o EAN aparecer em compras do GPS |
-| Quando o valor é recalculado | a cada envio GPS, exclusão de envio e vínculo de CNPJ órfão | idem (o recálculo cobre TODOS os pendentes); o upload da Gruppy em si não recalcula |
+| | Origem **GPS** | Origem **GRUPPY** | Origem **Loja (API)** |
+|---|---|---|---|
+| De onde vem | EAN de uma compra | EAN de uma tabela de preço | genérico vendido nas lojas (API do GPS) e fora da Base Genéricos |
+| O que falta enquanto não resolve | a compra não entra na análise (sem genérico, não há com o que comparar) | o preço não entra no "menor preço RMC" (oportunidade some ou sai subestimada) | no Pedido, o EAN não soma com os outros EANs do genérico |
+| Valor na fila | quantidade × VlrUnitario de todas as compras vigentes com esse EAN (normais + órfãs) | 0 ao entrar (tabela de preço é catálogo, não dinheiro gasto); passa a ter valor se/quando o EAN aparecer em compras do GPS | valor VENDIDO nas lojas na janela; qtd = nº de lojas |
+| Quando o valor é recalculado | a cada envio GPS, exclusão de envio e vínculo de CNPJ órfão | idem (o recálculo cobre TODOS os pendentes); o upload da Gruppy em si não recalcula | 1×/dia (primeira abertura de Dados) ou pelo botão; nunca resolve sozinho |
 
 - `origem` registra onde o EAN foi visto primeiro; se o mesmo EAN depois
   aparece no outro lado, continua sendo UM item (a origem não muda, o valor sim).
 - Prioridade da lista: **valor de compra em jogo** (maior primeiro) — o
   critério antigo "aparece em estoque" saiu junto com o estoque. A tela mostra
-  até 200 itens; o filtro **Origem** separa GPS/Gruppy.
+  até 200 itens; o filtro **Origem** separa GPS/Gruppy/Loja (API). Com
+  **Loja (API)** a ordem é de pareto pelo nº de lojas que vendem, com o "%
+  acumulado" no título de cada item (02/10/2026). O relatório **Sem
+  Classificação** segue o mesmo pareto (coluna LOJAS COM VENDA + % ACUMULADO).
+- Visual padronizado em 02/10/2026: texto digitado nos campos 14 px no app
+  inteiro (era 12,25 — `campo_entrada`), etiquetas do multiselect como chips
+  (`etiqueta_multiselect`), botões do topo/rodapé do Assistente com 40 px e,
+  no rodapé, só "Exportar" azul-marinho cheio.
 - Ações por item: **Confirmar sugestão**, **Vincular** a um genérico existente,
   **Cadastrar e vincular** como genérico novo, **Ignorar**.
 - **Reprocessar fila contra a base atual**: limpa EAN sujo (sufixo ".0"),
