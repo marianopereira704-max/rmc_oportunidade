@@ -45,10 +45,25 @@ def autenticar(cnpj: str, senha: str) -> Usuario | None:
         return None
 
 
+def _guardar_acesso(usuario_id: int) -> None:
+    """Nível e lojas do usuário na sessão (core/acesso.py) — lidos uma vez
+    no login, não a cada tela."""
+    from core import acesso
+    from core.models import UsuarioLoja
+
+    with get_session() as session:
+        u = session.get(Usuario, usuario_id)
+        lojas = [ul.loja_id for ul in session.scalars(select(UsuarioLoja).where(UsuarioLoja.usuario_id == usuario_id))]
+        st.session_state["usuario_id"] = usuario_id
+        st.session_state["usuario_nivel"] = acesso.nivel_do_usuario(u.papel.value, u.nivel)
+        st.session_state["usuario_lojas"] = lojas
+
+
 def iniciar_sessao(usuario: Usuario, lembrar: bool) -> None:
     st.session_state["usuario_cnpj"] = usuario.cnpj_login
     st.session_state["usuario_papel"] = usuario.papel.value
     st.session_state["usuario_nome"] = usuario.nome_exibicao
+    _guardar_acesso(usuario.id)
 
     if lembrar:
         cm = _cookie_manager()
@@ -62,7 +77,8 @@ def iniciar_sessao(usuario: Usuario, lembrar: bool) -> None:
 
 
 def encerrar_sessao() -> None:
-    for chave in ("usuario_cnpj", "usuario_papel", "usuario_nome", "secao_ativa"):
+    for chave in ("usuario_cnpj", "usuario_papel", "usuario_nome", "usuario_id", "usuario_nivel", "usuario_lojas",
+                  "secao_ativa"):
         st.session_state.pop(chave, None)
     cm = _cookie_manager()
     cm.delete(_COOKIE_NAME, key="delete_remember_cookie")
@@ -95,20 +111,29 @@ def tentar_restaurar_sessao() -> bool:
         ).scalar_one_or_none()
         if usuario is None:
             return False
+        usuario_id = usuario.id
 
     st.session_state["usuario_cnpj"] = cnpj
     st.session_state["usuario_papel"] = papel
     st.session_state["usuario_nome"] = usuario.nome_exibicao
+    _guardar_acesso(usuario_id)
     return True
 
 
 def usuario_atual() -> dict | None:
     if "usuario_cnpj" not in st.session_state:
         return None
+    from core import acesso
+
     return {
         "cnpj": st.session_state["usuario_cnpj"],
         "papel": st.session_state["usuario_papel"],
         "nome": st.session_state["usuario_nome"],
+        "id": st.session_state.get("usuario_id"),
+        # Sessão aberta antes desta versão (sem nível guardado): deduz do papel.
+        "nivel": st.session_state.get("usuario_nivel")
+                 or acesso.nivel_do_usuario(st.session_state["usuario_papel"], None),
+        "lojas": st.session_state.get("usuario_lojas", []),
     }
 
 

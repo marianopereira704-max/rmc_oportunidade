@@ -219,6 +219,11 @@ def test_filtros_em_memoria():
     assert len(analise.filtrar(df, analise.Filtros(uf="SP"))) == 2
     assert len(analise.filtrar(df, analise.Filtros(busca="ems"))) == 1
     assert len(analise.filtrar(df, analise.Filtros(grupo_economico="G1", loja_ids=[2]))) == 2
+    # Corte de acesso (Comprador/Proprietário, 02/10/2026): vale sempre, mesmo
+    # com uma escolha de loja fora dele.
+    assert set(analise.filtrar(df, analise.Filtros(lojas_permitidas=(2,)))["loja_id"]) == {2}
+    assert analise.filtrar(df, analise.Filtros(lojas_permitidas=(2,), loja_ids=[1])).empty
+    assert analise.filtrar(df, analise.Filtros(lojas_permitidas=())).empty
 
 
 def test_por_loja_soma_economia_e_conta_genericos():

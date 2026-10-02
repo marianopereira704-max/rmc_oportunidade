@@ -62,6 +62,8 @@ _COLUNAS_ATUALIZADAS = [
     "razao_social", "uf", "cidade",
     "atendente_comercial", "consultor_farma", "consultor_interno",
     "fonte", "atualizado_em",
+    # Desde 27/09/2026, para o vínculo com a loja do GPS (pedido/vinculo.py).
+    "legacy_id", "endereco_numero", "bairro", "cep", "nome_fantasia",
 ]
 
 
@@ -80,6 +82,15 @@ def _campos_do_time(item: dict) -> tuple[dict[str, str | None], bool]:
             continue
         campos[campo] = pessoa.get("name")
     return campos, duplicou
+
+
+def _texto_curto(valor, limite: int) -> str | None:
+    """Texto limpo e cortado no tamanho da coluna — o número do endereço vem
+    como inteiro em parte do cadastro e com sufixo ("170-A") em outra."""
+    if valor is None:
+        return None
+    t = str(valor).strip()
+    return t[:limite] or None
 
 
 def _gravar_lojas_em_bloco(session, linhas: list[dict]) -> None:
@@ -157,6 +168,11 @@ class SistemaInternoLojasAdapter(IntegrationAdapter):
                 # origem.
                 "fonte": "sistema_interno",
                 "atualizado_em": dt.datetime.utcnow(),
+                "legacy_id": item.get("legacyId"),
+                "endereco_numero": _texto_curto(endereco.get("number"), 20),
+                "bairro": _texto_curto(endereco.get("neighborhood"), 120),
+                "cep": _texto_curto(endereco.get("zip_code"), 10),
+                "nome_fantasia": _texto_curto(item.get("fantasyName"), 200),
             }
 
         with get_session() as session:

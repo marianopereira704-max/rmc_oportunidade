@@ -10,10 +10,10 @@ import logging
 
 import streamlit as st
 
-from core import auth, monitoramento, theme
+from core import acesso, auth, monitoramento, theme
 from core.config import settings
 from core.db import get_session, init_db
-from views import dados, dashboard, login, oportunidade_loja, oportunidade_produto, pedido
+from views import config_pedido, dados, dashboard, login, loja_barra, oportunidade_loja, oportunidade_produto, pedido
 
 st.set_page_config(
     page_title=f"{settings.nome_fornecedor} Oportunidades",
@@ -72,35 +72,43 @@ if st.session_state.get("ip_streamlit_divergente") and not st.session_state.get(
 SECOES = [
     ("oportunidade_loja", "Por Loja", ":material/storefront:", "Análise de Oportunidade", oportunidade_loja.render, False),
     ("oportunidade_produto", "Por Produto", ":material/inventory_2:", "Análise de Oportunidade", oportunidade_produto.render, False),
-    ("pedido", "Pedido", ":material/shopping_cart:", "Gestão", pedido.render, False),
+    ("pedido", "Assistente de pedido", ":material/shopping_cart:", "Gestão", pedido.render, False),
     ("dashboard", "Dashboard", ":material/dashboard:", "Gestão", dashboard.render, False),
     ("dados", "Dados", ":material/folder:", "Administração", dados.render, True),  # só admin
+    ("config_pedido", "Configurações de Pedidos", ":material/tune:", "Administração", config_pedido.render, True),
 ]
 
-_apenas_admin_por_chave = {chave: apenas_admin for chave, _r, _i, _g, _fn, apenas_admin in SECOES}
+# Quem vê o quê: core/acesso.py (níveis ADM, Consultor, Comprador,
+# Proprietário). A última coluna de SECOES continua dizendo o que é da
+# Administração, pra leitura; a regra que vale é `acesso.pode_ver`.
+_nivel = usuario["nivel"]
+_ROTULO_NIVEL = {acesso.ADM: "Admin", acesso.CONSULTOR: "Consultor", acesso.COMPRADOR: "Comprador",
+                 acesso.PROPRIETARIO: "Proprietário"}
 
 if "secao_ativa" not in st.session_state:
-    st.session_state["secao_ativa"] = "oportunidade_loja"
+    st.session_state["secao_ativa"] = acesso.secao_inicial(_nivel)
 
 # Trava de acesso: nunca renderizar uma seção admin-only pra quem não é admin
 # — cobre tanto alguém digitando/injetando a chave quanto o caso real: um
 # admin estava na aba Dados, deu logout, um consultor logou na mesma sessão
 # do navegador, e sem essa checagem a última seção ativa (herdada do usuário
 # anterior) continuava sendo renderizada mesmo sem o botão dela na sidebar.
-if _apenas_admin_por_chave.get(st.session_state["secao_ativa"]) and not auth.is_admin():
-    st.session_state["secao_ativa"] = "oportunidade_loja"
+if not acesso.pode_ver(_nivel, st.session_state["secao_ativa"]):
+    st.session_state["secao_ativa"] = acesso.secao_inicial(_nivel)
 
 with st.sidebar:
     theme.marca_sidebar(
-        f"{settings.nome_fornecedor} Oportunidades", usuario["nome"], "Admin" if auth.is_admin() else "Consultor",
+        f"{settings.nome_fornecedor} Oportunidades", usuario["nome"], _ROTULO_NIVEL.get(_nivel, "Consultor"),
     )
+    # A loja vem primeiro e vale pra todas as telas (02/10/2026).
+    loja_barra.barra(usuario)
 
     _ultimo_grupo = None
-    for chave, rotulo, icone, grupo, _fn, apenas_admin in SECOES:
-        if apenas_admin and not auth.is_admin():
+    for chave, rotulo, icone, grupo, _fn, _admin in SECOES:
+        if not acesso.pode_ver(_nivel, chave):
             continue
         if grupo != _ultimo_grupo:
-            theme.nav_grupo_label(grupo, divisoria=_ultimo_grupo is not None)
+            theme.nav_grupo_label(grupo, divisoria=True)   # o grupo LOJA vem antes de todos
             _ultimo_grupo = grupo
         ativa = st.session_state["secao_ativa"] == chave
         with st.container():
@@ -115,6 +123,7 @@ with st.sidebar:
         if st.button("Sair", key="nav_sair", icon=":material/logout:", use_container_width=True):
             auth.encerrar_sessao()
             st.rerun()
+    loja_barra.atualizacao(loja_barra.escolha(usuario))
 
 _secoes_por_chave = {chave: fn for chave, _r, _i, _g, fn, _a in SECOES}
 _secoes_por_chave[st.session_state["secao_ativa"]]()

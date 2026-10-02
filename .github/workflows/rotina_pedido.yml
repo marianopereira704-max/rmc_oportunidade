@@ -1,0 +1,54 @@
+# Rotina de dados da aba Pedido: API do GPS → Spaces (pacote pedido/).
+# Carga inicial e atualização diária são o mesmo comando — ele baixa só o
+# que falta. Passo a passo das chaves e de como acompanhar: docs/rotina_pedido.md
+#
+# ATENÇÃO: o repositório é PÚBLICO, e os logs daqui também. A rotina não
+# imprime nome de loja, produto nem valor — só índices, períodos e tempos.
+# Os dados vão para o Spaces (privado), nunca para o git.
+
+name: Rotina Pedido (API do GPS)
+
+on:
+  schedule:
+    # 03:00 UTC = 00:00 em Brasília. O GPS atualiza os dados do dia por volta
+    # das 11h–12h; rodando à meia-noite, o dia anterior já está completo.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}  # botão "Run workflow" (carga inicial, reprocessar)
+
+# Nunca duas rodadas ao mesmo tempo: a segunda espera a primeira terminar.
+concurrency:
+  group: rotina-pedido
+  cancel-in-progress: false
+
+jobs:
+  coleta:
+    name: Parte ${{ matrix.parte }} de 4
+    runs-on: ubuntu-latest
+    # O GitHub corta em 6 h; a rotina para sozinha antes (PEDIDO_ORCAMENTO_MINUTOS)
+    # e a próxima execução continua de onde ela parou.
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        parte: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Coleta
+        run: python -m pedido --parte ${{ matrix.parte }} --partes 4
+        env:
+          RMC_IGNORAR_SECRETS: "1"
+          PEDIDO_ORCAMENTO_MINUTOS: "330"
+          GPS_API_BASE_URL: ${{ secrets.GPS_API_BASE_URL }}
+          GPS_API_KEY: ${{ secrets.GPS_API_KEY }}
+          DO_SPACES_ENDPOINT: ${{ secrets.DO_SPACES_ENDPOINT }}
+          DO_SPACES_REGION: ${{ secrets.DO_SPACES_REGION }}
+          DO_SPACES_BUCKET: ${{ secrets.DO_SPACES_BUCKET }}
+          DO_SPACES_ACCESS_KEY: ${{ secrets.DO_SPACES_ACCESS_KEY }}
+          DO_SPACES_SECRET_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+          SISTEMA_INTERNO_BASE_URL: ${{ secrets.SISTEMA_INTERNO_BASE_URL }}
+          SISTEMA_INTERNO_TOKEN: ${{ secrets.SISTEMA_INTERNO_TOKEN }}

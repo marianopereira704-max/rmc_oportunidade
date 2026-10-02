@@ -53,6 +53,9 @@ from core.sql import insert_ignorando_conflito
 ROTINA_SINCRONIZACAO_LOJAS = "sincronizacao_lojas"
 ROTINA_SINCRONIZACAO_GPS = "sincronizacao_gps"
 ROTINA_REPROCESSAMENTO_FILA_EAN = "reprocessamento_fila_ean"
+# Genéricos vendidos nas lojas (API do GPS) que faltam na Base Genéricos →
+# fila de EAN "Loja (API)" (integrations/fila_loja.py), uma vez por dia.
+ROTINA_FILA_EAN_LOJA_API = "fila_ean_loja_api"
 # Não é rotina diária: é a trava de "um processamento de planilha GPS por vez"
 # (ver `reivindicar_trava`/`liberar_trava`).
 ROTINA_UPLOAD_GPS = "upload_gps"

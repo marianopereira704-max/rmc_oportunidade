@@ -142,7 +142,7 @@ def faixa_laboratorio(key: str) -> str | None:
     return st.session_state.get(f"{key}_laboratorio")
 
 
-def filtros(key: str, laboratorio: str | None, exemplo_busca: str) -> analise.Filtros:
+def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None) -> analise.Filtros:
     """Linha de filtros; desabilitada (mas visível) enquanto não há
     laboratório, pra deixar claro que dependem dele.
 
@@ -150,9 +150,39 @@ def filtros(key: str, laboratorio: str | None, exemplo_busca: str) -> analise.Fi
     "Último mês"/"Últimos 3 meses" já dizem o que são). O rótulo continua lá,
     escondido (`hidden`, não `collapsed`): ocupa a mesma altura dos rótulos
     de UF/Atendente/Grupo, então os cinco campos ficam na mesma linha, e
-    leitor de tela ainda lê o nome do campo."""
+    leitor de tela ainda lê o nome do campo.
+
+    `escolha` (views/loja_barra.py, 02/10/2026): com UMA loja escolhida na
+    barra, ficam só busca e período (UF, atendente, grupo e "lojas
+    específicas" não fazem sentido pra uma loja); com "Todas", as opções
+    se limitam às lojas que o usuário pode ver."""
     opcoes = _opcoes_filtros()
     bloqueado = laboratorio is None
+    permitidas = escolha.permitidas if escolha is not None else None
+    uma = escolha.loja if escolha is not None else None
+    if uma is not None:
+        # "collapsed": sem UF/Atendente/Grupo (de rótulo visível) ao lado, o
+        # rótulo escondido só deixava um vão acima dos dois campos.
+        f1, f5 = st.columns([5.2, 1.2])
+        with f1:
+            busca = st.text_input("Buscar", placeholder=exemplo_busca, key=f"{key}_busca", disabled=bloqueado,
+                                  label_visibility="collapsed")
+        with f5:
+            periodo = st.selectbox(
+                "Período", options=settings.periodos_meses_opcoes, format_func=rotulo_periodo,
+                key=f"{key}_periodo", disabled=bloqueado, label_visibility="collapsed",
+            )
+        return analise.Filtros(laboratorio=laboratorio, periodo_meses=periodo, busca=busca or None,
+                               loja_ids=[uma["id"]], lojas_permitidas=permitidas)
+    lojas_opcoes = opcoes["lojas"]
+    if permitidas is not None:
+        # Só o que existe nas lojas do usuário (Proprietário com "Todas").
+        lojas_opcoes = [l for l in lojas_opcoes if l["id"] in set(permitidas)]
+        opcoes = {
+            "ufs": sorted({l["uf"] for l in lojas_opcoes if l.get("uf")}),
+            "atendentes": sorted({l["atendente_comercial"] for l in lojas_opcoes if l.get("atendente_comercial")}),
+            "grupos": sorted({l["grupo_economico"] for l in lojas_opcoes if l.get("grupo_economico")}),
+        }
     f1, f2, f3, f4, f5 = st.columns([2.2, 1, 1.4, 1.6, 1.2])
     with f1:
         busca = st.text_input(
@@ -176,13 +206,13 @@ def filtros(key: str, laboratorio: str | None, exemplo_busca: str) -> analise.Fi
     loja_ids = None
     if not bloqueado:
         with st.expander("Selecionar lojas específicas (opcional)"):
-            mapa = {f"{l['razao_social']} · {ui.formatar_cnpj(l['cnpj'])}": l["id"] for l in opcoes["lojas"]}
+            mapa = {f"{l['razao_social']} · {ui.formatar_cnpj(l['cnpj'])}": l["id"] for l in lojas_opcoes}
             selecionadas = st.multiselect("Lojas", options=list(mapa.keys()), key=f"{key}_lojas")
             loja_ids = [mapa[s] for s in selecionadas] or None
     return analise.Filtros(
         laboratorio=laboratorio, periodo_meses=periodo, uf=None if uf == _TODAS else uf, busca=busca or None,
         atendente_comercial=None if atendente == _TODOS else atendente,
-        grupo_economico=None if grupo == _TODOS else grupo, loja_ids=loja_ids,
+        grupo_economico=None if grupo == _TODOS else grupo, loja_ids=loja_ids, lojas_permitidas=permitidas,
     )
 
 
@@ -201,13 +231,17 @@ def rotulo_meses(meses: list[str]) -> str:
     return f"{fmt(inicio, inicio[:4] != fim[:4])}–{fmt(fim)}"
 
 
-def indicadores(visao: str, linhas: pd.DataFrame, laboratorio: str, filtros_: analise.Filtros) -> None:
+def indicadores(visao: str, linhas: pd.DataFrame, laboratorio: str, filtros_: analise.Filtros,
+                uma_loja: bool = False) -> None:
     """Cards do topo, sobre o resultado JÁ filtrado (busca, UF, lojas…). A
     seta compara com o período anterior de mesmo tamanho, com os mesmos
     filtros; sem os meses anteriores carregados, não há seta.
 
     `visao` = "loja" ou "produto": muda a ordem e a média (por loja × por
-    produto) — cada tela abre pelo número do seu próprio assunto."""
+    produto) — cada tela abre pelo número do seu próprio assunto.
+
+    `uma_loja` (Por Produto com uma loja na barra, Q9 de 02/10/2026): o card
+    de lojas ("1 de 1") dá lugar a "Preço acima do laboratório"."""
     atual = analise.indicadores(linhas)
     anterior, meses_ant = None, None
     pacote = resultado_anterior(laboratorio, filtros_.periodo_meses)
@@ -237,6 +271,16 @@ def indicadores(visao: str, linhas: pd.DataFrame, laboratorio: str, filtros_: an
         "label": "Produtos com oportunidade", "sub": f"de {ui.formatar_numero(atual.produtos_analisados)} analisados",
         "variacao": var("produtos_com_oportunidade"), "dica_variacao": dica,
     }
+    if uma_loja:
+        def acima(df: pd.DataFrame) -> int:
+            return int((pd.to_numeric(df["diferenca"], errors="coerce") > 0).sum()) if not df.empty else 0
+        n_acima = acima(linhas)
+        ant_acima = acima(analise.filtrar(pacote[0], filtros_)) if pacote is not None else None
+        lojas = {
+            "icone": "alerta", "tom": "azul", "valor": ui.formatar_numero(n_acima),
+            "label": "Preço acima do laboratório", "sub": f"de {ui.formatar_numero(len(linhas))} comprados",
+            "variacao": analise.variacao(n_acima, ant_acima) if ant_acima is not None else None, "dica_variacao": dica,
+        }
     if visao == "loja":
         media = {
             "icone": "media", "tom": "azul", "valor": moeda_ou_traco(atual.economia_media_loja),

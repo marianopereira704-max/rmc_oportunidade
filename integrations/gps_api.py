@@ -311,6 +311,20 @@ class ClienteGpsApi:
             params["dataFim"] = data_fim.isoformat()
         yield from self._paginar(f"/api/v1/empresas/{id_empresa}/compras", params)
 
+    def listar_vendas_loja(self, id_empresa: str, codigo_loja: str, data_inicio: dt.date, data_fim: dt.date) -> Iterator[dict]:
+        """Vendas item a item de uma loja. Só existe por loja (não há rota de
+        vendas da empresa). Janela de no máximo 1 mês: 3 meses passaram de
+        8 min na MEGA FARMA (medido em 26/09/2026)."""
+        params = {"dataInicio": data_inicio.isoformat(), "dataFim": data_fim.isoformat()}
+        yield from self._paginar(f"/api/v1/empresas/{id_empresa}/lojas/{codigo_loja}/vendas", params)
+
+    def listar_estoque_empresa(self, id_empresa: str) -> Iterator[dict]:
+        """Estoque de TODAS as lojas da empresa, uma linha por (loja,
+        produto do cadastro) — inclusive os de estoque zero: os filtros
+        `produtivo`/`permiteCompra` são ignorados pela API (testado em
+        26/09/2026). Pela empresa é ~3× mais rápido por linha que pela loja."""
+        yield from self._paginar(f"/api/v1/empresas/{id_empresa}/estoque")
+
 
 @dataclass
 class ColetaCompras:
