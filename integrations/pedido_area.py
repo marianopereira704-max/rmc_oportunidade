@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import datetime as dt
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
+from core.config import settings
 from core.models import AreaPedido, AreaPedidoEstado, AvisoPedidoVisto, ExportacaoPedido, ListaPedido, ListaPedidoItem
 from core.sql import insert_com_atualizacao
 
@@ -89,6 +91,29 @@ def marcar(session: Session, usuario_id: int, loja_id: int, marcacoes: dict[str,
     if marcacoes:
         _gravar(session, usuario_id, loja_id,
                 [{"linha": l, "selecionado": bool(v)} for l, v in marcacoes.items()], ["selecionado"])
+
+
+# Mesmas regras de `alterar_quantidade`/`marcar`, sem banco (02/10/2026): a
+# tela guarda a área na sessão e, depois de gravar, atualiza a cópia com isto
+# em vez de reler o banco a cada clique. O teste confere que as duas dão o
+# mesmo resultado.
+
+def com_quantidade(itens: dict[str, ItemArea], linha: str, quantidade: int, sugestao: int) -> dict[str, ItemArea]:
+    novo = dict(itens)
+    item = ItemArea(None if quantidade == sugestao else int(quantidade), None)
+    if item.quantidade is None and item.selecionado is None:
+        novo.pop(linha, None)
+    else:
+        novo[linha] = item
+    return novo
+
+
+def com_marcacoes(itens: dict[str, ItemArea], marcacoes: dict[str, bool]) -> dict[str, ItemArea]:
+    novo = dict(itens)
+    for linha, valor in marcacoes.items():
+        anterior = novo.get(linha)
+        novo[linha] = ItemArea(anterior.quantidade if anterior else None, bool(valor))
+    return novo
 
 
 def descartar(session: Session, usuario_id: int, loja_id: int) -> int:
@@ -178,18 +203,30 @@ def ao_exportar(session: Session, usuario_id: int, loja_id: int) -> str | None:
     return nome
 
 
-def avisos(session: Session, usuario_id: int, usuario_nome: str, loja_id: int, hoje: dt.date) -> list[str]:
+def _de_brasilia(momento_utc: dt.datetime) -> dt.datetime:
+    return momento_utc.replace(tzinfo=dt.timezone.utc).astimezone(ZoneInfo(settings.pedido.fuso))
+
+
+def avisos(session: Session, usuario_id: int, usuario_nome: str, loja_id: int, hoje: dt.date,
+           listas_da_loja: list[ResumoLista] | None = None) -> list[str]:
     """Contra pedido duplicado: listas de OUTRAS pessoas desta loja e
-    exportações de hoje feitas por outras pessoas."""
+    exportações de hoje feitas por outras pessoas. `listas_da_loja`: as que
+    a tela já leu — sem isso, as listas eram lidas duas vezes por clique.
+
+    `hoje` é o dia de BRASÍLIA, e os horários saem em Brasília (02/10/2026):
+    antes saíam em UTC (3 h à frente), e depois das 21 h o "hoje" em UTC já
+    era amanhã — uma exportação das 20 h deixava de avisar."""
     saida = []
-    for l in listas(session, loja_id):
+    for l in (listas(session, loja_id) if listas_da_loja is None else listas_da_loja):
         if l.criado_por_id != usuario_id:
-            saida.append(f"{l.criado_por} tem a lista \"{l.nome}\" desta loja ({l.criado_em:%d/%m %H:%M} UTC).")
-    inicio = dt.datetime.combine(hoje, dt.time())
+            saida.append(f"{l.criado_por} tem a lista \"{l.nome}\" desta loja "
+                         f"({_de_brasilia(l.criado_em):%d/%m às %H:%M}).")
+    inicio = (dt.datetime.combine(hoje, dt.time(), tzinfo=ZoneInfo(settings.pedido.fuso))
+              .astimezone(dt.timezone.utc).replace(tzinfo=None))
     for e in session.scalars(select(ExportacaoPedido).where(ExportacaoPedido.loja_id == loja_id,
                                                            ExportacaoPedido.exportado_em >= inicio)):
         if e.exportado_por != usuario_nome:
-            saida.append(f"{e.exportado_por} exportou um pedido desta loja hoje às {e.exportado_em:%H:%M} (UTC).")
+            saida.append(f"{e.exportado_por} exportou um pedido desta loja hoje às {_de_brasilia(e.exportado_em):%H:%M}.")
     return saida
 
 

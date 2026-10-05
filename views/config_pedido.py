@@ -28,7 +28,7 @@ _ROTULOS = {
     "dias_medicamento": "Dias de estoque — medicamento",
     "dias_perfumaria": "Dias de estoque — perfumaria",
     "dias_por_categoria": "Dias por categoria",
-    "piso_maximo": "Piso do estoque máximo",
+    "piso_maximo": "Piso do estoque ideal",
     "dias_ruptura": "Dias da ruptura próxima",
     "ruptura_unidades": "Ruptura (unidades)",
     "dias_sem_classificacao": "Dias para Sem Classificação",
@@ -42,6 +42,7 @@ _ROTULOS = {
     "custo_faixa_min": "Custo coerente (mínimo)",
     "custo_faixa_max": "Custo coerente (máximo)",
     "fator_cadastro_nota": "Cadastro × nota",
+    "venda_pontual": "Venda pontual",
 }
 _SECOES = {"padrao": "Padrão de todas as lojas", "loja": "Personalização por loja"}
 
@@ -106,11 +107,11 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
         return f"{texto} · padrão {str(valor_padrao).replace('.', ',')}"
 
     with st.form(f"config_pedido_{chave}"):
-        theme.titulo_secao("Estoque máximo (quanto pedir)")
+        theme.titulo_secao("Estoque ideal (quanto pedir)")
         _explicacao(
-            "quantos dias de venda o pedido + o estoque devem cobrir. A sugestão é o máximo menos o estoque atual.",
-            "máximo = demanda por dia × dias, arredondado para cima. Ex.: vende 2 por dia, medicamento com "
-            f"{c.dias_medicamento} dias → máximo {2 * c.dias_medicamento}.",
+            "quantos dias de venda o pedido + o estoque devem cobrir. A sugestão é o ideal menos o estoque atual.",
+            "ideal = demanda por dia × dias, arredondado para cima. Ex.: vende 2 por dia, medicamento com "
+            f"{c.dias_medicamento} dias → ideal {2 * c.dias_medicamento}.",
         )
         a1, a2, a3, a4 = grade(4)
         p = padrao or c
@@ -122,9 +123,9 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
                                    c.dias_sem_classificacao, step=1, key=f"{chave}_sem",
                                    help="Dias estimados para produto sem categoria: ele recebe sugestão com a tag "
                                         "\"Sem Classificação\" até alguém classificar (Dados → Pendências).")
-        piso = a4.number_input(rotulo("Piso do máximo (unidades)", p.piso_maximo), 0, 1000, c.piso_maximo, step=1,
+        piso = a4.number_input(rotulo("Piso do ideal (unidades)", p.piso_maximo), 0, 1000, c.piso_maximo, step=1,
                                key=f"{chave}_piso",
-                               help="Menor máximo possível para um produto que vendeu na janela. Com 1, quem "
+                               help="Menor ideal possível para um produto que vendeu na janela. Com 1, quem "
                                     "vendeu pelo menos uma vez fica com ao menos 1 unidade na loja.")
         st.caption("Dias próprios de uma categoria (opcional). Em branco = dias do grupo dela."
                    + (" A coluna Padrão mostra os dias que valem sem personalização." if loja else ""))
@@ -151,18 +152,26 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
         theme.titulo_secao("Giro baixo")
         _explicacao(
             "produto que quase não vende. Ganha o selo \"Giro baixo\" e o filtro \"Ocultar giro baixo\" o tira do pedido.",
-            "giro baixo quando vendeu no máximo estas unidades nestes últimos dias.",
+            "giro baixo quando vendeu no máximo estas unidades nestes últimos dias. A curva ABC usa os mesmos dias.",
         )
         g1, g2, _ = grade(3)
         giro_dias = g1.number_input(rotulo("Últimos dias", p.giro_baixo_dias), 7, 365, c.giro_baixo_dias, step=1,
                                     key=f"{chave}_girod")
         giro_unidades = g2.number_input(rotulo("No máximo (unidades)", p.giro_baixo_max_unidades), 0.0, 1000.0,
                                         float(c.giro_baixo_max_unidades), step=1.0, key=f"{chave}_girou")
+        venda_pontual = st.checkbox(
+            rotulo("Venda pontual: giro baixo de curva A ou B fica na lista, desmarcado",
+                   "ligado" if p.venda_pontual else "desligado"),
+            value=c.venda_pontual, key=f"{chave}_pontual",
+            help="Produto que vendeu pouco, mas de valor alto (ex.: 1 unidade de um remédio de R$ 1.000). Em vez de "
+                 "\"Giro baixo\", ganha a tag \"Venda pontual\": aparece mesmo com \"Ocultar giro baixo\" ligado, "
+                 "mas vem desmarcado — só vai no pedido se o usuário marcar.")
 
         theme.titulo_secao("Curva ABC")
         _explicacao(
             "a importância do produto na loja, em duas letras: a 1ª pelo valor vendido, a 2ª pelas unidades.",
-            "A = os produtos que somam os primeiros % da venda; B = os % seguintes; C = o resto.",
+            "A = os produtos que somam os primeiros % da venda; B = os % seguintes; C = o resto. "
+            "Conta a venda dos mesmos últimos dias do giro baixo.",
         )
         k1, k2, k3 = grade(3)
         curva_a = k1.number_input(rotulo("A (%)", round(p.curva_a * 100)), 1, 98, round(c.curva_a * 100), step=1,
@@ -229,9 +238,10 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
         dias_medicamento=int(dias_medicamento), dias_perfumaria=int(dias_perfumaria), dias_por_categoria=proprios,
         piso_maximo=int(piso), dias_ruptura=int(dias_ruptura), giro_baixo_dias=int(giro_dias),
         giro_baixo_max_unidades=float(giro_unidades), curva_a=curva_a / 100, curva_b=curva_b / 100,
-        meses_fechados=int(meses), tolerancia_preco=c.tolerancia_preco, ruptura_unidades=int(ruptura_unidades),
+        meses_fechados=int(meses), ruptura_unidades=int(ruptura_unidades),
         dias_sem_classificacao=int(dias_sem), fator_preco_fora=float(fator), custo_faixa_min=faixa_min / 100,
         custo_faixa_max=faixa_max / 100, fator_cadastro_nota=float(cadastro_nota),
+        venda_pontual=bool(venda_pontual),
     )
     erros += nova.erros()
     if erros:

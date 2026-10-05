@@ -116,14 +116,11 @@ SELETORES_STREAMLIT: dict[str, tuple[str, str]] = {
     # Grudar esta camada, cujo pai é a página inteira (medido 29/09/2026).
     "envoltorio_layout": ('div[data-testid="stLayoutWrapper"]', "por_loja"),
     "bloco_horizontal": ('div[data-testid="stHorizontalBlock"]', "por_loja"),
-    # Assistente de pedido (01/10/2026) — nomes conferidos no DOM do 1.62:
-    # o diálogo é uma <section role="dialog"> dentro de div[stDialog]; a
+    # Assistente de pedido (01/10/2026) — nome conferido no DOM do 1.62: a
     # pílula não tem data-testid, só data-variant (marcada = aria-checked na
-    # escolha única, aria-pressed na múltipla).
-    "dialogo": ('div[data-testid="stDialog"] section[role="dialog"]', "pedido_alerta"),
+    # escolha única, aria-pressed na múltipla). Os seletores do pop-up de
+    # filtros (diálogo, campo de texto, caixa do multiselect) saíram com ele.
     "pilula": ('button[data-variant="pills"]', "pedido_parametros"),
-    "campo_texto": ('div[data-testid="stTextInputRootElement"]', "pedido_loja"),
-    "caixa_multiselect": ('div[data-testid="stMultiSelect"] .react-aria-ComboBox', "pedido_loja"),
     # Texto digitado/de exemplo dos campos (01/10/2026): o Streamlit usa
     # 0,875 × a base = 12,25px, fora da escala e MENOR que o rótulo.
     "campo_entrada": ('[data-testid="stTextInputField"], [data-testid="stNumberInputField"], '
@@ -309,6 +306,19 @@ def _construir_css() -> str:
     border-radius: var(--raio);
     font-weight: 700;
 }}
+
+/* === BARRA LATERAL SEM CONTORNO NOS INATIVOS (02/10/2026) — bloco isolado:
+   pra voltar ao visual anterior (todos com contorno), apagar só daqui até
+   "FIM DA BARRA SEM CONTORNO". O ativo continua verde cheio; os inativos
+   ficam só ícone e texto, com um fundo leve ao passar o mouse. === */
+{sidebar} {nav} {botao} {{
+    border-color: transparent;
+}}
+{sidebar} {nav} {botao}:hover {{
+    background: rgba(255, 255, 255, 0.08);
+    border-color: transparent;
+}}
+/* === FIM DA BARRA SEM CONTORNO === */
 
 /* Botão padrão (fora da sidebar): navy preenchido, texto branco. */
 {botao} {{
@@ -538,7 +548,7 @@ def _construir_css() -> str:
    verde só na borda esquerda. Altura mínima fixa: com ou sem o seletor
    (sem laboratório cadastrado), a faixa tem a mesma altura. */
 /* A faixa da Loja (tela Pedido) é a mesma peça, com o mesmo papel. */
-div[class*="st-key-faixa-laboratorio"], div[class*="st-key-faixa-loja"] {{
+div[class*="st-key-faixa-laboratorio"] {{
     background: #FFFFFF;
     border: 1px solid var(--borda);
     border-left: 4px solid var(--verde);
@@ -623,11 +633,20 @@ div[class*="st-key-rodape-pedido"] {botao}[kind="secondary"]:hover {{ background
 div[class*="st-key-rodape-pedido"] {botao}[kind="secondary"]:disabled {{
     background: #FFFFFF; color: var(--texto-muted); border-color: var(--borda);
 }}
+/* Tabela do Assistente: divisória entre as linhas mais clara (02/10/2026) —
+   a variável atravessa o componente da tabela (views/tabela.py). */
+div[class*="st-key-tela-pedido"] {{ --borda-linha: #EEF0F3; }}
+/* ✓ do "Salvo automaticamente": verde apagado, nada que chame atenção. */
+.rmc-salvo {{ color: #8FB27A; font-weight: 600; }}
 /* Linha de filtros: a busca leva a maior parte; o toggle, o que precisa. */
 div[class*="st-key-pedido-filtros-linha"] > div {{ min-width: 0; }}
-div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_busca"] {{ flex: 1.6 1 0; }}
+/* Larguras (05/10/2026, pedido do Mariano): proporção 187 · 187 · 157 · 187
+   (busca, Categoria, Status, Fabricante) sobre o que sobra depois do
+   interruptor (150 px) e dos vãos — a mesma proporção em 1280 e 1920 px. */
+div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_busca"],
 div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_cat_"],
-div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_fab_"] {{ flex: 1 1 0; }}
+div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_fab_"] {{ flex: 187 1 0; }}
+div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_status_"] {{ flex: 157 1 0; }}
 div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_giro"] {{ flex: none; }}
 
 /* === RODAPÉ FIXO DO PEDIDO (29/09/2026) — bloco isolado: se precisar

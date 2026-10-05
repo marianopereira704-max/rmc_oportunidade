@@ -171,7 +171,6 @@ class PedidoConfig:
     giro_baixo_max_unidades: float = field(default_factory=lambda: float(_get("PEDIDO_GIRO_BAIXO_MAX_UNIDADES", "1")))
     curva_a: float = field(default_factory=lambda: float(_get("PEDIDO_CURVA_A", "0.5")))
     curva_b: float = field(default_factory=lambda: float(_get("PEDIDO_CURVA_B", "0.4")))
-    tolerancia_preco: float = field(default_factory=lambda: float(_get("PEDIDO_TOLERANCIA_PRECO", "0.5")))
 
 
 @dataclass

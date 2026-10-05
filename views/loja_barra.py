@@ -130,6 +130,25 @@ def _hora_local(texto: str) -> dt.datetime | None:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def marcador_estoque(empresa: str | None) -> dict | None:
+    """O marcador da foto de estoque da empresa ({"data", "gerado_em"}),
+    conferido no Spaces no máximo a cada 5 min. Usado aqui (texto de
+    atualização) e no Assistente (chave do cálculo da loja)."""
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    if not empresa:
+        return None
+    try:
+        armaz, chaves = do_ambiente(), Chaves(settings.pedido.prefixo)
+        if not armaz.existe(chaves.marcador_estoque(empresa)):
+            return None
+        return armaz.ler_json(chaves.marcador_estoque(empresa))
+    except Exception:  # noqa: BLE001 — sem Spaces/arquivo: sem marcador
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def _gps(empresa: str | None) -> str | None:
     """Da empresa da loja: quando o estoque foi baixado (marcador da rotina,
     com `gerado_em` desde 29/09/2026; antes só a data). Sem loja ("Todas"):
@@ -140,9 +159,9 @@ def _gps(empresa: str | None) -> str | None:
     try:
         armaz, chaves = do_ambiente(), Chaves(settings.pedido.prefixo)
         if empresa:
-            if not armaz.existe(chaves.marcador_estoque(empresa)):
+            marcador = marcador_estoque(empresa)
+            if not marcador:
                 return None
-            marcador = armaz.ler_json(chaves.marcador_estoque(empresa))
             momento = _hora_local(marcador.get("gerado_em"))
             if momento:
                 return f"{momento:%d/%m/%y} às {momento:%H:%M}"

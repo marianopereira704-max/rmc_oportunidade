@@ -651,9 +651,9 @@ class ConfiguracaoPedido(Base):
 # da Base Genéricos, "P<código>" para um produto do cadastro da loja.
 
 class RascunhoPedido(Base):
-    """Quantidade digitada pelo usuário no lugar da sugestão — rascunho DA
-    LOJA (quem abrir a loja vê), com quem e quando alterou. Fica até alguém
-    descartar: exportar não apaga (dá pra exportar de novo)."""
+    """SEM USO desde 29/09/2026: o "rascunho da loja" da Fase 5 virou a área
+    de trabalho por usuário + loja (`AreaPedido`). O modelo fica porque a
+    tabela existe (migração 0009) e o teste de migrações compara as duas."""
     __tablename__ = "rascunhos_pedido"
     __table_args__ = (UniqueConstraint("loja_id", "linha", name="uq_rascunho_loja_linha"),)
 
@@ -798,8 +798,9 @@ class PersonalizacaoPedidoLoja(Base):
 class FiltroSalvoPedido(Base):
     """"Meus filtros" do pop-up do Pedido: pessoais (usuário) e de cada
     loja, no máximo 8 por usuário + loja. SEM USO desde 01/10/2026: o pop-up
-    de filtros saiu (Assistente de pedido) e o módulo foi apagado; a tabela
-    fica porque migração não apaga tabela enquanto o `main` está atrasado.
+    de filtros saiu (Assistente de pedido) e o módulo foi apagado. O modelo
+    fica porque a tabela existe (migração 0012) e o teste de migrações
+    compara as duas.
     `filtros` = JSON de pedido/calculo.Filtros.para_dict()."""
     __tablename__ = "pedido_filtro_salvo"
     __table_args__ = (UniqueConstraint("usuario_id", "loja_id", "nome", name="uq_pedido_filtro_salvo"),)

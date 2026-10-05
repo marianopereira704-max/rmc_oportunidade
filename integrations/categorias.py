@@ -203,9 +203,14 @@ def versao(session: Session) -> tuple[int, str]:
     return int(total or 0), str(ultima or "")
 
 
-def tabela(session: Session) -> pd.DataFrame:
+def tabela(session: Session, com_origem: bool = True) -> pd.DataFrame:
     """A base inteira: ean, categoria, origem (categorias como `category`:
-    ~235 mil linhas ficam em poucos MB)."""
+    ~235 mil linhas ficam em poucos MB). `com_origem=False` (Assistente de
+    pedido, que só usa ean + categoria): 825 ms em vez de 1.470 na carga
+    (medido em 02/10/2026 — a conversão da origem linha a linha era o grosso)."""
+    if not com_origem:
+        linhas = session.execute(select(CategoriaEan.ean, CategoriaEan.categoria)).all()
+        return pd.DataFrame(linhas, columns=["ean", "categoria"]).astype({"categoria": "category"})
     linhas = session.execute(select(CategoriaEan.ean, CategoriaEan.categoria, CategoriaEan.origem)).all()
     # O nome (FEBRAFAR), não o valor (febrafar) — convertido ANTES do
     # DataFrame: o pandas transforma o enum (subclasse de str) no valor.

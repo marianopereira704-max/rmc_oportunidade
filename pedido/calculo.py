@@ -24,7 +24,19 @@ do cadastro da loja.
   eram um só ("≤ 3 dias"): 354 das 374 linhas da Hudson, maior que os 303
   itens com sugestão, e o card não fechava a conta.
 - Giro baixo = no máximo 1 unidade vendida nos últimos 90 dias.
-- Curva ABC em duas letras: valor vendido e unidades, cortes 50/40/10.
+- Curva ABC em duas letras: valor vendido e unidades, cortes 50/40/10, no
+  MESMO período do giro baixo (os últimos N dias, `giro_baixo_dias`) — desde
+  05/10/2026. Antes a curva olhava a janela inteira (~118 dias na foto de
+  27/09) e o giro só os 90 dias: o AAS Protect da Hudson, com uma venda única
+  de 80 un. em 24/06 e nada depois, saía curva AA e giro baixo ao mesmo tempo
+  (52 produtos AA/AB/BA/BB em giro baixo na Hudson).
+- Venda pontual (05/10/2026): giro baixo com a 1ª letra da curva A ou B
+  (vendeu 1 unidade, mas de valor alto — Poviztra R$ 1.000, Xarelto) deixa de
+  ser "Giro baixo": ganha a tag verde "Venda pontual", aparece mesmo com
+  "Ocultar giro baixo", vem DESMARCADO (só vai no pedido se o usuário marcar
+  ou digitar a quantidade), sem tag Ruptura e fora do card Ruptura, e fica no
+  fim da ordem padrão. ~90 a 100 por loja, todos com estoque zero
+  (R$ 7–12 mil se todos fossem marcados). Desliga nas Configurações.
 - Preço (só no Pedido — a Análise de Oportunidade continua no menor preço) =
   a ÚLTIMA compra não bonificada: é o preço que a loja consegue com mais
   frequência. VlrUnitario × (1 − desconto%) ÷ Fracao, por unidade, sem ST.
@@ -43,6 +55,14 @@ do cadastro da loja.
   10 de 3.332; a faixa resolveu 9 desses 10 (display comprado sem fração na
   nota — Maskaclets R$ 79,49 = 30 × R$ 2,65 do cadastro; seringa cadastrada
   pela caixa de 100). O custo normal fica entre 22% e 79% do preço de venda.
+- Acima do preço de venda (02/10/2026): se, depois de tudo isso, o preço
+  ainda passa do preço de venda (a loja "compraria mais caro do que vende"),
+  vale a nota mais recente que fique dentro da faixa coerente; o item fica
+  "A revisar". Pega o caso em que nota E cadastro estão por caixa (Kinder Joy
+  R$ 128,11 com venda a R$ 13,00 → R$ 8,01). Testado nas 4 lojas com dados:
+  9 correções na Hudson, todas plausíveis, nenhuma nas outras; custo no
+  cálculo desprezível. Versões mais largas ("a nota mais recente coerente
+  sempre vence") erraram casos que já estavam certos.
 """
 from __future__ import annotations
 
@@ -63,17 +83,24 @@ RUPTURA_PROXIMA = "Ruptura próxima"
 CORRIGIDO = "Estoque corrigido"
 SEM_CLASSIFICACAO = "Sem Classificação"
 GIRO_BAIXO = "Giro baixo"
+VENDA_PONTUAL = "Venda pontual"
 ALTERADO = "Alterado à mão"
-TAGS_STATUS = [NEGATIVO, RUPTURA, RUPTURA_PROXIMA, CORRIGIDO, SEM_CLASSIFICACAO, GIRO_BAIXO, ALTERADO]
-# Tags de preço (embaixo do preço, na coluna Última compra).
+# "A revisar" é tag de SITUAÇÃO desde 02/10/2026 (antes ficava embaixo do
+# preço, competindo com "custo ajustado"): a primeira da coluna Status — é o
+# que sobe a linha pro topo da tabela.
+A_REVISAR = "A revisar"
+TAGS_STATUS = [A_REVISAR, NEGATIVO, RUPTURA, RUPTURA_PROXIMA, CORRIGIDO, SEM_CLASSIFICACAO, GIRO_BAIXO,
+               VENDA_PONTUAL, ALTERADO]
+# Marcas de preço (texto miúdo embaixo do preço, na coluna Última compra).
+# "custo ajustado" não é marca: vai na dica do preço (02/10/2026).
 BONIFICADO = "Bonificado"
-A_REVISAR = "a revisar"
 CUSTO_CADASTRO = "custo de cadastro"
 CUSTO_AJUSTADO = "custo ajustado"
 # Por que o item está "a revisar" (coluna revisar_motivo, pra dica da tela).
 MOTIVO_COMPRA = "compra"            # compra fora do padrão das compras da loja
 MOTIVO_DIVERGENCIA = "divergencia"  # cadastro × nota divergem e a faixa não decide
 MOTIVO_CADASTRO = "cadastro"        # sem compra e cadastro fora da faixa
+MOTIVO_ACIMA_VENDA = "acima_venda"  # a nota passava do preço de venda e foi trocada por uma coerente
 
 
 @dataclass(frozen=True)
@@ -88,7 +115,6 @@ class Parametros:
     giro_baixo_max_unidades: float = 1
     curva_a: float = 0.50
     curva_b: float = 0.40
-    tolerancia_preco: float = 0.50        # não usado desde 29/09/2026 (ver fator_preco_fora)
     limite_bonificacao: float = 0.10
     dias_por_categoria: tuple = ()
     piso_maximo: int = 1
@@ -98,6 +124,7 @@ class Parametros:
     custo_faixa_min: float = 0.15         # custo coerente: entre min e max × preço de venda
     custo_faixa_max: float = 1.0
     fator_cadastro_nota: float = 2.0      # cadastro × nota divergem acima disso → a faixa decide
+    venda_pontual: bool = True            # giro baixo de curva A/B vira "Venda pontual" (desmarcado)
 
 
 def _teto(valor: float) -> int:
@@ -196,6 +223,7 @@ def calcular(pronto: Pronto, base_categorias: pd.DataFrame, genericos: pd.DataFr
         "valor": v.groupby("linha")["valor"].sum(),
     })
     por_linha["unidades_90d"] = v90.groupby("linha")["unidades"].sum().reindex(por_linha.index).fillna(0)
+    por_linha["valor_90d"] = v90.groupby("linha")["valor"].sum().reindex(por_linha.index).fillna(0)
     # Coluna "Venda 90 dias" da tela (01/10/2026): só exibição — "vendeu 15 em
     # 90 dias" se entende melhor que "0,17 por dia". Fixa em 90, separada do
     # giro baixo (que tem os dias configuráveis); o cálculo segue na janela.
@@ -264,10 +292,17 @@ def calcular(pronto: Pronto, base_categorias: pd.DataFrame, genericos: pd.DataFr
     por_linha["sugestao"] = np.where(por_linha["listar"], np.ceil(falta - 1e-9), 0).astype(int)
     por_linha["ruptura"] = por_linha["estoque"] <= p.ruptura_unidades
     por_linha["ruptura_proxima"] = ~por_linha["ruptura"] & (por_linha["estoque"] <= por_linha["demanda_dia"] * p.dias_ruptura)
-    por_linha["giro_baixo"] = por_linha["unidades_90d"] <= p.giro_baixo_max_unidades
-    por_linha["curva_valor"] = _curva(por_linha["valor"], p.curva_a, p.curva_b)
-    por_linha["curva_unidades"] = _curva(por_linha["unidades"], p.curva_a, p.curva_b)
+    giro_baixo = por_linha["unidades_90d"] <= p.giro_baixo_max_unidades
+    # Curva no período do giro baixo (regra no topo do módulo).
+    por_linha["curva_valor"] = _curva(por_linha["valor_90d"], p.curva_a, p.curva_b)
+    por_linha["curva_unidades"] = _curva(por_linha["unidades_90d"], p.curva_a, p.curva_b)
     por_linha["curva"] = por_linha["curva_valor"] + por_linha["curva_unidades"]
+    # Venda pontual (regra no topo do módulo): sai do giro baixo e da ruptura.
+    pontual = giro_baixo & por_linha["curva_valor"].isin(["A", "B"]) & p.venda_pontual
+    por_linha["venda_pontual"] = pontual
+    por_linha["giro_baixo"] = giro_baixo & ~pontual
+    por_linha["ruptura"] &= ~pontual
+    por_linha["ruptura_proxima"] &= ~pontual
 
     # -- compra de referência ----------------------------------------------------------
     c = compras.assign(linha=compras["codigo_produto"].map(linha_do_produto))
@@ -288,6 +323,7 @@ def calcular(pronto: Pronto, base_categorias: pd.DataFrame, genericos: pd.DataFr
     por_linha["preco_origem"] = np.where(sem_compra, np.where(por_linha["custo_cadastro"] > 0, "cadastro", "sem"), "compra")
     por_linha["laboratorio"] = por_linha["compra_laboratorio"].where(~sem_compra, por_linha["laboratorio_cadastro"])
     _ajustar_custo(por_linha, p)
+    _corrigir_acima_da_venda(por_linha, c, p)
     por_linha["orcamento"] = por_linha["sugestao"] * por_linha["preco"].fillna(0)
     frac = pd.to_numeric(por_linha["compra_fracao"], errors="coerce").fillna(1)
     por_linha["compra_fracao"] = frac
@@ -295,17 +331,17 @@ def calcular(pronto: Pronto, base_categorias: pd.DataFrame, genericos: pd.DataFr
 
     # -- tags ----------------------------------------------------------------------
     marcas_status = [
+        (por_linha["a_revisar"].to_numpy(), A_REVISAR),
         (por_linha["negativo"].to_numpy() & ~por_linha["estoque_corrigido"].to_numpy(), NEGATIVO),
         (por_linha["ruptura"].to_numpy(), RUPTURA),
         (por_linha["ruptura_proxima"].to_numpy(), RUPTURA_PROXIMA),
         (por_linha["estoque_corrigido"].to_numpy(), CORRIGIDO),
         ((por_linha["grupo"] == cat.SEM_CLASSIFICACAO).to_numpy(), SEM_CLASSIFICACAO),
         (por_linha["giro_baixo"].to_numpy(), GIRO_BAIXO),
+        (por_linha["venda_pontual"].to_numpy(), VENDA_PONTUAL),
     ]
     marcas_preco = [
         (por_linha["compra_bonificado"].to_numpy(), BONIFICADO),
-        (por_linha["a_revisar"].to_numpy(), A_REVISAR),
-        (por_linha["custo_ajustado"].notna().to_numpy(), CUSTO_AJUSTADO),
         ((por_linha["preco_origem"] == "cadastro").to_numpy(), CUSTO_CADASTRO),
     ]
     por_linha["status"] = _tags(marcas_status)
@@ -349,6 +385,33 @@ def _ajustar_custo(df: pd.DataFrame, p: Parametros) -> None:
                                      index=df.index, dtype="object")
 
 
+def _corrigir_acima_da_venda(df: pd.DataFrame, c: pd.DataFrame, p: Parametros) -> None:
+    """Preço final ainda acima do preço de venda → a nota paga mais recente
+    dentro da faixa coerente (regra no topo do módulo). A nota trocada fica
+    em `compra_ignorada_*` (pra dica) e o item, "A revisar"."""
+    venda = df["preco_venda"]
+    acima = (venda > 0) & (pd.to_numeric(df["preco"], errors="coerce") > venda * p.custo_faixa_max)
+    if not acima.any() or c.empty:
+        return
+    pagas = c[~c["bonificado"] & c["linha"].isin(df.index[acima])]
+    v = pagas["linha"].map(venda)
+    boas = (pagas[(pagas["preco"] <= v * p.custo_faixa_max) & (pagas["preco"] >= v * p.custo_faixa_min)]
+            .sort_values(["linha", "data"], ascending=[True, False], kind="stable")
+            .drop_duplicates("linha").set_index("linha"))
+    if boas.empty:
+        return
+    linhas = boas.index
+    df.loc[linhas, "compra_ignorada_preco"] = df.loc[linhas, "preco"]
+    df.loc[linhas, "compra_ignorada_data"] = df.loc[linhas, "compra_data"]
+    for col in _COLUNAS_COMPRA:
+        df.loc[linhas, "compra_" + col] = boas[col]
+    df.loc[linhas, "preco"] = boas["preco"]
+    df.loc[linhas, "preco_nota"] = boas["preco"]
+    df.loc[linhas, "custo_ajustado"] = None
+    df.loc[linhas, "a_revisar"] = True
+    df.loc[linhas, "revisar_motivo"] = MOTIVO_ACIMA_VENDA
+
+
 def _tags(marcas: list) -> list[list[str]]:
     nomes = [n for _, n in marcas]
     return [[n for marcado, n in zip(linha, nomes) if marcado] for linha in zip(*[m for m, _ in marcas])]
@@ -356,9 +419,9 @@ def _tags(marcas: list) -> list[list[str]]:
 
 COLUNAS = [
     "linha", "nome", "generico", "ean_principal", "eans", "categoria", "grupo", "laboratorio", "laboratorio_cadastro",
-    "unidades", "valor", "unidades_90d", "venda_90d", "demanda_dia", "estoque", "estoque_gps", "estoque_corrigido", "negativo",
+    "unidades", "valor", "unidades_90d", "valor_90d", "venda_90d", "demanda_dia", "estoque", "estoque_gps", "estoque_corrigido", "negativo",
     "eans_negativos", "estoque_min", "estoque_max",
-    "sugestao", "listar", "ruptura", "ruptura_proxima", "giro_baixo", "curva", "curva_valor", "curva_unidades",
+    "sugestao", "listar", "ruptura", "ruptura_proxima", "giro_baixo", "venda_pontual", "curva", "curva_valor", "curva_unidades",
     "compra_data", "compra_preco", "compra_vlr_unitario", "compra_vlr_desconto", "compra_fracao", "compra_fornecedor",
     "compra_bonificado", "compra_a_revisar", "compra_ignorada_preco", "compra_ignorada_data",
     "custo_cadastro", "preco", "preco_origem", "orcamento", "aviso_embalagem", "status", "tags_preco",
@@ -373,7 +436,9 @@ COLUNAS = [
 def aplicar_area(linhas: pd.DataFrame, area: dict) -> pd.DataFrame:
     """Aplica a área de trabalho do usuário (integrations/pedido_area.py):
     `area`: linha → objeto com `quantidade` (None = segue a sugestão) e
-    `selecionado` (None = marcado se a quantidade > 0 — Q1/Q2 de 29/09/2026).
+    `selecionado` (None = marcado se a quantidade > 0 — Q1/Q2 de 29/09/2026;
+    "Venda pontual" vem desmarcado, a não ser que a quantidade tenha sido
+    digitada — digitar também é decidir pedir, 05/10/2026).
 
     `quantidade` = o que vai no pedido; `alterado` = digitada à mão;
     `selecionado`; `subtotal` = preço da última compra × quantidade."""
@@ -382,18 +447,14 @@ def aplicar_area(linhas: pd.DataFrame, area: dict) -> pd.DataFrame:
     marca = [getattr(area.get(l), "selecionado", None) for l in df["linha"]]
     df["alterado"] = [q is not None and q != s for q, s in zip(qtd_digitada, df["sugestao"])]
     df["quantidade"] = [int(q) if q is not None else int(s) for q, s in zip(qtd_digitada, df["sugestao"])]
-    df["selecionado"] = [bool(m) if m is not None else q > 0 for m, q in zip(marca, df["quantidade"])]
+    df["selecionado"] = [bool(m) if m is not None else q > 0 and (not vp or a)
+                         for m, q, vp, a in zip(marca, df["quantidade"], df["venda_pontual"], df["alterado"])]
     df["subtotal"] = df["quantidade"] * df["preco"].fillna(0)
     df["orcamento"] = df["subtotal"]
     frac = df["compra_fracao"].fillna(1)
     df["aviso_embalagem"] = (frac > 1) & (df["quantidade"] > 0) & (df["quantidade"] % frac != 0)
     df["status"] = [s + [ALTERADO] if a else s for s, a in zip(df["status"], df["alterado"])]
     return df
-
-
-def aplicar_rascunho(linhas: pd.DataFrame, rascunho: dict) -> pd.DataFrame:
-    """Compatibilidade (Fase 5): rascunho da loja = só quantidades."""
-    return aplicar_area(linhas, rascunho)
 
 
 def exportacao(linhas: pd.DataFrame) -> pd.DataFrame:
@@ -433,7 +494,7 @@ def tabela_completa(pedido: pd.DataFrame) -> pd.DataFrame:
         "VENDA 90 DIAS": df["venda_90d"].to_numpy(),
         "ESTOQUE": df["estoque"].to_numpy(),
         "MÍNIMO": df["estoque_min"].to_numpy(),
-        "MÁXIMO": df["estoque_max"].to_numpy(),
+        "IDEAL": df["estoque_max"].to_numpy(),   # "máximo" virou "ideal" na tela (02/10/2026)
         "SUGESTÃO": df["sugestao"].astype(int).to_numpy(),
         "QUANTIDADE": df["quantidade"].astype(int).to_numpy(),
         "SUBTOTAL": pd.to_numeric(df["subtotal"], errors="coerce").round(2).to_numpy(),
@@ -448,8 +509,9 @@ def giro_baixo(linhas: pd.DataFrame) -> pd.DataFrame:
     produtos de giro baixo que venderam na janela e TÊM ESTOQUE (com ou sem
     sugestão), o maior valor parado primeiro. Sem estoque não há nada parado:
     na Hudson eram 625 dos 2.260 de giro baixo (medido em 02/10/2026; ficam
-    1.635, R$ 210 mil parados)."""
-    df = linhas[linhas["giro_baixo"] & (linhas["estoque"] > 0)]
+    1.635, R$ 210 mil parados). "Venda pontual" com estoque também entra:
+    vendeu pouco do mesmo jeito, e o valor parado é o mais alto."""
+    df = linhas[(linhas["giro_baixo"] | linhas["venda_pontual"]) & (linhas["estoque"] > 0)]
     preco = pd.to_numeric(df["preco"], errors="coerce")
     parado = (df["estoque"].clip(lower=0) * preco.fillna(0)).round(2)
     saida = pd.DataFrame({
@@ -503,13 +565,16 @@ def lista(linhas: pd.DataFrame, ocultar_giro_baixo: bool = True) -> pd.DataFrame
     return df[~df["giro_baixo"]] if ocultar_giro_baixo else df
 
 
-def filtrar(linhas: pd.DataFrame, busca: str | None = None, categoria: str | None = None,
-            ocultar_giro_baixo: bool = True, filtros: "Filtros | None" = None) -> pd.DataFrame:
-    """A lista (`lista`) com a busca e os filtros da tela. Busca: nome, EAN
-    (qualquer um da linha) ou laboratório."""
+def filtrar(linhas: pd.DataFrame, busca: str | None = None, ocultar_giro_baixo: bool = True,
+            categorias: tuple = (), fabricantes: tuple = (), status: tuple = ()) -> pd.DataFrame:
+    """A lista (`lista`) com a linha de filtros da tela (01/10/2026): busca
+    (nome, EAN — qualquer um da linha — ou fabricante), Categoria, Status
+    (tags da coluna, 05/10/2026) e Fabricante (= laboratório); OU dentro do
+    mesmo campo, E entre campos.
+
+    Substitui a classe `Filtros` do pop-up de 29/09/2026 (9 campos, pílulas,
+    filtros salvos), apagada em 02/10/2026 junto com o pop-up."""
     df = lista(linhas, ocultar_giro_baixo)
-    if categoria:
-        df = df[df["categoria"].fillna(SEM_CLASSIFICACAO) == categoria]
     if busca:
         termo = busca.strip().upper()
         digitos = "".join(ch for ch in termo if ch.isdigit())
@@ -518,181 +583,27 @@ def filtrar(linhas: pd.DataFrame, busca: str | None = None, categoria: str | Non
         if digitos:
             alvo |= df["eans"].map(lambda es: any(digitos in e for e in es))
         df = df[alvo]
-    if filtros is not None:
-        df = filtros.aplicar(df)
+    if categorias:
+        df = df[df["categoria"].fillna(SEM_CLASSIFICACAO).isin(categorias)]
+    if fabricantes:
+        df = df[df["laboratorio"].isin(fabricantes)]
+    if status:
+        escolhidos = set(status)
+        df = df[[not escolhidos.isdisjoint(s) for s in df["status"]]]
     return df
 
 
-# ---------------------------------------------------------------------------
-# Filtros da tela (pop-up "Filtros")
-# ---------------------------------------------------------------------------
-
-# Pílulas de Preço do pop-up, em ORDEM FIXA — a ordem dá a cor de cada
-# pílula no CSS (core/theme.py, bloco "FILTROS DO PEDIDO"), assim como a de
-# TAGS_STATUS dá a das pílulas de Situação. Mudou a ordem aqui, mude lá.
-# "Sem compra" cobre o "custo de cadastro" (sem compra paga na janela) e o
-# "sem preço nenhum" — não há pílula própria pra custo de cadastro (Q3 de
-# 29/09/2026).
-SEM_COMPRA = "Sem compra"
-A_REVISAR_FILTRO = "A revisar"
-TAGS_PRECO_FILTRO = [BONIFICADO, A_REVISAR_FILTRO, SEM_COMPRA]
-
-# Campos de valor (busca do pop-up): campo → (rótulo, coluna da linha).
-CAMPOS_VALOR = {
-    "categoria": ("Categoria", "categoria"),
-    "laboratorio": ("Laboratório", "laboratorio"),
-    "fornecedor": ("Fornecedor", "compra_fornecedor"),
-    "curva_valor": ("Curva por valor", "curva_valor"),
-    "curva_unidades": ("Curva por unidades", "curva_unidades"),
-    "grupo": ("Grupo", "grupo"),
-    "tag": ("Situação", "status"),
-    "preco": ("Preço", None),            # calculado por _precos_da_linha
-}
+def opcoes_status(linhas: pd.DataFrame) -> list[str]:
+    """As tags da coluna Status que existem na lista da loja, na ordem da
+    coluna — as opções do filtro Status (05/10/2026)."""
+    existentes = {t for s in linhas["status"] for t in s}
+    return [t for t in TAGS_STATUS if t in existentes]
 
 
-def _precos_da_linha(df: pd.DataFrame) -> pd.Series:
-    """As pílulas de Preço de cada linha (lista, na ordem de TAGS_PRECO_FILTRO)."""
-    bonif = df["compra_bonificado"].astype(bool).to_numpy()
-    revisar = df["a_revisar"].astype(bool).to_numpy()
-    sem = (df["preco_origem"] != "compra").to_numpy()
-    return pd.Series([[n for m, n in zip(t, TAGS_PRECO_FILTRO) if m] for t in zip(bonif, revisar, sem)],
-                     index=df.index, dtype="object")
-
-
-@dataclass(frozen=True)
-class Filtros:
-    """Filtros do pop-up. `valores`: ((campo, valor), …) — OU dentro do
-    mesmo campo, E entre campos (vale também pras pílulas: Bonificado + A
-    revisar = "um OU outro", desde 29/09/2026). Os numéricos: None = desligado.
-
-    Saíram em 29/09/2026: `estoque_zerado` (é a pílula Ruptura, que segue o
-    parâmetro `ruptura_unidades`) e `sem_compra`/`bonificado`/`a_revisar`
-    (viraram ("preco", valor))."""
-    valores: tuple = ()
-    selecao: str | None = None            # "marcados" | "nao_marcados"
-    cobertura_ate_dias: int | None = None
-    estoque_de: float | None = None
-    estoque_ate: float | None = None
-    demanda_min: float | None = None
-    ultima_compra_mais_de_dias: int | None = None
-    hoje: str | None = None               # data de referência da "última compra há N dias" (não é salva)
-
-    def quantos(self) -> int:
-        n = len({c for c, _ in self.valores})
-        n += int(bool(self.selecao))
-        n += sum(x is not None for x in (self.cobertura_ate_dias, self.demanda_min, self.ultima_compra_mais_de_dias))
-        n += int(self.estoque_de is not None or self.estoque_ate is not None)
-        return n
-
-    def erros(self) -> list[str]:
-        if self.estoque_de is not None and self.estoque_ate is not None and self.estoque_de > self.estoque_ate:
-            return [f"\"Estoque de\" ({self.estoque_de:g}) é maior que \"até\" ({self.estoque_ate:g}): nenhum item "
-                    "caberia nessa faixa."]
-        return []
-
-    def aplicar(self, df: pd.DataFrame) -> pd.DataFrame:
-        por_campo: dict[str, set] = {}
-        for campo, valor in self.valores:
-            por_campo.setdefault(campo, set()).add(valor)
-        for campo, valores in por_campo.items():
-            if campo not in CAMPOS_VALOR:
-                continue  # filtro salvo com campo que não existe mais
-            coluna = CAMPOS_VALOR[campo][1]
-            if campo == "tag":
-                df = df[df[coluna].map(lambda ts: bool(valores & set(ts)))]
-            elif campo == "preco":
-                df = df[_precos_da_linha(df).map(lambda ts: bool(valores & set(ts)))] if not df.empty else df
-            elif campo == "grupo":
-                df = df[df[coluna].map(lambda g: cat.ROTULO_GRUPO.get(g, g)).isin(valores)]
-            elif campo == "categoria":
-                df = df[df[coluna].fillna(SEM_CLASSIFICACAO).isin(valores)]
-            else:
-                df = df[df[coluna].isin(valores)]
-        if self.selecao == "marcados" and "selecionado" in df:
-            df = df[df["selecionado"]]
-        elif self.selecao == "nao_marcados" and "selecionado" in df:
-            df = df[~df["selecionado"]]
-        if self.cobertura_ate_dias is not None:
-            df = df[df["estoque"] <= df["demanda_dia"] * self.cobertura_ate_dias]
-        if self.estoque_de is not None:
-            df = df[df["estoque"] >= self.estoque_de]
-        if self.estoque_ate is not None:
-            df = df[df["estoque"] <= self.estoque_ate]
-        if self.demanda_min is not None:
-            df = df[df["demanda_dia"] >= self.demanda_min]
-        if self.ultima_compra_mais_de_dias is not None and self.hoje:
-            # Sem compra na janela (~4 meses) também entra: pra o sistema, a
-            # última compra dele é "antes da janela".
-            limite = (dt.date.fromisoformat(self.hoje) - dt.timedelta(days=self.ultima_compra_mais_de_dias)).isoformat()
-            data = df["compra_data"].fillna("")
-            df = df[(data == "") | (data < limite)]
-        return df
-
-    def para_dict(self) -> dict:
-        """O que o "Salvar como meu filtro" grava (JSON) — sem `hoje`, que é
-        do dia em que o filtro é usado, não de quando foi salvo."""
-        return {
-            "valores": [list(v) for v in self.valores], "selecao": self.selecao,
-            "cobertura_ate_dias": self.cobertura_ate_dias, "estoque_de": self.estoque_de,
-            "estoque_ate": self.estoque_ate, "demanda_min": self.demanda_min,
-            "ultima_compra_mais_de_dias": self.ultima_compra_mais_de_dias,
-        }
-
-    @classmethod
-    def de_dict(cls, dados: dict, hoje: str | None = None) -> "Filtros":
-        """Lê um filtro salvo. Campo desconhecido (versão antiga ou mais nova
-        do formato) é ignorado, em vez de quebrar a tela."""
-        dados = dados or {}
-
-        def inteiro(v):
-            return int(v) if v is not None else None
-
-        def real(v):
-            return float(v) if v is not None else None
-
-        return cls(
-            valores=tuple(tuple(v) for v in dados.get("valores", []) if isinstance(v, (list, tuple)) and len(v) == 2),
-            selecao=dados.get("selecao") if dados.get("selecao") in ("marcados", "nao_marcados") else None,
-            cobertura_ate_dias=inteiro(dados.get("cobertura_ate_dias")), estoque_de=real(dados.get("estoque_de")),
-            estoque_ate=real(dados.get("estoque_ate")), demanda_min=real(dados.get("demanda_min")),
-            ultima_compra_mais_de_dias=inteiro(dados.get("ultima_compra_mais_de_dias")), hoje=hoje,
-        )
-
-
-def opcoes_de_valor(linhas: pd.DataFrame) -> list[tuple[str, str]]:
-    """(campo, valor) de tudo que existe na lista da loja — as opções da
-    busca do pop-up. Vêm da loja já calculada em memória (~4 ms na Reis F2,
-    277 laboratórios; medido em 29/09/2026): nada de tabela única de todas as
-    lojas (11,7 mi de linhas, 1,8 GB). Situação e Preço têm lista fixa
-    (`contar_opcoes`), mas também entram aqui pra busca achar."""
-    saida = []
-    for campo, (_rotulo, coluna) in CAMPOS_VALOR.items():
-        if campo == "tag":
-            valores = list(TAGS_STATUS)
-        elif campo == "preco":
-            valores = list(TAGS_PRECO_FILTRO)
-        elif campo == "grupo":
-            valores = sorted({cat.ROTULO_GRUPO.get(g, g) for g in linhas[coluna].dropna()})
-        elif campo == "categoria":
-            valores = sorted(set(linhas[coluna].fillna(SEM_CLASSIFICACAO)))
-        else:
-            valores = sorted({str(v) for v in linhas[coluna].dropna() if str(v).strip()})
-        saida.extend((campo, v) for v in valores)
-    return saida
-
-
-def contar_opcoes(pedido: pd.DataFrame) -> dict[str, dict[str, int]]:
-    """Quantos itens do PEDIDO INTEIRO cada pílula traria sozinha (Q1 de
-    29/09/2026: não depende dos outros filtros, que o formulário não
-    recalcula a cada clique). Lista fixa, na ordem, com 0 nas vazias."""
-    situacao = {t: 0 for t in TAGS_STATUS}
-    for ts in pedido["status"]:
-        for t in ts:
-            if t in situacao:
-                situacao[t] += 1
-    preco = {t: 0 for t in TAGS_PRECO_FILTRO}
-    if not pedido.empty:
-        for ts in _precos_da_linha(pedido):
-            for t in ts:
-                preco[t] += 1
-    return {"tag": situacao, "preco": preco}
+def opcoes_filtros(linhas: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """(categorias, fabricantes) que existem na lista da loja — as opções da
+    linha de filtros. Da loja já calculada em memória (~4 ms na Reis F2, 277
+    laboratórios; medido em 29/09/2026)."""
+    categorias = sorted(set(linhas["categoria"].fillna(SEM_CLASSIFICACAO)))
+    fabricantes = sorted({str(v) for v in linhas["laboratorio"].dropna() if str(v).strip()})
+    return categorias, fabricantes

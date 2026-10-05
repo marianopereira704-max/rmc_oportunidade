@@ -60,39 +60,6 @@ def test_comprador_e_proprietario_so_veem_as_proprias_lojas():
 
 
 # ---------------------------------------------------------------------------
-# Rascunho
-# ---------------------------------------------------------------------------
-
-def test_rascunho_grava_atualiza_e_volta_a_sugestao(session):
-    rasc.alterar_quantidade(session, 1, "G7", 10, 4, "ana")
-    rasc.alterar_quantidade(session, 1, "P9", 0, 3, "ana")
-    rasc.alterar_quantidade(session, 1, "G7", 12, 4, "bia")                  # mesma linha: atualiza
-    r = rasc.rascunho(session, 1)
-    assert r["G7"].quantidade == 12 and r["G7"].alterado_por == "bia" and r["G7"].sugestao_calculada == 4
-    assert r["P9"].quantidade == 0
-    rasc.alterar_quantidade(session, 1, "G7", 4, 4, "bia")                   # igual à sugestão: sai do rascunho
-    assert set(rasc.rascunho(session, 1)) == {"P9"}
-    with pytest.raises(ValueError):
-        rasc.alterar_quantidade(session, 1, "P9", -1, 3, "ana")
-    assert rasc.descartar_rascunho(session, 1) == 1 and rasc.rascunho(session, 1) == {}
-
-
-def test_aplicar_rascunho_muda_quantidade_orcamento_e_cards():
-    p = _pronto([("1", "2026-09-20", 118, 1), ("2", "2026-09-20", 118, 1)],
-                [("1", "200", "A", "L", 0, 2), ("2", "200", "B", "L", 0, 2)])
-    base = pd.DataFrame([("200", "MIP/OTC")], columns=["ean", "categoria"])
-    df = calculo.calcular(p, base, SEM_GENERICOS)
-    linha_a = _linha(df, "A")["linha"]
-    item = rasc.ItemRascunho(quantidade=20, sugestao_calculada=7, alterado_por="ana", alterado_em=None)
-    com = calculo.aplicar_rascunho(df, {linha_a: item})
-    a, b = _linha(com, "A"), _linha(com, "B")
-    assert a["quantidade"] == 20 and a["alterado"] and a["orcamento"] == pytest.approx(40)
-    assert b["quantidade"] == 7 and not b["alterado"]
-    i = calculo.indicadores(calculo.filtrar(com))
-    assert i.unidades == 27 and i.itens == 2
-
-
-# ---------------------------------------------------------------------------
 # Estoque negativo
 # ---------------------------------------------------------------------------
 
@@ -104,9 +71,6 @@ def test_correcoes_gravam_removem_e_recusam_negativo(session):
     assert set(rasc.correcoes(session, 1)) == {"P2"}
     with pytest.raises(ValueError):
         rasc.salvar_correcoes(session, 1, {"P2": -4}, {}, None, "bia")
-    v1 = rasc.versao_correcoes(session, 1)
-    rasc.salvar_correcoes(session, 1, {"P3": 1}, {}, None, "bia")
-    assert rasc.versao_correcoes(session, 1) != v1
 
 
 def test_correcao_so_vale_enquanto_o_gps_mostra_negativo():
@@ -140,9 +104,8 @@ def test_exportacao_produto_quantidade_e_eans_em_colunas(session):
         {"PRODUTO": "SABONETE", "QUANTIDADE": 2, "EAN 1": "444", "EAN 2": "", "EAN 3": ""},
     ]
     rasc.registrar_exportacao(session, 1, "Excel", 2, 7, 12.345, "ana")
-    e = rasc.ultima_exportacao(session, 1)
+    e = session.query(ExportacaoPedido).one()
     assert (e.formato, e.itens, e.unidades, float(e.valor), e.exportado_por) == ("Excel", 2, 7, 12.35, "ana")
-    assert session.query(ExportacaoPedido).count() == 1
 
 
 def test_arquivo_csv_abre_no_excel_em_portugues():
