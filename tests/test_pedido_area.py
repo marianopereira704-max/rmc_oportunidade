@@ -1,8 +1,10 @@
-"""Novo layout do Pedido (29/09/2026): área de trabalho por usuário + loja,
-seleção, listas salvas com nome, cards do pedido inteiro e filtros."""
+"""Assistente de pedido: área de trabalho por usuário + loja, seleção,
+listas salvas com nome, cards do pedido inteiro, avisos vistos e as
+exportações (tabela completa, giro baixo). Os filtros da linha da tela:
+tests/test_pedido_calculo.py."""
 import datetime as dt
+from zoneinfo import ZoneInfo
 
-import pandas as pd
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -63,8 +65,9 @@ def test_aviso_de_exportacao_de_outra_pessoa(session):
     session.add(ExportacaoPedido(loja_id=1, formato="Excel", itens=1, unidades=1, valor=1, exportado_por="Bruno",
                                  exportado_em=dt.datetime.utcnow()))
     session.flush()
-    assert any("Bruno exportou" in a for a in area.avisos(session, 7, "Ana", 1, dt.datetime.utcnow().date()))
-    assert area.avisos(session, 9, "Bruno", 1, dt.datetime.utcnow().date()) == []
+    hoje_br = dt.datetime.now(ZoneInfo("America/Sao_Paulo")).date()
+    assert any("Bruno exportou" in a for a in area.avisos(session, 7, "Ana", 1, hoje_br))
+    assert area.avisos(session, 9, "Bruno", 1, hoje_br) == []
 
 
 def _pedido():
@@ -87,54 +90,6 @@ def test_selecao_e_cards_do_pedido_inteiro():
     assert (i.unidades, i.itens, i.marcados, i.ruptura, i.ruptura_sem_pedido) == (35, 3, 2, 2, 0)
     com2 = calculo.aplicar_area(df, {zero: area.ItemArea(None, False)})
     assert calculo.indicadores(calculo.lista(com2)).ruptura_sem_pedido == 1
-
-
-def test_filtros_do_pop_up():
-    df = calculo.aplicar_area(_pedido(), {})
-    lst = calculo.lista(df)
-    ops = calculo.opcoes_de_valor(lst)
-    assert ("laboratorio", "LAB A") in ops and ("tag", calculo.RUPTURA) in ops and ("fornecedor", "DISTRIB X") in ops
-    f = calculo.Filtros(valores=(("laboratorio", "LAB A"), ("laboratorio", "LAB B"), ("tag", calculo.RUPTURA)))
-    assert set(f.aplicar(lst)["nome"]) == {"ZERO", "SABAO"}            # OU no mesmo campo, E entre campos
-    assert f.quantos() == 2
-    # "Estoque zerado" virou a pílula Ruptura; "Sem compra" virou pílula de Preço.
-    assert set(calculo.Filtros(valores=(("tag", calculo.RUPTURA),)).aplicar(lst)["nome"]) == {"ZERO", "SABAO"}
-    assert set(calculo.Filtros(valores=(("preco", calculo.SEM_COMPRA),)).aplicar(lst)["nome"]) == {"DOIS", "SABAO"}
-    assert list(calculo.Filtros(valores=(("categoria", "HIGIENE"),)).aplicar(lst)["nome"]) == ["SABAO"]
-    assert set(calculo.Filtros(selecao="nao_marcados").aplicar(lst)["nome"]) == set()
-
-
-def test_pilulas_de_preco_valem_como_ou_e_contam_o_pedido_inteiro():
-    df = calculo.aplicar_area(_pedido(), {})
-    df.loc[df["nome"] == "ZERO", "compra_bonificado"] = True
-    df.loc[df["nome"] == "DOIS", "a_revisar"] = True                    # todas as razões (01/10/2026)
-    lst = calculo.lista(df)
-    f = calculo.Filtros(valores=(("preco", calculo.BONIFICADO), ("preco", calculo.A_REVISAR_FILTRO)))
-    assert set(f.aplicar(lst)["nome"]) == {"ZERO", "DOIS"}             # Bonificado OU A revisar (antes era E)
-    n = calculo.contar_opcoes(lst)
-    assert list(n["tag"]) == calculo.TAGS_STATUS and list(n["preco"]) == calculo.TAGS_PRECO_FILTRO
-    assert n["tag"][calculo.RUPTURA] == 2 and n["tag"][calculo.GIRO_BAIXO] == 0   # lista fixa, 0 nas vazias
-    assert n["preco"] == {calculo.BONIFICADO: 1, calculo.A_REVISAR_FILTRO: 1, calculo.SEM_COMPRA: 2}
-
-
-def test_ruptura_segue_o_parametro_de_unidades():
-    vendas = [(c, "2026-09-20", 118, 1) for c in ("1", "2")]
-    estoque = [("1", "200", "ZERO", "L", 0, 1), ("2", "200", "DOIS", "L", 2, 1)]
-    df = calculo.calcular(_pronto(vendas, estoque), BASE, SEM_GENERICOS, calculo.Parametros(ruptura_unidades=2))
-    lst = calculo.lista(calculo.aplicar_area(df, {}))
-    assert set(calculo.Filtros(valores=(("tag", calculo.RUPTURA),)).aplicar(lst)["nome"]) == {"ZERO", "DOIS"}
-
-
-def test_validacao_de_ate_e_json_do_filtro_salvo():
-    assert calculo.Filtros(estoque_de=5, estoque_ate=2).erros()
-    assert not calculo.Filtros(estoque_de=2, estoque_ate=5).erros()
-    f = calculo.Filtros(valores=(("laboratorio", "LAB A"), ("preco", calculo.SEM_COMPRA)), selecao="marcados",
-                        cobertura_ate_dias=3, estoque_ate=10, hoje="2026-09-27")
-    d = f.para_dict()
-    assert "hoje" not in d
-    volta = calculo.Filtros.de_dict(d, hoje="2026-10-01")
-    assert volta.valores == f.valores and volta.cobertura_ate_dias == 3 and volta.hoje == "2026-10-01"
-    assert calculo.Filtros.de_dict({"valores": [["x"]], "campo_novo": 1, "selecao": "?"}) == calculo.Filtros()
 
 
 def test_avisos_vistos_valem_por_foto_e_por_usuario(session):
@@ -168,3 +123,31 @@ def test_exportacoes_tabela_completa_e_giro_baixo():
     assert list(giro["VALOR PARADO EM ESTOQUE"]) == [30.0, 10.0]
     df.loc[df["nome"] == "DOIS", "estoque"] = 0                         # sem estoque: nada parado, sai
     assert list(calculo.giro_baixo(df)["PRODUTO"]) == ["SABAO"]
+
+
+def test_ruptura_segue_o_parametro_de_unidades():
+    vendas = [(c, "2026-09-20", 118, 1) for c in ("1", "2")]
+    estoque = [("1", "200", "ZERO", "L", 0, 1), ("2", "200", "DOIS", "L", 2, 1)]
+    df = calculo.calcular(_pronto(vendas, estoque), BASE, SEM_GENERICOS, calculo.Parametros(ruptura_unidades=2))
+    lst = calculo.lista(calculo.aplicar_area(df, {}))
+    assert {n for n, st in zip(lst["nome"], lst["status"]) if calculo.RUPTURA in st} == {"ZERO", "DOIS"}
+
+
+def test_regras_em_memoria_dao_o_mesmo_que_o_banco(session):
+    """A tela atualiza a cópia da área na sessão com `com_quantidade` e
+    `com_marcacoes` em vez de reler o banco (02/10/2026): têm de dar o mesmo
+    resultado que gravar e ler de novo."""
+    memoria = {}
+    passos = [
+        ("qtd", "A", 10, 7), ("marca", {"A": False, "B": True}), ("qtd", "A", 7, 7),   # volta à sugestão, marca fica
+        ("marca", {"C": False}), ("qtd", "C", 3, 5), ("qtd", "B", 4, 4),
+    ]
+    for passo in passos:
+        if passo[0] == "qtd":
+            _, linha, q, sug = passo
+            area.alterar_quantidade(session, 7, 1, linha, q, sug)
+            memoria = area.com_quantidade(memoria, linha, q, sug)
+        else:
+            area.marcar(session, 7, 1, passo[1])
+            memoria = area.com_marcacoes(memoria, passo[1])
+        assert area.area(session, 7, 1).itens == memoria, passo

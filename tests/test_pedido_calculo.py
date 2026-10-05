@@ -190,7 +190,7 @@ def test_compra_de_referencia_e_a_ultima_paga_e_coerente():
     assert calculo.BONIFICADO in r1["tags_preco"]
     r2 = _linha(df, "P2")
     assert r2["preco"] == pytest.approx(10) and r2["compra_a_revisar"] and r2["compra_ignorada_preco"] == pytest.approx(990)
-    assert calculo.A_REVISAR in r2["tags_preco"]
+    assert calculo.A_REVISAR in r2["status"] and calculo.A_REVISAR not in r2["tags_preco"]   # Status desde 02/10/2026
     r3 = _linha(df, "P3")
     assert r3["preco_origem"] == "cadastro" and r3["preco"] == 10
     assert {calculo.BONIFICADO, calculo.CUSTO_CADASTRO} <= set(r3["tags_preco"])
@@ -228,13 +228,14 @@ def test_cadastro_x_nota_o_preco_de_venda_decide():
 
     r = _linha(df, "P1")
     assert r["preco"] == pytest.approx(2.65) and r["preco_nota"] == pytest.approx(79.49)
-    assert r["custo_ajustado"] == "cadastro" and not r["a_revisar"] and calculo.CUSTO_AJUSTADO in r["tags_preco"]
+    assert r["custo_ajustado"] == "cadastro" and not r["a_revisar"]
+    assert calculo.CUSTO_AJUSTADO not in r["tags_preco"]                     # vai na dica do preço (02/10/2026)
     assert r["orcamento"] == pytest.approx(r["sugestao"] * 2.65)              # o orçamento já sai certo
     r = _linha(df, "P2")
     assert r["preco"] == pytest.approx(0.799) and r["custo_ajustado"] == "nota" and not r["a_revisar"]
     r = _linha(df, "P3")
     assert r["preco"] == pytest.approx(28.02) and r["custo_ajustado"] is None
-    assert r["a_revisar"] and r["revisar_motivo"] == calculo.MOTIVO_DIVERGENCIA and calculo.A_REVISAR in r["tags_preco"]
+    assert r["a_revisar"] and r["revisar_motivo"] == calculo.MOTIVO_DIVERGENCIA and r["status"][0] == calculo.A_REVISAR
     r = _linha(df, "P4")
     assert r["preco"] == pytest.approx(11) and r["custo_ajustado"] is None and not r["a_revisar"]
     r = _linha(df, "P5")
@@ -264,7 +265,9 @@ def test_venda_90_dias_e_fixa_e_so_exibicao():
 
 def test_giro_baixo_ruptura_e_aviso_de_embalagem():
     # LENTO: 1 unidade em junho e nada nos últimos 90 dias.
-    vendas = [("1", "2026-06-02", 5, 1), ("2", "2026-09-20", 1, 1), ("3", "2026-09-20", 118, 1)]
+    # Valor de UMA pequeno (R$ 1 contra R$ 118): curva C, continua giro baixo
+    # (A/B seria "Venda pontual" — teste próprio).
+    vendas = [("1", "2026-06-02", 5, 1), ("2", "2026-09-20", 1, 1), ("3", "2026-09-20", 118, 118)]
     estoque = [("1", "201", "LENTO", "L", 0, 1), ("2", "201", "UMA", "L", 0, 1), ("3", "201", "RAPIDO", "L", 4, 1)]
     compras = [("3", "201", "2026-09-01", 12, 0, 12, "L", "F")]
     df = calculo.calcular(_pronto(vendas, estoque, compras), pd.DataFrame([("201", "MIP/OTC")], columns=["ean", "categoria"]),
@@ -285,12 +288,86 @@ def test_curva_abc_em_duas_letras():
     assert [_linha(df, f"P{c}")["curva"] for c in ("1", "2", "3")] == ["AC", "BB", "CA"]
 
 
+def test_curva_usa_o_periodo_do_giro_baixo():
+    """05/10/2026, caso do AAS Protect da Hudson: venda grande antes dos 90
+    dias e nada depois era curva AA e giro baixo ao mesmo tempo. Agora a
+    curva conta só os mesmos 90 dias: vira CC."""
+    vendas = [("1", "2026-06-24", 80, 1772.80), ("2", "2026-09-20", 10, 50), ("3", "2026-09-20", 5, 20)]
+    estoque = [(c, "201", f"P{c}", "L", 0, 1) for c in ("1", "2", "3")]
+    df = calculo.calcular(_pronto(vendas, estoque), pd.DataFrame([("201", "MIP/OTC")], columns=["ean", "categoria"]),
+                          SEM_GENERICOS)
+    aas = _linha(df, "P1")
+    assert aas["giro_baixo"] and aas["curva"] == "CC"
+    assert _linha(df, "P2")["curva"] == "AA"
+
+
 def test_filtrar_por_busca_ean_e_categoria():
     p = _pronto([("1", "2026-09-20", 118, 1), ("2", "2026-09-20", 118, 1)],
                 [("1", "200", "REMEDIO", "NEO", 0, 1), ("2", "100", "SABONETE", "LAB", 0, 1)])
     df = calculo.calcular(p, BASE, SEM_GENERICOS)
     assert calculo.filtrar(df, busca="20")["nome"].tolist() == ["REMEDIO"]      # parte do EAN
     assert calculo.filtrar(df, busca="neo")["nome"].tolist() == ["REMEDIO"]     # laboratório
-    assert calculo.filtrar(df, categoria="HIGIENE")["nome"].tolist() == ["SABONETE"]
+    assert calculo.filtrar(df, categorias=("HIGIENE",))["nome"].tolist() == ["SABONETE"]
+    assert calculo.filtrar(df, fabricantes=("NEO", "LAB"))["nome"].tolist() == ["REMEDIO", "SABONETE"]   # OU
+    assert calculo.filtrar(df, categorias=("HIGIENE",), fabricantes=("NEO",)).empty                   # E
+    assert calculo.opcoes_filtros(df) == (["HIGIENE", "MIP/OTC"], ["LAB", "NEO"])
     i = calculo.indicadores(calculo.filtrar(df))
     assert i.itens == 2 and i.unidades == 7 + 15 and i.ruptura == 2
+
+
+def test_preco_acima_da_venda_usa_a_nota_coerente():
+    """Regra de 02/10/2026 (casos reais da Hudson): o preço final ainda passa
+    do preço de venda → vale a nota mais recente dentro da faixa coerente."""
+    produtos = {
+        # código: (cadastro, venda, [(data, preço da nota)])
+        "1": (136.67, 13.00, [("2026-07-10", 8.01), ("2026-09-01", 128.11)]),   # Kinder: nota e cadastro por caixa
+        "2": (24.60, 35.59, [("2026-07-10", 23.65), ("2026-09-01", 39.49)]),    # Budesonida: diferença < 2×
+        "3": (50.00, 20.00, [("2026-09-01", 45.00)]),                            # nenhuma nota coerente: não muda
+        "4": (10.00, 20.00, [("2026-09-01", 11.00)]),                            # tudo normal: não mexe
+    }
+    vendas = [(c, "2026-09-20", 118, 1) for c in produtos]
+    estoque = [(c, f"20{c}", f"P{c}", "L", 0, cad, venda) for c, (cad, venda, _) in produtos.items()]
+    compras = [(c, f"20{c}", d, preco, 0, 1, "LAB", "F") for c, (_, _, notas) in produtos.items() for d, preco in notas]
+    base = pd.DataFrame([(f"20{c}", "MIP/OTC") for c in produtos], columns=["ean", "categoria"])
+    df = calculo.calcular(_pronto(vendas, estoque, compras), base, SEM_GENERICOS)
+    for nome, preco, ignorada in (("P1", 8.01, 128.11), ("P2", 23.65, 39.49)):
+        r = _linha(df, nome)
+        assert r["preco"] == pytest.approx(preco) and r["compra_data"] == "2026-07-10"
+        assert r["a_revisar"] and r["revisar_motivo"] == calculo.MOTIVO_ACIMA_VENDA
+        assert r["compra_ignorada_preco"] == pytest.approx(ignorada) and r["orcamento"] == pytest.approx(r["sugestao"] * preco)
+    assert _linha(df, "P3")["preco"] == pytest.approx(45.00)
+    assert _linha(df, "P4")["preco"] == pytest.approx(11.00) and not _linha(df, "P4")["a_revisar"]
+
+
+def test_venda_pontual_giro_baixo_de_curva_a_ou_b():
+    """05/10/2026: giro baixo com a 1ª letra da curva A ou B vira "Venda
+    pontual" — fora do giro baixo e da ruptura, aparece com "Ocultar giro
+    baixo", vem desmarcado (marcar ou digitar a quantidade põe no pedido) e
+    entra no filtro Status. Desligado nas configurações, volta a giro baixo."""
+    vendas = [("1", "2026-09-20", 1, 1000), ("2", "2026-09-20", 100, 300), ("3", "2026-09-20", 1, 2)]
+    estoque = [("1", "201", "CARO", "L", 0, 1), ("2", "201", "COMUM", "L", 0, 1), ("3", "201", "BARATO", "L", 0, 1)]
+    base = pd.DataFrame([("201", "MIP/OTC")], columns=["ean", "categoria"])
+    df = calculo.calcular(_pronto(vendas, estoque), base, SEM_GENERICOS)
+    caro, barato = _linha(df, "CARO"), _linha(df, "BARATO")
+    assert caro["curva"] == "AC" and caro["venda_pontual"] and not caro["giro_baixo"] and not caro["ruptura"]
+    assert caro["status"] == [calculo.VENDA_PONTUAL] and caro["sugestao"] == 1
+    assert barato["giro_baixo"] and not barato["venda_pontual"]
+    assert set(calculo.filtrar(df)["nome"]) == {"CARO", "COMUM"}                 # aparece com o interruptor ligado
+    assert calculo.filtrar(df, status=(calculo.VENDA_PONTUAL,))["nome"].tolist() == ["CARO"]
+    assert set(calculo.filtrar(df, ocultar_giro_baixo=False, status=(calculo.GIRO_BAIXO, calculo.RUPTURA))["nome"])         == {"BARATO", "COMUM"}                                                    # OU entre as tags
+    assert calculo.VENDA_PONTUAL in calculo.opcoes_status(df) and calculo.ALTERADO not in calculo.opcoes_status(df)
+
+    class Item:
+        def __init__(self, quantidade=None, selecionado=None):
+            self.quantidade, self.selecionado = quantidade, selecionado
+
+    sel = lambda area: dict(zip(*calculo.aplicar_area(df, area)[["nome", "selecionado"]].T.values))
+    assert sel({}) == {"CARO": False, "COMUM": True, "BARATO": True}                 # desmarcado por padrão
+    assert sel({caro["linha"]: Item(selecionado=True)})["CARO"]                      # marcado à mão
+    assert sel({caro["linha"]: Item(quantidade=2)})["CARO"]                          # quantidade digitada
+    i = calculo.indicadores(calculo.aplicar_area(calculo.filtrar(df), {}))
+    assert i.itens == 2 and i.marcados == 1 and i.ruptura == 1 and i.ruptura_sem_pedido == 0
+
+    desligado = calculo.calcular(_pronto(vendas, estoque), base, SEM_GENERICOS, calculo.Parametros(venda_pontual=False))
+    assert _linha(desligado, "CARO")["giro_baixo"] and not _linha(desligado, "CARO")["venda_pontual"]
+

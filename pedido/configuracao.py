@@ -43,7 +43,6 @@ class ConfigPedido:
     curva_a: float = 0.50
     curva_b: float = 0.40
     meses_fechados: int = 3
-    tolerancia_preco: float = 0.50          # não usado desde 29/09/2026 (ver fator_preco_fora)
     # Novo layout do Pedido (29/09/2026):
     ruptura_unidades: float = 0             # Ruptura = estoque até N unidades (0 = zerado)
     dias_sem_classificacao: int = 7         # dias estimados pra produto sem categoria
@@ -52,6 +51,8 @@ class ConfigPedido:
     custo_faixa_min: float = 0.15
     custo_faixa_max: float = 1.0
     fator_cadastro_nota: float = 2.0        # divergem mais que isso → a faixa decide
+    # Giro baixo de curva A/B vira "Venda pontual", desmarcado (05/10/2026).
+    venda_pontual: bool = True
 
     @classmethod
     def padrao(cls) -> "ConfigPedido":
@@ -61,7 +62,7 @@ class ConfigPedido:
         return cls(
             dias_medicamento=c.dias_medicamento, dias_perfumaria=c.dias_perfumaria, dias_ruptura=c.dias_ruptura,
             giro_baixo_dias=c.giro_baixo_dias, giro_baixo_max_unidades=c.giro_baixo_max_unidades,
-            curva_a=c.curva_a, curva_b=c.curva_b, meses_fechados=c.meses_fechados, tolerancia_preco=c.tolerancia_preco,
+            curva_a=c.curva_a, curva_b=c.curva_b, meses_fechados=c.meses_fechados,
         )
 
     @classmethod
@@ -84,7 +85,7 @@ class ConfigPedido:
         for nome, valor, minimo, maximo in (
             ("Dias de estoque — medicamento", self.dias_medicamento, 1, 180),
             ("Dias de estoque — perfumaria", self.dias_perfumaria, 1, 180),
-            ("Piso do estoque máximo", self.piso_maximo, 0, 1000),
+            ("Piso do estoque ideal", self.piso_maximo, 0, 1000),
             ("Dias da ruptura próxima", self.dias_ruptura, 0, 60),
             ("Ruptura (unidades)", self.ruptura_unidades, 0, 1000),
             ("Dias para Sem Classificação", self.dias_sem_classificacao, 1, 180),
@@ -117,11 +118,12 @@ class ConfigPedido:
             dias_medicamento=self.dias_medicamento, dias_perfumaria=self.dias_perfumaria,
             dias_ruptura=self.dias_ruptura, giro_baixo_dias=self.giro_baixo_dias,
             giro_baixo_max_unidades=self.giro_baixo_max_unidades, curva_a=self.curva_a, curva_b=self.curva_b,
-            tolerancia_preco=self.tolerancia_preco, limite_bonificacao=limite_bonificacao,
+            limite_bonificacao=limite_bonificacao,
             dias_por_categoria=tuple(sorted(self.dias_por_categoria.items())), piso_maximo=self.piso_maximo,
             ruptura_unidades=self.ruptura_unidades, dias_sem_classificacao=self.dias_sem_classificacao,
             fator_preco_fora=self.fator_preco_fora, custo_faixa_min=self.custo_faixa_min,
             custo_faixa_max=self.custo_faixa_max, fator_cadastro_nota=self.fator_cadastro_nota,
+            venda_pontual=bool(self.venda_pontual),
         )
 
     def dias_da_categoria(self, categoria: str) -> int:
@@ -130,8 +132,9 @@ class ConfigPedido:
         return self.dias_perfumaria if cat.grupo(categoria) == cat.PERFUMARIA else self.dias_medicamento
 
 
-# Fora da personalização: a janela é da rotina (vale pra todas as lojas) e a
-# tolerância de preço não é usada desde 29/09/2026.
+# Fora da personalização: a janela é da rotina (vale pra todas as lojas).
+# "tolerancia_preco" (sem uso desde 29/09/2026, apagada em 02/10/2026) ainda
+# pode estar no JSON de personalizações e configurações antigas: ignorada.
 FORA_DA_PERSONALIZACAO = {"meses_fechados", "tolerancia_preco"}
 
 

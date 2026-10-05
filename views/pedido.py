@@ -36,6 +36,8 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import time
+from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -54,7 +56,93 @@ from views import tabela as tb
 
 _KEY = "pedido"
 _ORDEM_PADRAO = ("valor", False)  # o que mais vende primeiro (coluna oculta); "a revisar" antes de tudo
-_ABRIR_NEGATIVOS = f"{_KEY}_abrir_negativos"   # "Corrigir manualmente" → abre a lista no rerun seguinte
+_ABRIR_NEGATIVOS = f"{_KEY}_abrir_negativos"
+# Notificações (02/10/2026): nada fica "permanente" na tela — sucesso, erro,
+# aviso e informação viram notificação no canto superior direito, com X e
+# 5 s, cada tipo com o seu ícone (o ✅ de sucesso, o ❌ de erro…).
+_ICONE_NOTIFICACAO = {"success": "✅", "error": "❌", "warning": "⚠️", "info": "ℹ️"}
+_AVISADOS = f"{_KEY}_avisados"   # avisos de estado já mostrados nesta sessão: (loja, texto)
+_ESTADO = f"{_KEY}_estado"       # o que a tela lê do banco sobre a loja (ver `_estado_loja`)
+_ESTADO_SEGUNDOS = 30
+
+
+@dataclass
+class _EstadoLoja:
+    """Tudo o que a tela lê do banco sobre a loja e o usuário, guardado na
+    sessão (P1 de 02/10/2026): antes eram 8 consultas a CADA clique (~1,1 s
+    contra o banco em NY), e quase nada muda entre um clique e outro. Relê
+    depois de 30 s (o que outra pessoa fez aparece com até 30 s de atraso) ou
+    depois de uma ação da tela (`_invalidar_estado`). A área de trabalho,
+    que muda a cada clique, é atualizada na cópia depois de gravar."""
+    chave: tuple
+    lido_em: float
+    correcoes: dict
+    area: object
+    listas: list
+    avisos: list
+    vistos: dict
+    personalizacao: dict
+
+
+def _estado_loja(uid: int, usuario_nome: str, loja_id: int) -> _EstadoLoja:
+    from integrations import configuracao_pedido, pedido_area, pedido_rascunho
+
+    atual = st.session_state.get(_ESTADO)
+    if atual is not None and atual.chave == (uid, loja_id) and time.monotonic() - atual.lido_em < _ESTADO_SEGUNDOS:
+        return atual
+    with get_session() as session:
+        listas = pedido_area.listas(session, loja_id)
+        estado = _EstadoLoja(
+            chave=(uid, loja_id), lido_em=time.monotonic(),
+            correcoes=pedido_rascunho.correcoes(session, loja_id),
+            area=pedido_area.area(session, uid, loja_id),
+            listas=listas,
+            avisos=pedido_area.avisos(session, uid, usuario_nome, loja_id,
+                                      dt.datetime.now(ZoneInfo(settings.pedido.fuso)).date(),
+                                      listas_da_loja=listas),
+            vistos=pedido_area.avisos_vistos(session, uid, loja_id),
+            personalizacao=configuracao_pedido.da_loja(session, loja_id),
+        )
+    st.session_state[_ESTADO] = estado
+    return estado
+
+
+def _invalidar_estado() -> None:
+    st.session_state.pop(_ESTADO, None)
+
+
+def _atualizar_area(uid: int, loja_id: int, mudar) -> None:
+    """Depois de gravar uma quantidade/marcação: a cópia na sessão recebe o
+    que acabou de ir pro banco (mesmas regras — integrations/pedido_area.py).
+    `mudar(itens) → itens novos` parte da cópia ATUAL da sessão, não da área
+    que a tela mostrava: em dois cliques rápidos (antes do redesenho), o
+    segundo partia da versão anterior e apagava o primeiro da cópia."""
+    from integrations import pedido_area
+
+    estado = st.session_state.get(_ESTADO)
+    if estado is not None and estado.chave == (uid, loja_id):
+        estado.area = pedido_area.Area(mudar(estado.area.itens), dt.datetime.utcnow(), estado.area.lista_aberta_id)
+
+
+def _concluir(tipo: str, texto: str) -> None:
+    """Fim de uma ação que mudou dados (lista, exportação, correção…): a
+    notificação no próximo redesenho e o estado relido do banco."""
+    st.session_state[f"{_KEY}_msg"] = (tipo, texto)
+    _invalidar_estado()
+
+
+def _notificar(tipo: str, texto: str) -> None:
+    st.toast(texto, icon=_ICONE_NOTIFICACAO.get(tipo, "ℹ️"), duration=5)
+
+
+def _avisar_uma_vez(loja_id: int, tipo: str, texto: str) -> None:
+    """Aviso de ESTADO (pedido duplicado, dia sem dado, parâmetros): a tela é
+    redesenhada a cada clique, e o aviso reapareceria o tempo todo — mostra
+    uma vez por loja na sessão (ao abrir ou trocar de loja)."""
+    vistos = st.session_state.setdefault(_AVISADOS, set())
+    if (loja_id, texto) not in vistos:
+        vistos.add((loja_id, texto))
+        _notificar(tipo, texto)   # "Corrigir manualmente" → abre a lista no rerun seguinte
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +177,7 @@ def _base_categorias(versao: tuple) -> pd.DataFrame:
     from integrations import categorias as categorias_integ
 
     with get_session() as session:
-        return categorias_integ.tabela(session)
+        return categorias_integ.tabela(session, com_origem=False)   # o cálculo só usa ean + categoria
 
 
 @st.cache_data(max_entries=2, show_spinner=False)
@@ -100,11 +188,15 @@ def _genericos(versao: tuple) -> pd.DataFrame:
         return pedido_tela.genericos(session)
 
 
-@st.cache_data(ttl=300, max_entries=30, show_spinner="Calculando o pedido da loja...")
+@st.cache_data(ttl=3600, max_entries=30, show_spinner="Calculando o pedido da loja...")
 def _calcular(empresa: str, loja: str, meses: int, versoes: tuple, params: calculo.Parametros,
-              correcoes: tuple = ()) -> tuple[pd.DataFrame, dict] | None:
-    """`versoes` e `params` só entram na chave do cache. 5 min: os brutos só
-    mudam de madrugada, mas uma foto nova precisa aparecer no mesmo dia."""
+              correcoes: tuple = (), foto: str | None = None) -> tuple[pd.DataFrame, dict] | None:
+    """`versoes`, `params` e `foto` só entram na chave do cache. `foto` = o
+    marcador do estoque da empresa (data + hora em que a rotina o gravou,
+    conferido a cada 5 min): foto nova → recalcula na hora. Antes o cache
+    expirava a cada 5 min e recalculava sem dado novo (~0,7 s, medido em
+    02/10/2026); a 1 h fica só de garantia pra dias de venda que a rotina
+    completa depois da foto."""
     from pedido import pronto
     from pedido.armazenamento import do_ambiente
     from pedido.plano import Chaves
@@ -121,6 +213,7 @@ def invalidar() -> None:
     _versoes.clear()
     _calcular.clear()
     configuracao.clear()
+    _invalidar_estado()   # personalização salva em Configurações: vale já, nesta sessão
 
 
 # ---------------------------------------------------------------------------
@@ -152,10 +245,9 @@ def _hora_local(momento: dt.datetime | None) -> str:
     return momento.replace(tzinfo=dt.timezone.utc).astimezone(ZoneInfo(settings.pedido.fuso)).strftime("%H:%M")
 
 
-def _rotulo_loja(l: dict) -> str:
-    local = "/".join(x for x in (l.get("cidade"), l.get("uf")) if x)
-    codigo = f" · cód. {l['legacy_id']}" if l.get("legacy_id") else ""
-    return f"{(l['razao_social'] or '').strip()} — {local}{codigo}"
+def _identificacao_loja(l: dict) -> str:
+    """"RAZÃO SOCIAL - 04.076.088/0001-86" (pop-up de Listas, 02/10/2026)."""
+    return f"{(l.get('razao_social') or '').strip()} - {ui.formatar_cnpj(l.get('cnpj') or '')}"
 
 
 # ---------------------------------------------------------------------------
@@ -175,50 +267,63 @@ def _colunas(p: calculo.Parametros) -> list[tb.ColunaTabela]:
         # Curva saía desigual no teste visual (29/09/2026).
         tb.ColunaTabela(None, "Status", id="status"),
         tb.ColunaTabela("curva", "Curva"),
+        # Dicas (02/10/2026): frases curtas, um parágrafo por ideia ("\n\n"),
+        # e "sistema de vendas" no lugar de "GPS" — é lá que a loja corrige.
         tb.ColunaTabela("preco", "Última compra", direita=True, numerica=True,
-                        dica="A compra mais recente não bonificada, por unidade, sem ST. Compra fora do padrão da "
-                             "loja fica de fora (\"a revisar\"). Sem compra: custo de cadastro do GPS (aproximado). "
-                             "Cadastro e nota muito diferentes: vale o que for coerente com o preço de venda."),
+                        dica="A compra mais recente, por unidade e sem ST. Bonificações não entram."),
         # "Venda 90 dias" no lugar de "Demanda/dia" (01/10/2026): "vendeu 15
         # em 90 dias" se entende; "0,17 por dia" parecia contradizer a
         # sugestão. Só exibição — a sugestão segue a demanda da janela.
-        tb.ColunaTabela("venda_90d", "Venda 90 dias", direita=True, numerica=True,
-                        dica="Unidades vendidas nos últimos 90 dias. A sugestão usa a média por dia da janela "
-                             "de vendas inteira (Configurações de Pedidos)."),
-        tb.ColunaTabela("estoque_max", "Mín./Máx.", direita=True, numerica=True,
-                        dica=f"Mín. = estoque para {p.dias_ruptura} dias de venda (abaixo: ruptura próxima). Máx. = "
-                             "onde o pedido + o estoque devem chegar."),
-        tb.ColunaTabela("estoque", "Est. atual", direita=True, numerica=True),
-        tb.ColunaTabela("quantidade", "Sugestão", direita=True, numerica=True,
-                        dica="A quantidade do pedido. Digite outro número para mudar; em azul = alterado à mão."),
+        # Quantidades centralizadas e dinheiro à direita (Q6 de 02/10/2026).
+        tb.ColunaTabela("venda_90d", "Venda 90 dias", centro=True, numerica=True,
+                        dica="Unidades vendidas nos últimos 90 dias.\n\nA sugestão usa a média por dia de todo "
+                             "o período de vendas."),
+        # "Ideal" no lugar de "Máx." (02/10/2026): é onde o estoque deve chegar.
+        tb.ColunaTabela("estoque_max", "Mín./Ideal", centro=True, numerica=True,
+                        dica=f"Mín.: estoque para {p.dias_ruptura} dias de venda; abaixo disso, ruptura próxima."
+                             "\n\nIdeal: onde o estoque deve chegar com o pedido."),
+        tb.ColunaTabela("estoque", "Est. atual", centro=True, numerica=True),
+        tb.ColunaTabela("quantidade", "Sugestão", centro=True, numerica=True,
+                        dica="A quantidade do pedido. Digite outro número para mudar.\n\nEm azul: alterada à mão."),
         tb.ColunaTabela("subtotal", "Subtotal", direita=True, numerica=True),
     ]
 
 
 _CLASSE_STATUS = {
+    calculo.A_REVISAR: "selo-revisar",
     calculo.NEGATIVO: "selo-perigo", calculo.RUPTURA: "selo-ruptura", calculo.RUPTURA_PROXIMA: "selo-sugestao",
     calculo.CORRIGIDO: "selo-alterado", calculo.ALTERADO: "selo-alterado",
     calculo.SEM_CLASSIFICACAO: "selo-neutro", calculo.GIRO_BAIXO: "selo-neutro",
+    calculo.VENDA_PONTUAL: "selo-sucesso",
 }
 
 
 def _dica_status(tag: str, r: dict, p: calculo.Parametros) -> str | None:
+    if tag == calculo.A_REVISAR:
+        return _dica_revisar(r)
     if tag == calculo.NEGATIVO:
-        return (f"EAN negativo no GPS: {r['eans_negativos']}. Conta como 0 no cálculo; corrija em "
-                "\"Estoque negativo\", no topo.")
+        return (f"O sistema de vendas mostra estoque negativo em: {r['eans_negativos']}.\n\n"
+                "No cálculo, o negativo conta como zero.")
     if tag == calculo.RUPTURA:
         return "Estoque zerado." if p.ruptura_unidades == 0 else f"Estoque de até {_numero(p.ruptura_unidades)} unidade(s)."
     if tag == calculo.RUPTURA_PROXIMA:
-        return f"O estoque dá para {p.dias_ruptura} dia(s) de venda ou menos."
+        return f"O estoque cobre {p.dias_ruptura} dia(s) de venda ou menos."
     if tag == calculo.CORRIGIDO:
-        return "O GPS mostra estoque negativo; vale o estoque corrigido aqui até a próxima foto sem negativo."
+        return ("O sistema de vendas mostra estoque negativo.\n\nVale o estoque digitado aqui até o sistema de "
+                "vendas deixar de mostrar negativo.")
     if tag == calculo.SEM_CLASSIFICACAO:
-        return (f"Produto sem categoria: sugestão com {p.dias_sem_classificacao} dias estimados. Classifique em "
-                "Dados → Pendências → Sem Classificação.")
+        return f"Produto sem categoria: sugestão com {p.dias_sem_classificacao} dias estimados."
     if tag == calculo.GIRO_BAIXO:
-        return f"No máximo {_numero(p.giro_baixo_max_unidades)} unidade(s) vendida(s) nos últimos {p.giro_baixo_dias} dias."
+        return f"Vendeu no máximo {_numero(p.giro_baixo_max_unidades)} unidade(s) nos últimos {p.giro_baixo_dias} dias."
+    if tag == calculo.VENDA_PONTUAL:
+        unidades = f"{_numero(r['unidades_90d'])} unidade" + ("" if r["unidades_90d"] == 1 else "s")
+        entre = ("os produtos que mais faturam na loja" if r["curva_valor"] == "A"
+                 else "os produtos que faturam bem na loja")
+        return (f"Produto de alto valor que vende pouco.\n\nVendeu {unidades} nos últimos "
+                f"{p.giro_baixo_dias} dias, mas essa venda o coloca entre {entre}.\n\n"
+                "Vem desmarcado: só entra no pedido se você marcar.")
     if tag == calculo.ALTERADO:
-        return f"Quantidade digitada à mão (o sistema sugeria {_numero(r['sugestao'])})."
+        return f"Quantidade digitada à mão.\n\nO sistema sugeria {_numero(r['sugestao'])}."
     return None
 
 
@@ -241,67 +346,97 @@ def _celula_status(r: dict, p: calculo.Parametros) -> list:
     return tb.celula(tb.pilha(tags))
 
 
-def _cadastro_nota_venda(r: dict) -> str:
-    return (f"cadastro {_moeda(r['custo_cadastro'])} · nota {_moeda(r['preco_nota'])} · "
-            f"preço de venda {_moeda(r['preco_venda'])}")
+def _preco_usado(r: dict) -> str:
+    """O preço que o pedido usa, dito como o usuário vê na coluna: com o
+    custo ajustado, é o cadastro — a dica do "A revisar" dizia "usa a compra
+    de R$ 40,29" no Carvedilol, que estava a R$ 3,53 (bug de 02/10/2026)."""
+    if r.get("custo_ajustado") == "cadastro":
+        return (f"o pedido usa o custo de cadastro do sistema de vendas ({_moeda(r['preco'])}), que combina com o "
+                f"preço de venda ({_moeda(r['preco_venda'])})")
+    return f"o pedido usa a compra de {_data(r['compra_data'])}, de {_moeda(r['preco'])}"
 
 
 def _dica_revisar(r: dict) -> str:
+    """Por que o preço está "A revisar" — o que aconteceu, qual preço o
+    pedido usou e onde corrigir (catálogo de dicas de 02/10/2026)."""
     motivo = r.get("revisar_motivo")
     if motivo == calculo.MOTIVO_DIVERGENCIA:
-        return (f"Custo de cadastro e nota muito diferentes ({_cadastro_nota_venda(r)}) e o preço de venda não "
-                "mostra qual está certo. Usada a nota; confira a fração no GPS.")
+        return (f"Preço a conferir.\n\nO custo de cadastro do sistema de vendas ({_moeda(r['custo_cadastro'])}) e a "
+                f"última nota ({_moeda(r['preco_nota'])}) estão muito diferentes, e o preço de venda "
+                f"({_moeda(r['preco_venda'])}) não mostra qual está certo.\n\nO pedido usa a nota. Confira a "
+                "fração no sistema de vendas.")
+    if motivo == calculo.MOTIVO_ACIMA_VENDA:
+        return (f"Preço a conferir.\n\nA nota de {_data(r['compra_ignorada_data'])}, de "
+                f"{_moeda(r['compra_ignorada_preco'])} por unidade, passava do preço de venda "
+                f"({_moeda(r['preco_venda'])}): provavelmente lançada sem a fração. O pedido usa a compra de "
+                f"{_data(r['compra_data'])}, de {_moeda(r['preco'])}.\n\nConfira as notas no sistema de vendas.")
     if motivo == calculo.MOTIVO_CADASTRO:
-        return (f"Sem compra na janela e o custo de cadastro ({_moeda(r['custo_cadastro'])}) está fora da faixa "
-                f"coerente com o preço de venda ({_moeda(r['preco_venda'])}). Confira o cadastro no GPS.")
+        return (f"Preço a conferir.\n\nSem compra nos últimos meses, o preço vem do cadastro do sistema de vendas "
+                f"({_moeda(r['custo_cadastro'])}). Esse valor não combina com o preço de venda "
+                f"({_moeda(r['preco_venda'])}).\n\nConfira o cadastro no sistema de vendas.")
     if pd.notna(r["compra_ignorada_preco"]):
-        return (f"A compra de {_data(r['compra_ignorada_data'])} a {_moeda(r['compra_ignorada_preco'])} ficou de "
-                "fora: muito diferente das outras compras deste produto.")
-    return "Todas as compras estão fora do padrão; usada a mais recente."
+        return (f"Preço a conferir.\n\nA compra de {_data(r['compra_ignorada_data'])}, de "
+                f"{_moeda(r['compra_ignorada_preco'])} por unidade, está muito diferente das outras compras deste "
+                f"produto e não foi usada como preço: {_preco_usado(r)}.\n\nConfira as notas no sistema de vendas. "
+                "Geralmente é a embalagem ou a fração lançada errada.")
+    return (f"Preço a conferir.\n\nAs compras deste produto variam muito entre si, e nenhuma serve de referência "
+            f"segura: {_preco_usado(r)}.\n\nConfira as notas no sistema de vendas.")
 
 
 def _dica_custo_ajustado(r: dict) -> str:
     if r.get("custo_ajustado") == "cadastro":
-        return (f"A nota ({_moeda(r['preco_nota'])}) está fora da faixa coerente com o preço de venda "
-                f"({_moeda(r['preco_venda'])}) — provavelmente sem a fração. Usado o custo de cadastro "
-                f"{_moeda(r['custo_cadastro'])}.")
-    return (f"O custo de cadastro do GPS ({_moeda(r['custo_cadastro'])}) está fora da faixa coerente com o preço "
-            f"de venda ({_moeda(r['preco_venda'])}); a nota está certa e foi usada. Vale corrigir o cadastro no GPS.")
+        return (f"Custo ajustado: a nota ({_moeda(r['preco_nota'])}) não combina com o preço de venda "
+                f"({_moeda(r['preco_venda'])}), provavelmente lançada sem a fração. Foi usado o cadastro "
+                f"({_moeda(r['custo_cadastro'])}).")
+    return (f"Custo ajustado: o cadastro do sistema de vendas ({_moeda(r['custo_cadastro'])}) não combina com o "
+            f"preço de venda ({_moeda(r['preco_venda'])}). A nota está certa e foi usada.\n\nVale corrigir o "
+            "cadastro no sistema de vendas.")
 
 
 def _celula_compra(r: dict) -> list:
-    linhas = [tb.pedaco(_moeda(r["preco"]))]
+    """Preço e data (desde 02/10/2026, sem etiquetas): "A revisar" foi pra
+    coluna Status, "custo ajustado" vai na dica do preço e da data, e preço
+    de cadastro/bonificação viram texto miúdo — são detalhe, não decisão."""
+    partes_dica = []
     if r["preco_origem"] == "compra":
-        detalhe = (f"VlrUnitario {_moeda(r['compra_vlr_unitario'])}, desconto "
-                   f"{_numero(r['compra_vlr_desconto'] or 0, 2)}%, embalagem de {_numero(r['compra_fracao'])} un."
-                   + (f" — {r['compra_fornecedor']}" if isinstance(r["compra_fornecedor"], str) else ""))
-        linhas.append(tb.pedaco(_data(r["compra_data"]), "aux", dica=detalhe))
-    elif r["preco_origem"] == "sem":
+        fornecedor = (f"\n\nFornecedor: {' '.join(r['compra_fornecedor'].split())}."
+                      if isinstance(r["compra_fornecedor"], str) and r["compra_fornecedor"].strip() else "")
+        partes_dica.append(
+            f"Última compra: {_moeda(r['compra_vlr_unitario'])} por embalagem de {_numero(r['compra_fracao'])} un., "
+            f"desconto de {_numero(r['compra_vlr_desconto'] or 0, 2)}%.{fornecedor}\n\nNo pedido, o preço é por "
+            "unidade, sem ST.")
+    if r.get("custo_ajustado"):
+        partes_dica.append(_dica_custo_ajustado(r))
+    dica = "\n\n".join(partes_dica) or None
+    if r["preco_origem"] == "sem":
         linhas = [tb.pedaco("—", "aux"), tb.pedaco("sem compra", "aux")]
+    else:
+        linhas = [tb.pedaco(_moeda(r["preco"]), dica=dica)]
+        if r["preco_origem"] == "compra":
+            linhas.append(tb.pedaco(_data(r["compra_data"]), "aux", dica=dica))
     for t in r["tags_preco"]:
         if t == calculo.BONIFICADO:
-            linhas.append(tb.pedaco(t, "selo-sucesso", "Houve bonificação (preço abaixo de R$ 0,10) depois desta "
-                                                      "compra; ela não entra no preço."))
-        elif t == calculo.A_REVISAR:
-            linhas.append(tb.pedaco(t, "selo-neutro", _dica_revisar(r)))
-        elif t == calculo.CUSTO_AJUSTADO:
-            linhas.append(tb.pedaco(t, "selo-alterado", _dica_custo_ajustado(r)))
+            linhas.append(tb.pedaco("· bonificado depois", "aux", "Depois desta compra houve uma bonificação (preço "
+                                                                 "abaixo de R$ 0,10). Ela não entra no preço."))
         elif t == calculo.CUSTO_CADASTRO:
-            linhas.append(tb.pedaco(t, "selo-neutro", "Sem compra paga na janela: preço de compra do cadastro do GPS "
-                                                      "(aproximado — bate com a última compra em só ~metade dos produtos)."))
+            # "-" no lugar de "· cadastro" (02/10/2026); a explicação fica na dica.
+            linhas.append(tb.pedaco("-", "aux", "Sem compra nos últimos meses.\n\nO preço é o custo de cadastro do "
+                                                "sistema de vendas, um valor aproximado."))
     return tb.celula(*linhas)
 
 
 def _celula_estoque(r: dict) -> list:
     if r["estoque_corrigido"]:
         return tb.celula(tb.pedaco(_numero(r["estoque"])),
-                         tb.pedaco(f"GPS: {_numero(r['estoque_gps'])}", "aux", "Estoque negativo no GPS, corrigido aqui."))
+                         tb.pedaco(f"PDV: {_numero(r['estoque_gps'])}", "aux",
+                                   "O sistema de vendas mostra estoque negativo.\n\nVale o estoque digitado aqui."))
     classe = ("txt-vermelho" if r["negativo"] else "txt-laranja" if r["ruptura"]
               else "txt-ambar" if r["ruptura_proxima"] else None)
     linhas = [tb.pedaco(_numero(r["estoque"]), classe)]
     if r["negativo"]:
-        linhas.append(tb.pedaco(f"GPS: {_numero(r['estoque_gps'])}", "aux txt-vermelho",
-                                f"EAN negativo no GPS: {r['eans_negativos']}. Conta como 0 no cálculo."))
+        # "PDV" (ponto de venda): onde não cabe "sistema de vendas" (02/10/2026).
+        linhas.append(tb.pedaco(f"PDV: {_numero(r['estoque_gps'])}", "aux txt-vermelho",
+                                "O sistema de vendas mostra estoque negativo.\n\nNo cálculo, conta como zero."))
     return tb.celula(*linhas)
 
 
@@ -314,7 +449,7 @@ def _celula_sugestao(r: dict) -> list:
     if r["aviso_embalagem"]:
         frac = _numero(r["compra_fracao"])
         linhas.append(tb.pedaco(f"emb. {frac}", "selo-sugestao",
-                                f"A última compra veio em embalagem de {frac} unidades; "
+                                f"A última compra veio em embalagem de {frac} unidades. "
                                 f"{_numero(r['quantidade'])} não fecha uma embalagem inteira."))
     return tb.celula(*linhas)
 
@@ -354,7 +489,7 @@ def _indicadores(pedido: pd.DataFrame, p: calculo.Parametros) -> None:
         {"icone": "moeda", "tom": "verde", "valor": ui.formatar_moeda(i.orcamento), "label": "Orçamento total",
          "sub": f"{ui.formatar_numero(i.unidades)} unidades marcadas"},
         {"icone": "produto", "tom": "roxo", "valor": ui.formatar_numero(i.itens), "label": "Itens com sugestão",
-         "sub": f"{ui.formatar_numero(i.marcados)} marcados"},
+         "sub": f"{ui.formatar_numero(i.marcados)} selecionados"},
         {"icone": "alerta", "tom": "ambar", "valor": ui.formatar_numero(i.ruptura), "label": "Ruptura",
          "sub": f"{ui.formatar_numero(i.ruptura_sem_pedido)} sem pedido"},
         {"icone": "duvida", "tom": "azul", "valor": ui.formatar_numero(sem), "label": "Sem classificação",
@@ -393,6 +528,7 @@ def _responder_aviso(usuario_id: int, loja_id: int, tipo: str, foto: str, respos
 
     with get_session() as session:
         pedido_area.marcar_aviso_visto(session, usuario_id, loja_id, tipo, foto, resposta)
+    _invalidar_estado()
 
 
 @st.dialog("Estoque negativo", dismissible=False)
@@ -402,7 +538,7 @@ def _alerta_negativos(usuario_id: int, loja_id: int, foto: str, n: int) -> None:
 
     st.markdown(f"**{ui.formatar_numero(n)} produto(s) com estoque negativo.** Deseja corrigir manualmente ou "
                 "considerar todos com estoque zero?")
-    st.caption("Com estoque zero, a sugestão cobre o máximo inteiro do produto. Corrigindo, a linha é recalculada "
+    st.caption("Com estoque zero, a sugestão cobre o ideal inteiro do produto. Corrigindo, a linha é recalculada "
                "com o estoque que você digitar; os que ficarem sem correção contam como zero. A pergunta volta "
                "quando chegar uma foto nova do estoque.")
     c1, c2 = st.columns(2)
@@ -446,27 +582,57 @@ def _escolher_parametros(loja_id: int, personalizado: ConfigPedido, padrao: Conf
         )
 
 
-def _linha_filtros(loja_id: int, todas: pd.DataFrame) -> tuple[str | None, tuple]:
-    """Busca, Categoria, Fabricante e Ocultar giro baixo, numa linha acima da
-    tabela (sem pop-up desde 01/10/2026). As opções vêm do que a loja tem na
-    lista — calculadas em memória com o resto da loja (~4 ms na Hudson) —
-    sem depender do "Ocultar giro baixo": uma opção que some da lista com a
-    escolha feita quebraria o campo."""
-    opcoes = calculo.opcoes_de_valor(todas[todas["listar"]])
-    categorias = [v for c, v in opcoes if c == "categoria"]
-    fabricantes = [v for c, v in opcoes if c == "laboratorio"]
+# Filtro Status: o valor fica em `<base>_valor` e o campo tem chave com
+# versão (`<base>_<n>`). Tirar "Giro baixo" de dentro do callback do
+# interruptor escrevendo na chave do campo funcionava uma vez; na escolha
+# seguinte o campo voltava vazio (visto em 05/10/2026). Campo novo, com o
+# valor certo como padrão, não tem esse problema.
+def _status_mudou(base: str) -> None:
+    """Filtro Status × "Ocultar giro baixo" (Q10/Q12 de 05/10/2026): escolher
+    "Giro baixo" desliga o interruptor; tirar "Giro baixo" o religa."""
+    novo = list(st.session_state.get(f"{base}_{st.session_state.get(f'{base}_v', 0)}", []))
+    antes = calculo.GIRO_BAIXO in st.session_state.get(f"{base}_valor", [])
+    agora = calculo.GIRO_BAIXO in novo
+    if agora != antes:
+        st.session_state[f"{_KEY}_giro"] = not agora
+    st.session_state[f"{base}_valor"] = novo
+
+
+def _giro_mudou(base: str) -> None:
+    """Religar "Ocultar giro baixo" tira "Giro baixo" do filtro Status (Q13)."""
+    valor = st.session_state.get(f"{base}_valor", [])
+    if st.session_state.get(f"{_KEY}_giro") and calculo.GIRO_BAIXO in valor:
+        st.session_state[f"{base}_valor"] = [t for t in valor if t != calculo.GIRO_BAIXO]
+        st.session_state[f"{base}_v"] = st.session_state.get(f"{base}_v", 0) + 1
+
+
+def _linha_filtros(loja_id: int, todas: pd.DataFrame) -> tuple[str | None, tuple, tuple, tuple]:
+    """Busca, Categoria, Status, Fabricante e Ocultar giro baixo, numa linha
+    acima da tabela (sem pop-up desde 01/10/2026; Status desde 05/10/2026).
+    As opções vêm do que a loja tem na lista — calculadas em memória com o
+    resto da loja (~4 ms na Hudson) — sem depender do "Ocultar giro baixo":
+    uma opção que some da lista com a escolha feita quebraria o campo (o
+    multiselect descarta calado o valor que não está nas opções)."""
+    listadas = todas[todas["listar"]]
+    categorias, fabricantes = calculo.opcoes_filtros(listadas)
+    base = f"{_KEY}_status_{loja_id}"
+    ja_escolhidos = st.session_state.get(f"{base}_valor", [])
+    status = [t for t in calculo.TAGS_STATUS if t in set(calculo.opcoes_status(listadas)) | set(ja_escolhidos)]
     with st.container(key="pedido-filtros-linha", horizontal=True, vertical_alignment="center", gap="small"):
         busca = st.text_input("Buscar", placeholder="Buscar produto, EAN ou fabricante", key=f"{_KEY}_busca",
+                              icon=":material/search:",
                               label_visibility="collapsed")
         escolhidas = st.multiselect("Categoria", categorias, placeholder="Categoria", key=f"{_KEY}_cat_{loja_id}",
                                     label_visibility="collapsed")
+        tags = st.multiselect("Status", status, default=ja_escolhidos, placeholder="Status",
+                              key=f"{base}_{st.session_state.get(f'{base}_v', 0)}",
+                              on_change=_status_mudou, args=(base,), label_visibility="collapsed")
         fabs = st.multiselect("Fabricante", fabricantes, placeholder="Fabricante", key=f"{_KEY}_fab_{loja_id}",
                               label_visibility="collapsed")
-        st.toggle("Ocultar giro baixo", value=True, key=f"{_KEY}_giro",
+        st.toggle("Ocultar giro baixo", value=True, key=f"{_KEY}_giro", on_change=_giro_mudou, args=(base,),
                   help="Ligado: os itens de giro baixo saem do pedido (não aparecem, não contam nos cards e não "
                        "vão na exportação).")
-    valores = tuple([("categoria", v) for v in escolhidas] + [("laboratorio", v) for v in fabs])
-    return (busca or None), valores
+    return (busca or None), tuple(escolhidas), tuple(fabs), tuple(tags)
 
 
 @st.dialog("Estoque negativo", width="large")
@@ -519,11 +685,11 @@ def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: 
             gravadas, removidas = pedido_rascunho.salvar_correcoes(session, loja["id"], valores, gps,
                                                                    meta.get("data_foto"), usuario["nome"])
         partes = [f"{gravadas} correção(ões) salva(s)"] + ([f"{removidas} removida(s)"] if removidas else [])
-        st.session_state[f"{_KEY}_msg"] = ("success", "Estoque negativo: " + ", ".join(partes) + ".")
+        _concluir("success", "Estoque negativo: " + ", ".join(partes) + ".")
         st.rerun()
 
 
-@st.dialog("Listas", width="large")
+@st.dialog("Listas", width="medium")   # "large" ficava largo demais (02/10/2026)
 def _dialog_listas(loja: dict, usuario: dict, pedido: pd.DataFrame, listas: list, aberta_id: int | None,
                    tem_alteracoes: bool) -> None:
     """Botão "Listas" do rodapé (02/10/2026): duas abas — salvar o pedido
@@ -537,7 +703,7 @@ def _dialog_listas(loja: dict, usuario: dict, pedido: pd.DataFrame, listas: list
                    "outra pessoa ver.")
         i = calculo.indicadores(pedido)
         st.markdown(comum.texto_markdown(
-            f"**{html.escape(_rotulo_loja(loja))}**  \n{ui.formatar_numero(i.marcados)} itens marcados · "
+            f"**{html.escape(_identificacao_loja(loja))}**  \n{ui.formatar_numero(i.marcados)} itens marcados · "
             f"{ui.formatar_numero(i.unidades)} unidades · {ui.formatar_moeda(i.orcamento)} · "
             f"{dt.datetime.now(ZoneInfo(settings.pedido.fuso)):%d/%m/%Y %H:%M}"))
         nome = st.text_input("Nome da lista", max_chars=120, placeholder="Ex.: Reposição semanal — genéricos",
@@ -550,7 +716,7 @@ def _dialog_listas(loja: dict, usuario: dict, pedido: pd.DataFrame, listas: list
             with get_session() as session:
                 pedido_area.salvar_lista(session, usuario["id"], usuario["nome"], loja["id"], nome, itens,
                                          i.unidades, i.orcamento)
-            st.session_state[f"{_KEY}_msg"] = ("success", f"Lista \"{nome.strip()}\" salva.")
+            _concluir("success", f"Lista \"{nome.strip()}\" salva.")
             st.rerun()
 
     with aba_salvas:
@@ -577,12 +743,12 @@ def _dialog_listas(loja: dict, usuario: dict, pedido: pd.DataFrame, listas: list
                         with get_session() as session:
                             pedido_area.abrir_lista(session, usuario["id"], loja["id"], l.id)
                         st.session_state.pop(f"{_KEY}_confirmar_abrir", None)
-                        st.session_state[f"{_KEY}_msg"] = ("success", f"Lista \"{l.nome}\" aberta na sua área de trabalho.")
+                        _concluir("success", f"Lista \"{l.nome}\" aberta na sua área de trabalho.")
                         st.rerun()
                 if c3.button("Excluir", key=f"{_KEY}_excluir_{l.id}", use_container_width=True):
                     with get_session() as session:
                         pedido_area.excluir_lista(session, l.id)
-                    st.session_state[f"{_KEY}_msg"] = ("success", f"Lista \"{l.nome}\" excluída.")
+                    _concluir("success", f"Lista \"{l.nome}\" excluída.")
                     st.rerun()
 
 
@@ -598,7 +764,7 @@ def _dialog_descartar(loja: dict, usuario: dict, alterados: int) -> None:
     if c2.button("Descartar", type="primary", use_container_width=True):
         with get_session() as session:
             pedido_area.descartar(session, usuario["id"], loja["id"])
-        st.session_state[f"{_KEY}_msg"] = ("success", "Alterações descartadas: o pedido voltou à sugestão.")
+        _concluir("success", "Alterações descartadas: o pedido voltou à sugestão.")
         st.rerun()
 
 
@@ -667,7 +833,7 @@ def _dialog_exportar(loja: dict, pedido: pd.DataFrame, todas: pd.DataFrame, usua
                 pedido_rascunho.registrar_exportacao(session, loja["id"], formato, len(tabela), i.unidades,
                                                      i.orcamento, usuario["nome"])
                 lista = pedido_area.ao_exportar(session, usuario["id"], loja["id"])
-            st.session_state[f"{_KEY}_msg"] = ("success", "Pedido exportado" + (
+            _concluir("success", "Pedido exportado" + (
                 f"; a lista \"{lista}\" foi encerrada." if lista else "."))
             st.session_state[f"{_KEY}_exportou"] = True
 
@@ -676,8 +842,8 @@ def _dialog_exportar(loja: dict, pedido: pd.DataFrame, todas: pd.DataFrame, usua
                            on_click=_registrar, key=f"{_KEY}_baixar")
     elif tipo == "completa":
         abas = {"Pedido": calculo.tabela_completa(pedido), "Giro baixo": calculo.giro_baixo(todas)}
-        st.caption(f"Pedido: {ui.formatar_numero(len(abas['Pedido']))} itens · Giro baixo: "
-                   f"{ui.formatar_numero(len(abas['Giro baixo']))} produtos.")
+        st.markdown(comum.texto_markdown(f"**{ui.formatar_numero(len(abas['Pedido']))}** itens no pedido · "
+                                         f"**{ui.formatar_numero(len(abas['Giro baixo']))}** produtos de giro baixo"))
         st.download_button("Baixar Excel", data=_excel(abas), file_name=f"assistente_pedido_completo_{codigo}_{hoje}.xlsx",
                            mime=_XLSX, type="primary", use_container_width=True, key=f"{_KEY}_baixar_completa")
     else:
@@ -712,9 +878,14 @@ def _titulo() -> None:
 
 
 def _render() -> None:
-    from integrations import configuracao_pedido, pedido_area, pedido_rascunho
+    from integrations import pedido_area
 
     usuario = auth.usuario_atual()
+    # Resultado de uma ação (lista salva, exportação…): notificação, logo no
+    # início — antes de qualquer saída antecipada da tela.
+    mensagem = st.session_state.pop(f"{_KEY}_msg", None)
+    if mensagem:
+        _notificar(*mensagem)
     # A loja vem da barra lateral (02/10/2026). "Todas" não carrega: a
     # sugestão, o estoque e a exportação são de uma loja por vez.
     escolha = loja_barra.escolha(usuario)
@@ -732,21 +903,19 @@ def _render() -> None:
         return
 
     uid = usuario["id"] if usuario.get("id") is not None else -1
-    with get_session() as session:
-        correcoes = pedido_rascunho.correcoes(session, loja["id"])
-        area = pedido_area.area(session, uid, loja["id"])
-        listas = pedido_area.listas(session, loja["id"])
-        avisos = pedido_area.avisos(session, uid, usuario["nome"], loja["id"], dt.datetime.utcnow().date())
-        vistos = pedido_area.avisos_vistos(session, uid, loja["id"])
-        personalizacao = configuracao_pedido.da_loja(session, loja["id"])
+    estado = _estado_loja(uid, usuario["nome"], loja["id"])
+    correcoes, area, listas = estado.correcoes, estado.area, estado.listas
+    avisos, vistos, personalizacao = estado.avisos, estado.vistos, estado.personalizacao
     padrao = configuracao()
     # Loja com personalização: vale a pílula escolhida; enquanto nenhuma for
     # escolhida, os pop-ups contam pelo padrão (a lista ainda não aparece).
     escolha = st.session_state.get(f"{_KEY}_param_{loja['id']}") if personalizacao else None
     config = cfg.aplicar(padrao, personalizacao) if escolha == "loja" else padrao
     p = parametros(config)
+    marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
     resultado = _calcular(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados, _versoes(), p,
-                          tuple(sorted((l, c.estoque) for l, c in correcoes.items())))
+                          tuple(sorted((l, c.estoque) for l, c in correcoes.items())),
+                          foto=f"{marcador.get('data')}|{marcador.get('gerado_em')}")
     if resultado is None:
         st.info("Os dados desta loja ainda não foram coletados. A rotina da madrugada traz as vendas, as "
                 "compras e o estoque do GPS; a loja aparece aqui no dia seguinte à primeira coleta.")
@@ -775,54 +944,60 @@ def _render() -> None:
         _alerta_sem_classificacao(uid, loja["id"], foto, n_sem, p.dias_sem_classificacao)
 
     if personalizacao and _escolher_parametros(loja["id"], cfg.aplicar(padrao, personalizacao), padrao) is None:
-        st.info("Esta loja tem parâmetros personalizados. Escolha acima com quais parâmetros ver a sugestão.")
+        _avisar_uma_vez(loja["id"], "info", "Esta loja tem parâmetros personalizados. Escolha acima com quais "
+                                            "parâmetros ver a sugestão.")
         return
 
     for aviso in avisos:
-        st.warning(aviso, icon=":material/group:")
+        _avisar_uma_vez(loja["id"], "warning", aviso)
     sem_vendas, sem_compras = meta.get("dias_sem_vendas", []), meta.get("dias_sem_compras", [])
     if sem_vendas:
-        st.warning(f"{len(sem_vendas)} dia(s) sem vendas coletadas (a demanda usa só os dias com dado).")
+        _avisar_uma_vez(loja["id"], "warning",
+                        f"{len(sem_vendas)} dia(s) sem vendas coletadas (a demanda usa só os dias com dado).")
     if sem_compras:
-        st.info(f"Compras de {len(sem_compras)} dia(s) ainda não coletadas — nesses dias, o preço pode vir do "
-                "custo de cadastro.")
+        _avisar_uma_vez(loja["id"], "info", f"Compras de {len(sem_compras)} dia(s) ainda não coletadas — nesses "
+                                            "dias, o preço pode vir do custo de cadastro.")
 
     _indicadores(pedido, p)
-    busca, valores = _linha_filtros(loja["id"], todas)
-    filtros = calculo.Filtros(valores=valores, hoje=meta["data_foto"])
-    linhas = calculo.filtrar(todas, busca=busca, ocultar_giro_baixo=ocultar, filtros=filtros)
-    mensagem = st.session_state.pop(f"{_KEY}_msg", None)
-    if mensagem:
-        getattr(st, mensagem[0])(mensagem[1])
+    busca, categorias, fabricantes, status = _linha_filtros(loja["id"], todas)
+    linhas = calculo.filtrar(todas, busca=busca, ocultar_giro_baixo=ocultar, categorias=categorias,
+                             fabricantes=fabricantes, status=status)
 
-    ui.resetar_pagina_se_filtro_mudou(_KEY, f"{loja['id']}|{busca}|{valores}|{ocultar}|{escolha}")
+    ui.resetar_pagina_se_filtro_mudou(
+        _KEY, f"{loja['id']}|{busca}|{categorias}|{fabricantes}|{status}|{ocultar}|{escolha}")
     ordem = st.session_state.get(f"{_KEY}_ordem")
     if ordem is None:
         # Padrão (Q14 de 01/10/2026): os "a revisar" primeiro, depois o que
-        # mais vende em valor. Clicar num título troca pela ordem da coluna.
+        # mais vende em valor; "Venda pontual" (desmarcados) no fim — Q14 de
+        # 05/10/2026. Clicar num título troca pela ordem da coluna.
         ordem = _ORDEM_PADRAO
-        ordenadas = linhas.sort_values(["a_revisar", "valor"], ascending=[False, False], kind="stable")
+        ordenadas = linhas.sort_values(["venda_pontual", "a_revisar", "valor"], ascending=[True, False, False],
+                                       kind="stable")
     else:
         ordenadas = analise.ordenar(linhas, *ordem)
     fatia, pagina = comum.pagina(ordenadas, _KEY)
-    sugestao_da_linha = dict(zip(todas["linha"], todas["sugestao"]))
 
     def _editar(linha: str, texto: str) -> None:
         texto = texto.strip()
         if not texto.isdigit():
-            st.session_state[f"{_KEY}_msg"] = ("warning", "Quantidade não gravada: use um número inteiro, 0 ou maior.")
+            st.session_state[f"{_KEY}_msg"] = ("error", "Quantidade não gravada: use um número inteiro, 0 ou maior.")
             return
+        # Só a linha digitada (antes: um dicionário das ~5 mil linhas a cada clique).
+        achada = todas.loc[todas["linha"] == linha, "sugestao"]
+        sugestao = int(achada.iloc[0]) if not achada.empty else 0
         with get_session() as s2:
-            pedido_area.alterar_quantidade(s2, uid, loja["id"], linha, int(texto), int(sugestao_da_linha.get(linha, 0)))
+            pedido_area.alterar_quantidade(s2, uid, loja["id"], linha, int(texto), sugestao)
+        _atualizar_area(uid, loja["id"], lambda itens: pedido_area.com_quantidade(itens, linha, int(texto), sugestao))
 
     def _marcar(marcacoes: dict[str, bool]) -> None:
         with get_session() as s2:
             pedido_area.marcar(s2, uid, loja["id"], marcacoes)
+        _atualizar_area(uid, loja["id"], lambda itens: pedido_area.com_marcacoes(itens, marcacoes))
 
     tb.tabela(
         f"{_KEY}_tabela", _colunas(p), [_linha(r, p) for r in fatia.to_dict("records")], ordem,
         ao_ordenar=lambda coluna: comum.alternar_ordem(_KEY, coluna.campo, coluna.numerica),
-        vazio=("Nenhum produto para pedir", "O estoque desta loja cobre o máximo de todos os produtos com esses filtros"),
+        vazio=("Nenhum produto para pedir", "O estoque desta loja cobre o ideal de todos os produtos com esses filtros"),
         densa=True, ao_editar=_editar,
         selecao=dict(zip(fatia["linha"], fatia["selecionado"])), ao_marcar=_marcar,
     )
@@ -842,12 +1017,17 @@ def _rodape(loja: dict, usuario: dict, pedido: pd.DataFrame, todas: pd.DataFrame
         # Botões na largura natural, alinhados à direita: em colunas iguais,
         # "Descartar alterações" quebrava em 2 linhas em 1280 px (29/09/2026).
         esq, dir_ = st.columns([1, 3.4], vertical_alignment="center")
-        texto = (f"Salvo automaticamente · {_hora_local(area.atualizado_em)}" if area.atualizado_em is not None
-                 else "Segue a sugestão")
-        esq.markdown(f'<span class="rmc-muted">{texto}</span>', unsafe_allow_html=True)
+        if area.atualizado_em is not None:
+            # ✓ do mesmo tamanho e cinza-esverdeado apagado: diz "está salvo"
+            # sem chamar atenção (Q8 de 02/10/2026).
+            esq.markdown(f'<span class="rmc-muted"><span class="rmc-salvo">✓</span> Salvo automaticamente · '
+                         f'{_hora_local(area.atualizado_em)}</span>', unsafe_allow_html=True)
+        else:
+            esq.markdown('<span class="rmc-muted">Segue a sugestão</span>', unsafe_allow_html=True)
         # "Ocultar giro baixo" saiu daqui pra linha de filtros (01/10/2026).
         with dir_.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", gap="small"):
-            if st.button("Descartar alterações", key=f"{_KEY}_descartar", disabled=not area.itens):
+            if st.button("Descartar alterações", key=f"{_KEY}_descartar", disabled=not area.itens,
+                         icon=":material/delete:"):
                 _dialog_descartar(loja, usuario, len(area.itens))
             # "Listas (N)": o nº avisa, sem abrir nada, que já há pedido montado
             # pra esta loja (era a função do botão do topo, que saiu).

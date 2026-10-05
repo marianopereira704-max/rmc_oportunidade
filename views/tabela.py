@@ -91,6 +91,7 @@ class ColunaTabela:
     # dentro da coluna e o vão visível fica maior que os outros.
     largura: str = "auto"
     direita: bool = False   # números e valores alinham à direita
+    centro: bool = False    # quantidades centralizadas (Assistente de pedido, 02/10/2026)
     numerica: bool = False  # 1º clique: número do maior pro menor, texto de A a Z
     dica: str | None = None  # "?" ao lado do título, com esta explicação
     icone: str | None = None  # ícone à esquerda do conteúdo de cada célula: "local" | "pessoa"
@@ -131,15 +132,19 @@ _CSS = """
   word-break: normal;
   align-items: center;
   padding: var(--esp-3, 12px) var(--esp-4, 16px);
-  border-top: 1px solid var(--borda, #E4E7EB);
+  /* --borda-linha: a tela pode deixar a divisória mais clara (o Assistente
+     de pedido usa #EEF0F3, 02/10/2026); sem ela, a borda padrão. */
+  border-top: 1px solid var(--borda-linha, var(--borda, #E4E7EB));
 }
 .vazio { grid-column: 1 / -1; }
 .linha.corpo:hover { background: rgba(23, 55, 94, 0.03); }
 /* Linha em destaque (`"classe": "revisar"` na linha): "a revisar" do
    Assistente de pedido — âmbar, não vermelho (vermelho é erro; 01/10/2026).
    Barra por box-shadow: não ocupa largura, o grid não se mexe. */
-.linha.corpo.revisar { background: #FDF6EA; box-shadow: inset 3px 0 0 #D29B3A; }
-.linha.corpo.revisar:hover { background: #FBF0DC; }
+/* Desde 02/10/2026 só a barra na borda esquerda, sem o fundo bege: com
+   muitas linhas "a revisar" o fundo virava uma massa de cor (a tag "A
+   revisar" no Status já diz o motivo). */
+.linha.corpo.revisar { box-shadow: inset 3px 0 0 #D29B3A; }
 /* `"classe": "destaque"`: a loja escolhida na barra lateral, na Por Loja
    (visão da rede, 02/10/2026) — azul claro, a cor de "selecionado". */
 .linha.corpo.destaque { background: #EEF4FB; box-shadow: inset 3px 0 0 var(--navy, #17375E); }
@@ -164,6 +169,7 @@ _CSS = """
    (com ele, em 1280 px o selo de Economia invadia o vão até o botão). */
 .cel { overflow-wrap: break-word; }
 .cel.direita { text-align: right; white-space: nowrap; }
+.cel.centro { text-align: center; white-space: nowrap; }
 .cabecalho .titulo { white-space: nowrap; }
 .cel > div + div { margin-top: 2px; }
 /* Célula com ícone (Localização, Responsável): ícone à esquerda, centrado
@@ -224,6 +230,10 @@ button.titulo:focus-visible { outline: 2px solid var(--navy, #17375E); outline-o
 .selo-perigo { background: #FDE2E1; color: #9B1C1C; }
 .selo-ruptura { background: #FEE4D2; color: #9A3412; }
 .selo-alterado { background: #DCE9F7; color: #123A63; }
+/* "A revisar" (02/10/2026): âmbar de atenção só no CONTORNO, fundo branco —
+   não se confunde com "Ruptura próxima" (âmbar cheio). Contorno por sombra:
+   borda de verdade mudaria a altura da tag. */
+.selo-revisar { background: #FFFFFF; color: #854F0B; box-shadow: inset 0 0 0 1px #D29B3A; }
 .txt-vermelho { color: #B3261E; font-weight: 600; }
 .txt-laranja { color: #C2410C; font-weight: 600; }
 .txt-ambar { color: #B45309; font-weight: 600; }
@@ -276,7 +286,10 @@ button.titulo:focus-visible { outline: 2px solid var(--navy, #17375E); outline-o
 [data-dica]:hover::after, [data-dica]:focus-visible::after {
   content: attr(data-dica);
   position: absolute; z-index: 20; pointer-events: none;
-  width: max-content; max-width: 280px; white-space: normal; text-align: left;
+  /* pre-line: "
+
+" no texto vira parágrafo (dicas de 02/10/2026). */
+  width: max-content; max-width: 300px; white-space: pre-line; text-align: left;
   background: #1F2A37; color: #FFFFFF;
   font-size: var(--fs-min, 12px); font-weight: 400; line-height: 1.4;
   padding: 6px 10px; border-radius: var(--raio-sm, 6px);
@@ -408,7 +421,7 @@ export default function (component) {
     cab.appendChild(cel);
   }
   for (const c of colunas) {
-    const cel = el("div", "cel" + (c.direita ? " direita" : ""));
+    const cel = el("div", "cel" + (c.direita ? " direita" : "") + (c.centro ? " centro" : ""));
     cel.setAttribute("role", "columnheader");
     const ativa = data.ordem && data.ordem[0] === c.campo;
     const titulo = el(c.campo ? "button" : "span", "titulo");
@@ -449,7 +462,7 @@ export default function (component) {
       linha.appendChild(cel);
     }
     for (const c of colunas) {
-      const cel = el("div", "cel" + (c.direita ? " direita" : ""));
+      const cel = el("div", "cel" + (c.direita ? " direita" : "") + (c.centro ? " centro" : ""));
       cel.setAttribute("role", "cell");
       if (c.icone && ICONES_CEL[c.icone]) {
         cel.classList.add("com-icone");
@@ -542,7 +555,7 @@ def tabela(
         data={
             "colunas": [
                 {"id": c.id, "campo": c.campo, "rotulo": c.rotulo, "largura": c.largura,
-                 "direita": c.direita, "dica": c.dica, "icone": c.icone}
+                 "direita": c.direita, "centro": c.centro, "dica": c.dica, "icone": c.icone}
                 for c in colunas
             ],
             "linhas": linhas,
