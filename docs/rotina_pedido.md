@@ -34,6 +34,9 @@ As chaves **nunca** vão no código (o repositório é público). No GitHub:
 | `DO_SPACES_SECRET_KEY` | `DO_SPACES_SECRET_KEY` |
 | `SISTEMA_INTERNO_BASE_URL` | `SISTEMA_INTERNO_BASE_URL` |
 | `SISTEMA_INTERNO_TOKEN` | `SISTEMA_INTERNO_TOKEN` |
+| `EMAIL_REMETENTE` | `EMAIL_REMETENTE` (alerta por e-mail, 28/10/2026) |
+| `EMAIL_SENHA_APP` | `EMAIL_SENHA_APP` |
+| `ALERTA_DESTINATARIOS` | não está no secrets.toml: os e-mails que recebem o alerta, separados por vírgula |
 
 Quando trocar uma chave (a da API do GPS e a do Spaces estão pendentes de
 troca), atualize aqui também.
@@ -84,6 +87,24 @@ arquivo do mês é refeito quando muda a lista de lojas ou a data da baixa).
 - O último mês fechado é baixado de novo todo dia até o **dia 6** do mês
   seguinte (notas lançadas com atraso); só então ele aparece na Análise.
 - As compras dos **últimos 5 dias** são baixadas de novo toda noite.
+
+## 4b. Alerta por e-mail (28/10/2026)
+
+Por último, o job **Alerta por e-mail** (`python -m pedido.alerta`) lê os
+relatórios do dia e manda e-mail para `ALERTA_DESTINATARIOS` **só quando há
+problema**: parte sem relatório, parte que caiu com erro, nenhuma loja com
+foto de estoque, ou queda de mais de 5% nas lojas com foto contra a noite
+anterior (e "nenhum relatório desde …" quando a rotina parou de rodar). O
+resumo de cada dia fica em `pedido/controle/alerta/<data>.json`. No log do
+GitHub só aparece "nada a avisar" ou "alerta enviado". Se o e-mail não sair,
+o job falha e o aviso de falha do próprio GitHub chega.
+
+Desde 28/10/2026 a fase de carga não segura mais a noite: a parte que
+termina a sua fatia da carga com pelo menos 10 min de orçamento segue, na
+mesma execução, para a manutenção (estoque, histórico, mês corrente). Motivo:
+a API passou a listar 150 "empresas" sem cadastro (lojas "derivada de
+tb_estoque", sem nome nem CNPJ, nenhuma da rede) e, de 25 a 28/10, nenhuma
+loja ganhou foto de estoque.
 
 ## 5. Base de categorias (uma vez)
 

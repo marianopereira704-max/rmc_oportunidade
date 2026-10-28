@@ -19,7 +19,7 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from core import analise, analise_api, dicas, theme, ui
+from core import analise, analise_api, dicas, revisar, theme, ui
 from core.config import settings
 from core.db import get_session
 from core.queries import (PaginaResultado, lista_atendentes, lista_grupos_economicos, lista_lojas, lista_ufs,
@@ -534,9 +534,8 @@ _DICA_REVISAR = {
 def _dica_revisar(r: dict) -> str:
     texto = _DICA_REVISAR.get(r.get("revisar_motivo"), "O preço desta compra parece errado.").format(
         cadastro=moeda(r["custo_cadastro"]), nota=moeda(r["preco_nota"]), venda=moeda(r["preco_venda"]))
-    return dicas.dica("Preço a conferir.", texto,
-                      "Esta compra não soma economia. Confira a nota no sistema de vendas: geralmente é a "
-                      "embalagem ou a fração lançada errada.")
+    return dicas.dica("Preço a conferir.", f"{texto} Esta compra não soma economia.",
+                      revisar.acao(r.get("revisar_motivo")))
 
 
 def colunas_notas(laboratorio: str, com_produto: bool = True) -> list[tb.ColunaTabela]:

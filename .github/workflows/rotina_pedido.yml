@@ -81,3 +81,32 @@ jobs:
           DO_SPACES_BUCKET: ${{ secrets.DO_SPACES_BUCKET }}
           DO_SPACES_ACCESS_KEY: ${{ secrets.DO_SPACES_ACCESS_KEY }}
           DO_SPACES_SECRET_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+
+  # Alerta por e-mail (pedido/alerta.py, 28/10/2026): só quando a execução
+  # trouxe menos do que devia (parte sem relatório, erro, nenhuma foto de
+  # estoque, queda de lojas). Falha da rotina inteira o GitHub já avisa.
+  alerta:
+    name: Alerta por e-mail
+    needs: [coleta, rede]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Alerta
+        run: python -m pedido.alerta --partes 8
+        env:
+          RMC_IGNORAR_SECRETS: "1"
+          DO_SPACES_ENDPOINT: ${{ secrets.DO_SPACES_ENDPOINT }}
+          DO_SPACES_REGION: ${{ secrets.DO_SPACES_REGION }}
+          DO_SPACES_BUCKET: ${{ secrets.DO_SPACES_BUCKET }}
+          DO_SPACES_ACCESS_KEY: ${{ secrets.DO_SPACES_ACCESS_KEY }}
+          DO_SPACES_SECRET_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+          EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
+          EMAIL_SENHA_APP: ${{ secrets.EMAIL_SENHA_APP }}
+          ALERTA_DESTINATARIOS: ${{ secrets.ALERTA_DESTINATARIOS }}

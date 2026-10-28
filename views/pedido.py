@@ -43,7 +43,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from core import acesso, analise, auth, dicas, theme, ui
+from core import acesso, analise, auth, dicas, revisar, theme, ui
 from core.config import settings
 from core.db import get_session
 from pedido import calculo
@@ -417,29 +417,37 @@ def _preco_usado(r: dict) -> str:
 
 def _dica_revisar(r: dict) -> str:
     """Por que o preço está "A revisar" — o que aconteceu, qual preço o
-    pedido usou e onde corrigir (catálogo de dicas de 02/10/2026)."""
+    pedido usou e o que fazer (catálogo de dicas de 02/10/2026; a ação, uma
+    por motivo e igual nas três telas, vem de core/revisar.py desde 28/10)."""
     motivo = r.get("revisar_motivo")
     if motivo == calculo.MOTIVO_DIVERGENCIA:
-        return (f"Preço a conferir.\n\nO custo de cadastro do sistema de vendas ({_moeda(r['custo_cadastro'])}) e a "
-                f"última nota ({_moeda(r['preco_nota'])}) estão muito diferentes, e o preço de venda "
-                f"({_moeda(r['preco_venda'])}) não mostra qual está certo.\n\nO pedido usa a nota. Confira a "
-                "fração no sistema de vendas.")
+        return dicas.dica("Preço a conferir.",
+                          f"O custo de cadastro do sistema de vendas ({_moeda(r['custo_cadastro'])}) e a última nota "
+                          f"({_moeda(r['preco_nota'])}) estão muito diferentes, e o preço de venda "
+                          f"({_moeda(r['preco_venda'])}) não mostra qual está certo. O pedido usa a nota.",
+                          revisar.acao(motivo))
     if motivo == calculo.MOTIVO_ACIMA_VENDA:
-        return (f"Preço a conferir.\n\nA nota de {_data(r['compra_ignorada_data'])}, de "
-                f"{_moeda(r['compra_ignorada_preco'])} por unidade, passava do preço de venda "
-                f"({_moeda(r['preco_venda'])}): provavelmente lançada sem a fração. O pedido usa a compra de "
-                f"{_data(r['compra_data'])}, de {_moeda(r['preco'])}.\n\nConfira as notas no sistema de vendas.")
+        return dicas.dica("Preço a conferir.",
+                          f"A nota de {_data(r['compra_ignorada_data'])}, de {_moeda(r['compra_ignorada_preco'])} por "
+                          f"unidade, passava do preço de venda ({_moeda(r['preco_venda'])}). O pedido usa a compra de "
+                          f"{_data(r['compra_data'])}, de {_moeda(r['preco'])}.",
+                          revisar.acao(motivo))
     if motivo == calculo.MOTIVO_CADASTRO:
-        return (f"Preço a conferir.\n\nSem compra nos últimos meses, o preço vem do cadastro do sistema de vendas "
-                f"({_moeda(r['custo_cadastro'])}). Esse valor não combina com o preço de venda "
-                f"({_moeda(r['preco_venda'])}).\n\nConfira o cadastro no sistema de vendas.")
+        return dicas.dica("Preço a conferir.",
+                          f"Sem compra nos últimos meses, o preço vem do cadastro do sistema de vendas "
+                          f"({_moeda(r['custo_cadastro'])}). Esse valor não combina com o preço de venda "
+                          f"({_moeda(r['preco_venda'])}).",
+                          revisar.acao(motivo))
     if pd.notna(r["compra_ignorada_preco"]):
-        return (f"Preço a conferir.\n\nA compra de {_data(r['compra_ignorada_data'])}, de "
-                f"{_moeda(r['compra_ignorada_preco'])} por unidade, está muito diferente das outras compras deste "
-                f"produto e não foi usada como preço: {_preco_usado(r)}.\n\nConfira as notas no sistema de vendas. "
-                "Geralmente é a embalagem ou a fração lançada errada.")
-    return (f"Preço a conferir.\n\nAs compras deste produto variam muito entre si, e nenhuma serve de referência "
-            f"segura: {_preco_usado(r)}.\n\nConfira as notas no sistema de vendas.")
+        return dicas.dica("Preço a conferir.",
+                          f"A compra de {_data(r['compra_ignorada_data'])}, de {_moeda(r['compra_ignorada_preco'])} "
+                          f"por unidade, está muito diferente das outras compras deste produto e não foi usada como "
+                          f"preço: {_preco_usado(r)}.",
+                          revisar.acao(calculo.MOTIVO_COMPRA))
+    return dicas.dica("Preço a conferir.",
+                      f"As compras deste produto variam muito entre si, e nenhuma serve de referência segura: "
+                      f"{_preco_usado(r)}.",
+                      revisar.acao(calculo.MOTIVO_COMPRA))
 
 
 def _dica_custo_ajustado(r: dict) -> str:

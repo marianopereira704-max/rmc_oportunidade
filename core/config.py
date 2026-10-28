@@ -221,6 +221,10 @@ class EmailConfig:
     app_url: str = field(default_factory=lambda: (_get("APP_URL", "http://localhost:8501") or "").rstrip("/"))
     horas_ativacao: int = 48
     horas_recuperacao: int = 1
+    # Alerta da rotina do Pedido (pedido/alerta.py, 28/10/2026): e-mails separados por vírgula, nos Secrets do
+    # GitHub — o repositório é público.
+    destinatarios_alerta: list[str] = field(default_factory=lambda: [
+        e.strip() for e in (_get("ALERTA_DESTINATARIOS", "") or "").split(",") if e.strip()])
 
     @property
     def configured(self) -> bool:

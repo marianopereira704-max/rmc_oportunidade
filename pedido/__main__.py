@@ -90,6 +90,11 @@ ESPERAS_INICIAIS = (60, 300, 600)
 # publicar código se um dia precisar de outro par de meses.
 MESES_CARGA = [m.strip() for m in os.environ.get("PEDIDO_CARGA_MESES", "2026-08,2026-09").split(",") if m.strip()]
 TENTATIVAS_CARGA = 3   # empresa que falha 3 vezes na carga deixa de segurar a manutenção (Q2)
+# Parte que termina a SUA fatia da carga com pelo menos isto de orçamento sobrando segue para a manutenção na
+# mesma execução (28/10/2026): a API passou a listar 150 "empresas" novas sem cadastro (lojas "derivada de
+# tb_estoque", sem nome nem CNPJ, nenhuma da rede) — a carga delas levou 83 s e, mesmo assim, a execução acabou ali,
+# sem estoque nem histórico de nenhuma loja. Cada empresa nova que o GPS cadastrar custaria uma noite inteira.
+MINIMO_PARA_MANUTENCAO_SEG = 10 * 60
 
 
 def _carga_concluida(marcador: dict | None) -> bool:
@@ -219,18 +224,19 @@ def _executar(a, hoje: dt.date, armaz, chaves: Chaves, parte: str) -> int:
     cliente = cliente_das_configuracoes(timeout_segundos=settings.pedido.timeout_consulta_segundos, tentativas=1,
                                         sessao_http=_SessaoComPrazo(settings.pedido.timeout_consulta_segundos))
 
+    inicio = time.monotonic()
     if a.empresas:
-        empresas = [e.strip() for e in a.empresas.split(",") if e.strip()]
+        todas = [e.strip() for e in a.empresas.split(",") if e.strip()]
     else:
-        empresas = _com_tentativas(lambda: [str(e["idEmpresa"]) for e in cliente.listar_empresas()],
-                                   "lista de empresas do GPS")
+        todas = _com_tentativas(lambda: [str(e["idEmpresa"]) for e in cliente.listar_empresas()],
+                                "lista de empresas do GPS")
     status = _status_carga(armaz, chaves)
     if a.so_estoque:
         # Todas as empresas, divididas entre as partes, sem olhar a fase: a foto do estoque não depende da carga.
-        fase, empresas = "completa", coleta.dividir(empresas, a.parte, a.partes)
+        fase, empresas = "completa", coleta.dividir(todas, a.parte, a.partes)
         print(f"Só estoque: esta parte pega {len(empresas)} empresa(s)", flush=True)
     else:
-        fase, empresas = _fase_e_empresas(empresas, status, a.parte, a.partes)
+        fase, empresas = _fase_e_empresas(todas, status, a.parte, a.partes)
     if a.so_estoque:
         pass
     elif fase == "carga":
@@ -259,6 +265,22 @@ def _executar(a, hoje: dt.date, armaz, chaves: Chaves, parte: str) -> int:
     )
     rel = rotina.executar(empresas, parte)
     armaz.salvar_json(chaves.execucao(hoje, parte, time.strftime("%H%M%S")), coleta.relatorio_dict(rel))
+
+    # A fatia da carga desta parte acabou sem parar pelo tempo: o que sobra do orçamento vai para a manutenção. As
+    # outras partes cuidam das pendentes delas, então não há por que esperar por elas (e o status de quem ainda está
+    # rodando nem estaria gravado). Dois relatórios no dia: Dados → Rotinas mostra o último (o da manutenção).
+    resta = a.orcamento_minutos * 60 - (time.monotonic() - inicio)
+    if fase == "carga" and not rel.parou_por_tempo and resta >= MINIMO_PARA_MANUTENCAO_SEG:
+        empresas = coleta.dividir(todas, a.parte, a.partes)
+        print(f"Carga desta parte concluída; manutenção de {len(empresas)} empresa(s) com {resta / 60:.0f} min "
+              "restantes", flush=True)
+        rotina = coleta.Coleta(
+            cliente, armaz, chaves, hoje, meses, resta,
+            settings.pedido.tentativas_por_unidade, filtro_lojas=filtro,
+            fase="manutencao", meses_carga=MESES_CARGA, status_carga=_status_carga(armaz, chaves),
+        )
+        rel = rotina.executar(empresas, parte)
+        armaz.salvar_json(chaves.execucao(hoje, parte, time.strftime("%H%M%S")), coleta.relatorio_dict(rel))
 
     print(
         f"FIM — empresas processadas {rel.empresas_processadas}/{rel.empresas_na_parte} "

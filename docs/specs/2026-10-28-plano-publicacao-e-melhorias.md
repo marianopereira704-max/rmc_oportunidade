@@ -58,6 +58,18 @@ arquivos que a rotina NOVA gravou no Spaces. Conferir antes:
 4. Resultado: um parágrafo dizendo "pode trocar" ou o que precisa de ajuste (e o ajuste, se for no
    ramo novo).
 
+**Resultado (28/10/2026): pode trocar, sem ajuste.** Caminhos do Spaces só ganharam arquivos novos;
+`configuracao.json` tem só `meses_fechados` nos dois; relatório e lista de lojas do GPS só ganharam
+campos (o antigo lê com `.get`); marcador de estoque e catálogo idênticos; Secrets do workflow iguais.
+Teste prático (scratchpad, disco local): rotina nova monta o pronto → o app antigo REAPROVEITA (mesma
+assinatura) e calcula a mesma sugestão; o app antigo monta → a rotina nova lê, monta o modelo de estoque e
+grava o histórico. Spaces real (só leitura): carga de 2026-08/09 concluída nas 388 empresas (349 completas,
+39 por tentativas) → a rotina nova entra direto na manutenção, com estoque e histórico. Achados: nenhum
+relatório desde 25/10, foto de estoque mais recente de 23/10 (215 empresas com foto); a tarefa do Windows de
+28/10 não existe no Agendador e não deixou log — o histórico do estoque ainda não começou; desde 09/10 não há
+relatório da rotina antiga do GitHub (conferir na aba Actions). A empresa com código de loja com espaços pode
+aparecer como pendência nova no vínculo do app antigo (resolver em Dados → Vínculo).
+
 ## Fase 3 — Rotina nova toda noite pelo GitHub (M, com C)
 
 1. (M) GitHub → Settings → General → Default branch → `desenvolvimento`.
@@ -70,7 +82,18 @@ arquivos que a rotina NOVA gravou no Spaces. Conferir antes:
 7. (M) Já ligar o aviso nativo do GitHub: github.com → Settings (da conta) → Notifications → Actions →
    "Only notify for failed workflows". Sem código: e-mail quando a rotina inteira falha.
 
-## Fase 4 — Alerta por e-mail (C)
+**Fase 3 feita em 28/10/2026** (ramo padrão = `desenvolvimento`). A 1ª execução manual ficou presa na carga: a
+API passou a listar 538 ids, mas 150 são "empresas" sem cadastro (lojas "derivada de tb_estoque", sem nome nem
+CNPJ, nenhuma da rede) — as 388 reais seguem iguais. A carga delas levou 83 s e a execução acabou ali, sem estoque.
+Corrigido: a parte que termina a sua fatia da carga com ≥ 10 min de orçamento segue para a manutenção na mesma
+execução (`pedido/__main__.py::MINIMO_PARA_MANUTENCAO_SEG`, teste `test_parte_que_termina_a_carga_segue_...`).
+
+## Fase 4 — Alerta por e-mail (C) — feita em 28/10/2026
+
+`pedido/alerta.py` + job `alerta` no workflow + `tests/test_alerta.py`. Decisões tomadas com os padrões propostos:
+queda de 5%, e-mail só quando há problema. Usa o dia mais recente com relatório (disparo que vira o dia) e avisa
+"nenhum relatório desde …". **Falta (M): criar os Secrets `EMAIL_REMETENTE`, `EMAIL_SENHA_APP` e
+`ALERTA_DESTINATARIOS` no GitHub** (sem eles o job falha e o GitHub avisa).
 
 O aviso do GitHub (Fase 3, passo 7) cobre a rotina que QUEBRA. Este cobre a rotina que termina "verde"
 mas trouxe menos do que devia.
@@ -89,7 +112,11 @@ mas trouxe menos do que devia.
 5. Testes com relatórios fictícios (falha, queda, tudo normal) e envio de mentira.
 6. A decidir: mandar também um resumo diário "tudo certo" (proposta: não — só quando há problema).
 
-## Fase 5 — "A revisar" com a ação a tomar (C)
+## Fase 5 — "A revisar" com a ação a tomar (C) — feita em 28/10/2026
+
+Achado ao implementar: o Assistente e a Análise já terminavam com "Confira as notas no sistema de vendas", igual
+para todos os motivos; o Dashboard só dava o porquê. Feito: `core/revisar.py` (uma ação por motivo, parágrafo
+"O que fazer: …") usado nas três telas; o porquê continua em cada tela; `tests/test_revisar.py`.
 
 Hoje o porquê está em três lugares: `core/dashboard_estoque._MOTIVO_CUSTO` (Dashboard),
 `views/pedido.py` (~l. 422, Assistente) e `views/analise_comum.py` (~l. 523, Análise).

@@ -554,6 +554,27 @@ def test_fase_da_execucao_e_ordem_das_empresas():
     assert rotina._fase_e_empresas(["a"], {"a": {**completa, "meses": ["2025-01"]}}, 0, 1)[0] == "carga"
 
 
+@pytest.mark.parametrize("orcamento, segue", [("60", True), ("5", False)])
+def test_parte_que_termina_a_carga_segue_para_a_manutencao(tmp_path, monkeypatch, orcamento, segue):
+    """28/10/2026: 150 "empresas" novas sem cadastro seguraram a execução inteira na carga (83 s de trabalho) e
+    nenhuma loja ganhou estoque nem histórico naquela noite."""
+    from pedido import __main__ as rotina
+
+    class ComEmpresas(ClienteFalso):
+        def listar_empresas(self):
+            return [{"idEmpresa": "E1"}]
+
+    monkeypatch.setattr(rotina, "cliente_das_configuracoes", lambda **kw: ComEmpresas())
+    assert rotina.main(["--destino", f"local:{tmp_path}", "--hoje", "2026-10-28", "--todas-as-lojas",
+                        "--orcamento-minutos", orcamento]) == 0
+    armaz = ArmazenamentoLocal(tmp_path)
+    assert armaz.ler_json(CH.carga("E1"))["completa"] is True
+    assert armaz.existe(CH.estoque("E1", "1")) is segue      # estoque só vem na manutenção
+    if segue:
+        assert armaz.listar(CH.prefixo_historico_estoque("E1", "1"))
+        assert coleta.ultimas_execucoes(armaz, CH)[1][0]["fase"] == "manutencao"
+
+
 def test_codigo_da_loja_com_espacos_nao_gera_arquivo_vazio(tmp_path):
     """08/10/2026: "1" + 49 espaços na lista de lojas e "1" nos dados — a
     separação por loja não casava e os arquivos saíam vazios."""

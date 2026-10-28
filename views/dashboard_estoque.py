@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core import analise, auth, dicas, theme, ui
+from core import analise, auth, dicas, revisar, theme, ui
 from core import dashboard_estoque as de
 from core.theme import GRAFICO
 from pedido import linhas as lc
@@ -315,7 +315,8 @@ def linha_critico(r: dict) -> dict:
 
 def dica_custo(motivo) -> str:
     """A dica do selo "a revisar": o motivo do custo em frase (o modelo guarda um código ou um texto curto)."""
-    return dicas.dica(de.motivo_custo(motivo), "O SKU conta nas unidades, mas não entra nos valores em R$.")
+    return dicas.dica(de.motivo_custo(motivo), "O SKU conta nas unidades, mas não entra nos valores em R$.",
+                      revisar.acao(motivo))
 
 
 def _ordenar_criticos(coluna: tb.ColunaTabela) -> None:

@@ -12,6 +12,9 @@ frequência de venda, investimento pela sugestão do Assistente). Detalhes no `C
 - **A foto do estoque precisa rodar TODA noite** (o histórico depende disso). A 1ª coleta ficou agendada pelo Mariano
   no Windows para 00:05 de 28/10 (script `C:/Users/RMC - 0014/rmc_rotina/coleta_estoque.ps1`, modo `--so-estoque`, 8
   partes; logs em `rmc_rotina/logs`). Decidir: publicar só a rotina no GitHub (A) ou agendar nesta máquina toda noite (B).
+  **28/10/2026: a coleta NÃO rodou** (a tarefa não está no Agendador, a pasta de logs está vazia; foto de estoque mais
+  recente de 23/10). Decidido o caminho A: ramo `desenvolvimento` como padrão do GitHub — conferido que a rotina nova
+  convive com o app antigo (`docs/specs/2026-10-28-plano-publicacao-e-melhorias.md`, Fase 2).
 - Conferir em 28/10 os logs e o 1º dia do histórico no Spaces (`pedido/historico_estoque/`).
 - A API do GPS estava lenta em 27/10 (14,5 min para o estoque de uma empresa de 1 loja): medir a duração da coleta.
 - Ao publicar o app: nada a carregar (o histórico vem da rotina).
