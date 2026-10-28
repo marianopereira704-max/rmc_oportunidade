@@ -1,17 +1,8 @@
-"""Cliente da API de consulta do GPS Farma — a integração que deve substituir
-o upload manual da planilha GPS.
-
-O QUE ESTE MÓDULO FAZ HOJE: fala com a API (autenticação, paginação, janela
-de datas, erros, novas tentativas) e ENTREGA OS REGISTROS BRUTOS.
-
-O QUE ELE DELIBERADAMENTE NÃO FAZ: transformar esses registros em
-`RegistroCompraGPS`. O mapeamento campo a campo (qual chave do JSON é o EAN,
-qual é o custo, qual é a quantidade, como sai o mês de referência) NÃO está
-implementado porque nenhuma chamada autenticada foi feita até agora — a chave
-de API disponível em 15/09/2026 era recusada com 401. Escrever esse
-mapeamento sem ver uma resposta real seria adivinhar em cima de dado
-financeiro, que é exatamente o erro que não se pode cometer aqui. O ponto
-onde ele entra está marcado em `GpsApiComprasAdapter.sincronizar`.
+"""Cliente da API de consulta do GPS Farma. Quem usa: a rotina do Pedido e
+da Análise (pacote pedido/ — vendas, compras e estoque das lojas, gravados
+no Spaces pela madrugada). O adaptador antigo que "coletava sem gravar"
+(GpsApiComprasAdapter/coletar_compras, de antes da chave funcionar) saiu em
+05/10/2026, junto com o envio da planilha do GPS.
 
 === O que foi confirmado (lido do Swagger em 15/09/2026) ===
 
@@ -62,7 +53,6 @@ from typing import Any, Callable, Iterator
 import requests
 
 from core.config import settings
-from integrations.base import IntegrationAdapter, ResultadoSincronizacao, StatusIntegracao
 
 
 class GpsApiError(RuntimeError):
@@ -125,18 +115,6 @@ def _extrair_id_empresa(registro: dict) -> str:
         f"Procurei por {', '.join(_CHAVES_ID_EMPRESA)} e recebi as chaves: "
         f"{', '.join(sorted(registro.keys())) or '(nenhuma)'}."
     )
-
-
-def janela_sobreposta(hoje: dt.date, dias: int) -> tuple[dt.date, dt.date]:
-    """Intervalo que a sincronização automática repuxa a cada rodada.
-
-    Sempre termina hoje e começa `dias` atrás — independente de quando foi a
-    última sincronização. Ver a justificativa em `core/config.py::GpsApiConfig`:
-    é o que garante que uma nota corrigida retroativamente no ERP volte pra
-    cá, coisa que um corte "desde a última vez" nunca traria."""
-    if dias < 0:
-        raise ValueError("dias de sobreposição não pode ser negativo.")
-    return (hoje - dt.timedelta(days=dias), hoje)
 
 
 @dataclass
@@ -326,53 +304,6 @@ class ClienteGpsApi:
         yield from self._paginar(f"/api/v1/empresas/{id_empresa}/estoque")
 
 
-@dataclass
-class ColetaCompras:
-    """Resultado de uma coleta — números pra relatório, sem nenhum dado
-    persistido (persistir depende do mapeamento que ainda não existe)."""
-    data_inicio: dt.date
-    data_fim: dt.date
-    empresas: int
-    registros: int
-    chamadas: int
-
-
-def coletar_compras(
-    cliente: ClienteGpsApi,
-    hoje: dt.date | None = None,
-    dias_sobreposicao: int | None = None,
-    consumidor: Callable[[str, dict], None] | None = None,
-) -> ColetaCompras:
-    """Percorre TODAS as empresas e traz as compras da janela com
-    sobreposição, entregando cada registro bruto ao `consumidor`.
-
-    Iterar todas as empresas (em vez de um id fixo) é decisão confirmada com
-    o cliente: a base do RMC tem mais de uma empresa no GPS.
-
-    Nada é gravado aqui. Quando o mapeamento de campos existir, o `consumidor`
-    é exatamente o lugar onde ele entra."""
-    hoje = hoje or dt.date.today()
-    dias = settings.gps_api.dias_sobreposicao if dias_sobreposicao is None else dias_sobreposicao
-    data_inicio, data_fim = janela_sobreposta(hoje, dias)
-
-    empresas = 0
-    registros = 0
-    for empresa in cliente.listar_empresas():
-        id_empresa = _extrair_id_empresa(empresa)
-        empresas += 1
-        for compra in cliente.listar_compras(id_empresa, data_inicio=data_inicio, data_fim=data_fim):
-            registros += 1
-            if consumidor is not None:
-                consumidor(id_empresa, compra)
-
-    return ColetaCompras(
-        data_inicio=data_inicio,
-        data_fim=data_fim,
-        empresas=empresas,
-        registros=registros,
-        chamadas=len(cliente.paginas_requisitadas),
-    )
-
 
 def cliente_das_configuracoes(**substituicoes: Any) -> ClienteGpsApi:
     """Monta o cliente a partir de `settings.gps_api`. Levanta se não estiver
@@ -394,53 +325,3 @@ def cliente_das_configuracoes(**substituicoes: Any) -> ClienteGpsApi:
     return ClienteGpsApi(**parametros)
 
 
-class GpsApiComprasAdapter(IntegrationAdapter):
-    """Adapter do GPS pela API, no lugar do upload de planilha.
-
-    ATENÇÃO: `sincronizar` ainda NÃO grava nada. Ele faz a coleta completa —
-    o que já prova ponta a ponta que autenticação, paginação e janela de datas
-    funcionam — e devolve a contagem, com `registros_processados=0` e status
-    MANUAL pra deixar explícito que a planilha continua sendo a fonte real
-    enquanto o mapeamento de campos não existir.
-
-    É de propósito que ele não escreva "quase certo" no banco: sem uma
-    resposta real da API à vista, qualquer mapeamento seria chute em cima de
-    valor financeiro."""
-
-    nome = "Compras (API GPS Farma)"
-
-    def status(self) -> StatusIntegracao:
-        return (
-            StatusIntegracao.DISPONIVEL
-            if settings.gps_api.configured
-            else StatusIntegracao.INDISPONIVEL
-        )
-
-    def sincronizar(self, **kwargs) -> ResultadoSincronizacao:
-        if self.status() != StatusIntegracao.DISPONIVEL:
-            return ResultadoSincronizacao(
-                status=StatusIntegracao.INDISPONIVEL,
-                registros_processados=0,
-                mensagem="API do GPS ainda não configurada (GPS_API_BASE_URL / GPS_API_KEY).",
-            )
-
-        cliente = kwargs.get("cliente") or cliente_das_configuracoes()
-        coleta = coletar_compras(
-            cliente,
-            hoje=kwargs.get("hoje"),
-            dias_sobreposicao=kwargs.get("dias_sobreposicao"),
-            # >>> É AQUI que o mapeamento campo a campo entra, quando existir:
-            # trocar `consumidor=None` por uma função que converta o registro
-            # bruto em RegistroCompraGPS e grave em bloco.
-            consumidor=kwargs.get("consumidor"),
-        )
-        return ResultadoSincronizacao(
-            status=StatusIntegracao.MANUAL,
-            registros_processados=0,
-            mensagem=(
-                f"Coleta de {coleta.data_inicio:%d/%m/%Y} a {coleta.data_fim:%d/%m/%Y}: "
-                f"{coleta.registros} registro(s) de compra em {coleta.empresas} empresa(s), "
-                f"em {coleta.chamadas} chamada(s) à API. NADA foi gravado — o mapeamento dos "
-                "campos da API para RegistroCompraGPS ainda não está implementado."
-            ),
-        )

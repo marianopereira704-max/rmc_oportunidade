@@ -67,12 +67,19 @@ class Papel(str, enum.Enum):
 
 
 class Usuario(Base):
-    """Login único (mesmo CNPJ), senha diferente por papel. O consultor vê a
-    rede inteira — decisão confirmada, não há escopo por loja/consultor."""
+    """Dois jeitos de entrar (07/10/2026):
+    - EQUIPE RMC (ADM e Consultor): CNPJ da rede + senha, e a senha define o
+      papel — como sempre foi. Veem a rede inteira.
+    - LOJAS (Comprador e Proprietário): e-mail (`login`) + senha criada pelo
+      próprio usuário a partir do link de ativação. `cnpj_login` vazio;
+      `papel` = CONSULTOR só porque a coluna é obrigatória (enum do Postgres
+      que o app antigo também lê) — o que vale é o `nivel`.
+    Status na tela de Cadastro: sem senha = "Aguardando"; `ativo` False =
+    "Excluído" (nada se apaga: o histórico continua com o nome)."""
     __tablename__ = "usuarios"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    cnpj_login: Mapped[str] = mapped_column(String(18), index=True)
+    cnpj_login: Mapped[str | None] = mapped_column(String(18), nullable=True, index=True)
     senha_hash: Mapped[str] = mapped_column(String(128))
     papel: Mapped[Papel] = mapped_column(Enum(Papel))
     nome_exibicao: Mapped[str] = mapped_column(String(120))
@@ -84,18 +91,65 @@ class Usuario(Base):
     # mesmo banco é arriscado). Vazio = deduzido do `papel` (core/acesso.py).
     # `login` será o usuário do login individual (e-mail ou CPF).
     nivel: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    login: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    # E-mail do login individual, sempre em minúsculas; um por pessoa.
+    login: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True, unique=True)
     lojas: Mapped[list["UsuarioLoja"]] = relationship(cascade="all, delete-orphan")
+
+    # Cadastro (07/10/2026). Campos livres: cargo e telefone. `loja_principal_id`
+    # = a loja do cadastro; as lojas ADICIONAIS (multi-lojas, só do mesmo
+    # grupo econômico) ficam em `usuarios_lojas`. `linhas_compra` (Comprador:
+    # genericos,similares,propagados,perfumaria) e `paineis` (oportunidade_produto,
+    # pedido, dashboard): códigos separados por vírgula — integrations/usuarios.py.
+    cargo: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    telefone: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    loja_principal_id: Mapped[int | None] = mapped_column(ForeignKey("lojas.id"), nullable=True, index=True)
+    linhas_compra: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    paineis: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    criado_em: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    criado_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    excluido_em: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    excluido_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
 
     __table_args__ = (UniqueConstraint("cnpj_login", "papel", name="uq_login_papel"),)
 
 
 class UsuarioLoja(Base):
-    """Lojas de um Comprador/Proprietário — ele só vê o Pedido delas."""
+    """Lojas ADICIONAIS de um usuário de loja (multi-lojas — "Atribuir
+    Empresas"). A loja principal fica em `Usuario.loja_principal_id`; o acesso
+    é a soma das duas (core/auth.py)."""
     __tablename__ = "usuarios_lojas"
 
     usuario_id: Mapped[int] = mapped_column(ForeignKey("usuarios.id"), primary_key=True)
     loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"), primary_key=True)
+
+
+class TokenSenha(Base):
+    """Link de criar/recuperar senha (07/10/2026). Guarda só o HASH do
+    token: quem lê o banco não consegue usar um link. `tipo` = ativacao (48 h)
+    ou recuperacao (1 h); usado uma vez (`usado_em`)."""
+    __tablename__ = "tokens_senha"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(ForeignKey("usuarios.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    tipo: Mapped[str] = mapped_column(String(20))
+    criado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    expira_em: Mapped[dt.datetime] = mapped_column(DateTime)
+    usado_em: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+
+class UsuarioLojaHistorico(Base):
+    """Acessos a loja que SAÍRAM (Q32 de 06/10/2026): loja que deixa a rede
+    ou o grupo econômico perde o acesso na sincronização, e fica aqui quem
+    perdeu acesso a qual loja, quando e por quê."""
+    __tablename__ = "usuarios_lojas_historico"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    usuario_id: Mapped[int] = mapped_column(ForeignKey("usuarios.id"), index=True)
+    loja_id: Mapped[int] = mapped_column(ForeignKey("lojas.id"))
+    motivo: Mapped[str] = mapped_column(String(200))
+    registrado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    registrado_por: Mapped[str] = mapped_column(String(120))
 
 
 # ---------------------------------------------------------------------------
@@ -129,7 +183,21 @@ class Loja(Base):
     cep: Mapped[str | None] = mapped_column(String(10), nullable=True)
     nome_fantasia: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
+    # Loja DA REDE (07/10/2026): status "Ativo" no sistema interno. O
+    # sistema interno marca como `active` também os cadastros do "Portal do
+    # PBM" (192) e "Institucional" (27) — 813 "ativas", 594 da rede. Quem sai
+    # da rede fica com False (nada é apagado: listas, exportações e o
+    # histórico continuam). Vazio = ainda não sincronizado pela regra nova:
+    # conta como da rede (`loja_da_rede()`), pra não sumir nada antes da
+    # primeira sincronização.
+    na_rede: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+
     compras: Mapped[list["RegistroCompraGPS"]] = relationship(back_populates="loja")
+
+
+def loja_da_rede():
+    """Condição SQL "a loja é da rede" (vazio conta como sim — ver `Loja.na_rede`)."""
+    return Loja.na_rede.is_not(False)
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +629,23 @@ class SituacaoVinculoGps(str, enum.Enum):
     SEM_CANDIDATO = "sem_candidato"
 
 
+class EmpresaGps(Base):
+    """O código que a equipe usa pra cada empresa do GPS (08/10/2026). A API
+    só identifica a empresa pelo `idEmpresa` longo; o número conhecido
+    (Mega Farma = 2089) vem da planilha exportada do GPS (Dados → Vínculo de
+    lojas GPS). `cnpjs` = CNPJs (só dígitos, separados por vírgula) das
+    lojas da empresa segundo o GPS — põe no topo, na escolha da loja do RMC,
+    as lojas daquela empresa (a API não manda CNPJ em parte das lojas)."""
+    __tablename__ = "empresas_gps"
+
+    id_empresa_gps: Mapped[str] = mapped_column(String(40), primary_key=True)
+    codigo_gps: Mapped[str] = mapped_column(String(20))
+    nome: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    cnpjs: Mapped[str | None] = mapped_column(Text, nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+    atualizado_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
+
+
 class VinculoLojaGps(Base):
     """Qual loja do GPS (idEmpresa, CodigoLoja) é qual loja do RMC.
 
@@ -601,6 +686,9 @@ class OrigemCategoria(str, enum.Enum):
     FEBRAFAR = "febrafar"
     CMED = "cmed"
     MANUAL = "manual"
+    # Genérico pelo catálogo IQVIA (GMRS = G) que FEBRAFAR/CMED não conheciam
+    # (07/10/2026, Q38) — só preenche EAN sem categoria, nunca troca uma.
+    IQVIA = "iqvia"
 
 
 class CategoriaEan(Base):
@@ -624,6 +712,40 @@ class CategoriaEan(Base):
     descricao: Mapped[str | None] = mapped_column(String(200), nullable=True)
     atualizado_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
     atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
+
+
+class CatalogoIqvia(Base):
+    """Catálogo de produtos da IQVIA (07/10/2026): de cada EAN, o SETOR_NEC —
+    que define a LINHA DE COMPRA do Comprador no Assistente (pedido/linhas.py:
+    RX_GENERICO → Genéricos, RX_TRADE → Similares…; o que cada setor vira é
+    configurável e personalizável por loja) — e o GMRS (G = genérico).
+    Complementa a base de categorias, não substitui (Q37): os dias de estoque
+    e o "é genérico?" da Análise continuam vindo de `categorias_ean`.
+    Arquivo de terceiro, carga única (não chegam catálogos novos): nunca no
+    git — passa pelo Spaces (`python -m pedido.carga_catalogo`). `ean` na
+    chave normalizada (`categorias.chave_ean`)."""
+    __tablename__ = "catalogo_iqvia"
+
+    ean: Mapped[str] = mapped_column(String(20), primary_key=True)
+    setor_nec: Mapped[str] = mapped_column(String(40))
+    gmrs: Mapped[str | None] = mapped_column(String(2), nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
+
+
+class ClassificacaoEan(Base):
+    """O que cada FONTE diz de cada EAN (25/10/2026, cascata de classificação — docs/specs/
+    2026-10-25-classificacao-produtos-design.md): a categoria da FEBRAFAR e o tipo bruto da CMED (Genérico,
+    Similar, Novo, Biológico…). `categorias_ean` guarda UMA categoria por EAN, a vencedora da regra de junção;
+    quando a CMED vence, a da FEBRAFAR se perde, e o tipo da CMED nunca foi gravado. A IQVIA fica em
+    `catalogo_iqvia`. Aqui não se decide nada: a categoria fixa do produto é calculada na hora
+    (`pedido/classificacao.py`). Planilhas de terceiros, nunca no git: passam pelo Spaces
+    (`python -m pedido.carga_categorias`). `ean` na chave normalizada (`categorias.chave_ean`)."""
+    __tablename__ = "classificacao_ean"
+
+    ean: Mapped[str] = mapped_column(String(20), primary_key=True)
+    febrafar: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    cmed_tipo: Mapped[str | None] = mapped_column(String(60), nullable=True)
+    atualizado_em: Mapped[dt.datetime] = mapped_column(DateTime, default=dt.datetime.utcnow)
 
 
 # ---------------------------------------------------------------------------

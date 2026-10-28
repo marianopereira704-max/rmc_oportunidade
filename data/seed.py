@@ -4,10 +4,9 @@ pequenas (poucas linhas, casos de borda propositais) usadas nos testes
 automatizados de integração do Bloco 2.
 
 O volume gerado é configurável via `settings.seed` (core/config.py,
-variáveis SEED_QTD_LOJAS / SEED_QTD_GENERICOS / SEED_QTD_MESES /
-SEED_FRACAO_COBERTURA_COMPRAS / SEED_SEMENTE_ALEATORIA) — os defaults
-(70 lojas x 320 genéricos x 8 meses x 65% de cobertura) resultam em
-100k+ linhas em `registros_compra_gps`.
+variáveis SEED_QTD_LOJAS / SEED_QTD_GENERICOS / SEED_SEMENTE_ALEATORIA).
+Desde 05/10/2026 não gera compras (a planilha do GPS saiu; as compras vêm
+da API) — SEED_QTD_MESES e SEED_FRACAO_COBERTURA_COMPRAS ficaram sem uso.
 
 Roda com: `python -m data.seed` (a partir da raiz do projeto, com o venv
 ativado). É idempotente no sentido de que sempre limpa e recria o cenário de
@@ -22,7 +21,6 @@ script de geração de dados, que não roda em produção.
 """
 from __future__ import annotations
 
-import datetime as dt
 import random
 
 from sqlalchemy import delete, insert
@@ -208,51 +206,6 @@ def _criar_uma_tabela_gruppy(
     session.execute(insert(ItemTabelaGruppy), itens)
 
 
-def _ultimos_ano_meses(quantidade: int) -> list[str]:
-    hoje = dt.date.today().replace(day=1)
-    meses = []
-    ano_mes = hoje
-    for _ in range(quantidade):
-        meses.append(ano_mes.strftime("%Y-%m"))
-        ano_mes = (ano_mes.replace(day=1) - dt.timedelta(days=1)).replace(day=1)
-    return meses
-
-
-def _criar_compras_gps(
-    session: Session, lojas: list[Loja], genericos: list[dict], ano_meses: list[str], fracao_cobertura: float
-) -> int:
-    """Bulk insert (não ORM objeto-a-objeto) — com 100k+ linhas, criar um
-    RegistroCompraGPS por vez via `session.add` seria ordens de magnitude
-    mais lento. Devolve a quantidade total de linhas inseridas."""
-    total = 0
-    for loja in lojas:
-        for ano_mes in ano_meses:
-            selecionados = [g for g in genericos if random.random() < fracao_cobertura]
-            if not selecionados:
-                continue
-            linhas = []
-            for item in selecionados:
-                ean = random.choice(item["eans"])
-                quantidade = random.randint(2, 60)
-                custo_unitario = round((6 + (item["base_generico_id"] % 40)) * (0.9 + random.random() * 0.4), 4)
-                pct_cmv = round(0.35 + random.random() * 0.35, 4)
-                fat_liquido = round((custo_unitario * quantidade) / pct_cmv, 4)
-                linhas.append({
-                    "loja_id": loja.id,
-                    "ean": ean,
-                    "descricao_origem": f"compra genérico {item['base_generico_id']}",
-                    "laboratorio_compra": None,
-                    "ano_mes": ano_mes,
-                    "quantidade": quantidade,
-                    "fat_liquido": fat_liquido,
-                    "pct_cmv": pct_cmv,
-                    "custo_unitario": custo_unitario,
-                    "estoque": random.randint(0, 40),
-                })
-            session.execute(insert(RegistroCompraGPS), linhas)
-            total += len(linhas)
-    return total
-
 
 def rodar() -> None:
     # Trava: este script APAGA lojas, genéricos, tabelas Gruppy e compras
@@ -276,7 +229,7 @@ def rodar() -> None:
 
     with get_session() as session:
         print(f"Criando {cfg.qtd_lojas} lojas...")
-        lojas = _criar_lojas(session, ufs, cfg.qtd_lojas)
+        _criar_lojas(session, ufs, cfg.qtd_lojas)
 
         print(f"Criando {cfg.qtd_genericos} genéricos (Base Genéricos + EAN)...")
         genericos = _criar_genericos_e_eans(session, cfg.qtd_genericos)
@@ -284,15 +237,10 @@ def rodar() -> None:
         print("Criando tabelas de preço Gruppy (nacionais + regionais)...")
         _criar_tabelas_gruppy(session, ufs, genericos)
 
-    ano_meses = _ultimos_ano_meses(cfg.qtd_meses)
-    with get_session() as session:
-        print(f"Gerando compras GPS pra {len(ano_meses)} meses ({ano_meses[-1]} a {ano_meses[0]})...")
-        total_compras = _criar_compras_gps(session, lojas, genericos, ano_meses, cfg.fracao_cobertura_compras)
-
-    print(
-        f"\nPronto: {cfg.qtd_lojas} lojas, {cfg.qtd_genericos} genéricos, "
-        f"{total_compras:,} linhas em registros_compra_gps.".replace(",", ".")
-    )
+    # Compras da planilha do GPS não são mais geradas (05/10/2026): a
+    # Análise lê as compras da API (arquivos da rede — o teste visual monta
+    # as suas em tests/visual/compras_rede.py).
+    print(f"Pronto: {cfg.qtd_lojas} lojas, {cfg.qtd_genericos} genéricos.")
 
 
 if __name__ == "__main__":

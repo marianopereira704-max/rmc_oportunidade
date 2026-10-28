@@ -136,9 +136,9 @@ def vendas_por_ean(p: Pronto) -> pd.DataFrame:
     return v.groupby("ean", as_index=False).agg(unidades=("unidades", "sum"), valor=("valor", "sum"))
 
 
-def atualizar(armaz: Armazenamento, chaves: Chaves, empresa: str, loja: str, meses_fechados: int) -> Pronto | None:
-    """O pronto da loja, montado de novo só se os brutos mudaram. None se a
-    rotina ainda não tirou nenhuma foto de estoque desta empresa."""
+def _situacao(armaz: Armazenamento, chaves: Chaves, empresa: str, loja: str, meses_fechados: int):
+    """O que o pronto da loja DEVERIA ter hoje (arquivos da janela, dias sem dado) e a assinatura disso — só
+    com listagens e o marcador de estoque, sem ler os arquivos de dados. None sem foto de estoque."""
     foto = data_da_foto(armaz, chaves, empresa)
     if foto is None:
         return None
@@ -148,6 +148,28 @@ def atualizar(armaz: Armazenamento, chaves: Chaves, empresa: str, loja: str, mes
     k_estoque = chaves.estoque(empresa, loja)
     tem_estoque = k_estoque in existentes
     assinatura = _assinatura(k_vendas + k_compras + ([k_estoque] if tem_estoque else []), foto)
+    return foto, k_vendas, falta_vendas, k_compras, falta_compras, k_estoque, tem_estoque, assinatura
+
+
+def assinatura_em_dia(armaz: Armazenamento, chaves: Chaves, empresa: str, loja: str, meses_fechados: int) -> str | None:
+    """A assinatura do pronto da loja SE ele já está montado e em dia com os brutos; senão None. É o que o
+    modelo de estoque (pedido/estoque_modelo.py) usa para decidir, sem ler os 3 arquivos do pronto."""
+    s = _situacao(armaz, chaves, empresa, loja, meses_fechados)
+    if s is None:
+        return None
+    k_meta = _chave_pronto(chaves, empresa, loja, "meta.json")
+    if not armaz.existe(k_meta):
+        return None
+    return s[-1] if armaz.ler_json(k_meta).get("assinatura") == s[-1] else None
+
+
+def atualizar(armaz: Armazenamento, chaves: Chaves, empresa: str, loja: str, meses_fechados: int) -> Pronto | None:
+    """O pronto da loja, montado de novo só se os brutos mudaram. None se a
+    rotina ainda não tirou nenhuma foto de estoque desta empresa."""
+    situacao = _situacao(armaz, chaves, empresa, loja, meses_fechados)
+    if situacao is None:
+        return None
+    foto, k_vendas, falta_vendas, k_compras, falta_compras, k_estoque, tem_estoque, assinatura = situacao
 
     k_meta = _chave_pronto(chaves, empresa, loja, "meta.json")
     if armaz.existe(k_meta):

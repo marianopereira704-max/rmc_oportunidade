@@ -1,18 +1,20 @@
-"""Análise de Oportunidade · Por Loja — uma linha por loja, economia = soma
-da economia dos genéricos dela no período, contra o laboratório escolhido no
-filtro principal (regras em core/analise.py). O detalhe abre a tabela de
-produtos da loja com as mesmas colunas da visão Por Produto. Ordenação,
-paginação e detalhe rodam sobre o resultado guardado em memória
+"""Análise de Oportunidade · Por Loja (só ADM) — uma linha por loja, economia
+= soma das compras acima da tabela Gruppy do laboratório escolhido, no
+período. Desde 05/10/2026 pelas compras da API do GPS e com todo produto da
+tabela, não só genérico (regras em core/analise_api.py). O detalhe abre as
+compras da loja, uma linha por produto e nota fiscal. Ordenação, paginação
+e detalhe rodam sobre o resultado guardado em memória
 (views/analise_comum.py); a tabela é o componente de views/tabela.py."""
 from __future__ import annotations
 
 import pandas as pd
 import streamlit as st
 
-from core import analise, auth, theme, ui
+from core import analise, analise_api, auth, dicas, theme, ui
 from core.config import settings
 from views import analise_comum as comum
 from views import loja_barra
+from views import popups
 from views import tabela as tb
 
 _KEY = "op_loja"
@@ -20,9 +22,10 @@ _KEY = "op_loja"
 # Ordem fixa dos responsáveis, uma linha cada; posição vazia = "—". Sem
 # prefixo ("CI:", "CF:"): quem é quem vem da posição — por isso a dica no "?".
 _RESPONSAVEIS = ("consultor_interno", "consultor_farma", "atendente_comercial")
-_DICA_RESPONSAVEL = (
-    "Em ordem, uma linha cada: 1. Consultor interno · 2. Consultor farma · "
-    "3. Atendente comercial. \"—\" = posição sem responsável."
+_DICA_RESPONSAVEL = dicas.dica(
+    "Em ordem, uma linha cada:",
+    "1. Consultor interno\n2. Consultor farma\n3. Atendente comercial",
+    "O traço \"—\" indica posição sem responsável.",
 )
 
 _COLUNAS = [
@@ -89,14 +92,14 @@ def _linha(loja: dict, destaque_id: int | None = None) -> dict:
     }
 
 
-@st.dialog("Detalhes da loja", width="large")
-def _dialog_detalhes(loja: dict, produtos: pd.DataFrame, laboratorio: str) -> None:
+@popups.popup("Detalhes da loja", "detalhe")
+def _dialog_detalhes(loja: dict, produtos: pd.DataFrame, laboratorio: str, bonificadas: int) -> None:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown(f"**CNPJ**  \n{ui.formatar_cnpj(loja['cnpj'])}")
         st.markdown(f"**Razão Social**  \n{loja['razao_social']}")
         st.markdown(f"**UF / Cidade**  \n{loja['uf']} · {loja['cidade']}")
-        st.markdown(f"**Grupo econômico**  \n{loja.get('grupo_economico') or '—'}")
+        st.markdown(f"**Grupo econômico**  \n{comum.rotulo_grupo(loja.get('grupo_economico'))}")
     with c2:
         # Mesma ordem da coluna Responsável da tabela, aqui com o nome inteiro.
         st.markdown(f"**Consultor interno**  \n{loja.get('consultor_interno') or '—'}")
@@ -105,24 +108,25 @@ def _dialog_detalhes(loja: dict, produtos: pd.DataFrame, laboratorio: str) -> No
 
     theme.card_destaque(f"Economia perdida nesse período — {laboratorio}", ui.formatar_moeda(float(loja["economia"])))
 
-    theme.titulo_secao("Produtos comprados por essa loja no período")
+    theme.titulo_secao("Compras desta loja no período")
     chave = f"{_KEY}_detalhe_{loja['loja_id']}"
-    comum.tabela_produtos(
-        f"{chave}_tabela", chave, analise.ordenar(produtos, *comum.ordem_atual(chave)).to_dict("records"),
-        laboratorio, com_loja=False,
-        vazio=("Nenhum produto comparável", "Nenhuma compra desta loja no período tem preço do laboratório"),
+    ordenadas = analise.ordenar(produtos, *comum.ordem_atual(chave))
+    tb.tabela(
+        f"{chave}_tabela", comum.colunas_notas(laboratorio), [comum.linha_nota(r) for r in ordenadas.to_dict("records")],
+        comum.ordem_atual(chave), ao_ordenar=lambda coluna: comum.alternar_ordem(chave, coluna.campo, coluna.numerica),
+        vazio=("Nenhuma compra comparável", "Nenhuma compra desta loja no período tem preço do laboratório"),
+        densa=True,
     )
 
-    bonificadas = int(produtos["bonificacoes"].sum()) if not produtos.empty else 0
-    fora = int((produtos["fonte"] == analise.FONTE_FORA).sum()) if not produtos.empty else 0
+    revisar = int(produtos["a_revisar"].sum()) if not produtos.empty else 0
     notas = []
     if bonificadas:
         notas.append(
             f"{bonificadas} compra(s) bonificada(s) (abaixo de {ui.formatar_moeda(settings.analise.limite_bonificacao)}) "
             "ficaram fora da conta"
         )
-    if fora:
-        notas.append(f"{fora} produto(s) com preço \"a revisar\" (provável erro de cadastro) não somam economia")
+    if revisar:
+        notas.append(f"{revisar} compra(s) com preço \"a revisar\" não somam economia")
     if notas:
         st.caption(comum.texto_markdown(" · ".join(notas) + "."))
 
@@ -143,10 +147,15 @@ def _render() -> None:
         comum.aviso_sem_laboratorio()
         return
 
-    todas = comum.resultado(laboratorio, filtros.periodo_meses)
+    todas, bonificacoes, meses = comum.resultado_api(laboratorio, filtros.periodo_meses)
+    if not meses:
+        st.info("As compras da rede ainda não foram montadas. A rotina da madrugada junta as compras de todas as "
+                "lojas por mês fechado; cada mês aparece a partir do dia 6 do mês seguinte.")
+        return
     linhas = analise.filtrar(todas, filtros)
     with area_indicadores:
         comum.indicadores("loja", linhas, laboratorio, filtros)
+    st.caption(f"Compras de {comum.rotulo_meses(meses)}, pela data da nota fiscal.")
 
     ui.resetar_pagina_se_filtro_mudou(_KEY, f"{laboratorio}|{filtros}")
     # Por Loja é a visão da REDE (só ADM): a loja da barra lateral não filtra,
@@ -156,7 +165,7 @@ def _render() -> None:
         st.caption(f"Visão da rede: esta tela mostra todas as lojas. A loja escolhida na barra lateral "
                    f"({loja_barra.rotulo(escolhida)}) aparece destacada.")
 
-    lojas = analise.por_loja(linhas)
+    lojas = analise_api.por_loja(linhas)
     lojas["localizacao"] = [_localizacao(l) for l in lojas.to_dict("records")]
     ordem = comum.ordem_atual(_KEY)
     fatia, pagina = comum.pagina(analise.ordenar(lojas, *ordem), _KEY)
@@ -172,7 +181,8 @@ def _render() -> None:
         escolhida = lojas[lojas["loja_id"].astype(str) == clicada]
         if not escolhida.empty:
             loja = escolhida.iloc[0].to_dict()
-            _dialog_detalhes(loja, linhas[linhas["loja_id"] == loja["loja_id"]], laboratorio)
+            _dialog_detalhes(loja, linhas[linhas["loja_id"] == loja["loja_id"]], laboratorio,
+                             int(bonificacoes.get(loja["loja_id"], 0)))
 
     if not lojas.empty:
         ui.controles_paginacao(pagina, _KEY)

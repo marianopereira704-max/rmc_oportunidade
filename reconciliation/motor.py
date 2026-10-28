@@ -1,7 +1,8 @@
 """Motor de reconciliação EAN -> Base Genéricos.
 
-Tanto a Gruppy (`ItemTabelaGruppy.ean`) quanto o GPS (`RegistroCompraGPS.ean`)
-passam por aqui. A ideia central: `EanGenerico` é a ÚNICA fonte de junção
+Passam por aqui os EANs genéricos da Gruppy (`ItemTabelaGruppy.ean`), das
+compras e das vendas das lojas pela API do GPS (integrations/fila_compras.py,
+integrations/fila_loja.py). A ideia central: `EanGenerico` é a ÚNICA fonte de junção
 EAN->genérico (ver core/models.py) — então resolver um EAN aqui, uma vez,
 conserta retroativamente qualquer linha já importada com aquele EAN, sem
 precisar de backfill.
@@ -39,7 +40,6 @@ from core.models import (
     ItemTabelaGruppy,
     OrigemFila,
     OrigemResolucao,
-    RegistroCompraGPS,
     StatusFila,
 )
 from core.sql import insert_ignorando_conflito
@@ -717,8 +717,6 @@ def _ids_de_genericos(session: Session, nomes: list[str]) -> dict[str, int]:
 
 @dataclass
 class ResultadoLimpezaEan:
-    registros_compra_gps_corrigidos: int
-    registros_compra_gps_colisoes_puladas: int
     itens_tabela_gruppy_corrigidos: int
     fila_resolucao_ean_corrigidos: int
     fila_resolucao_ean_colisoes_mescladas: int
@@ -728,18 +726,13 @@ def limpar_eans_sujos(session: Session) -> ResultadoLimpezaEan:
     """Corrige em lote, via UPDATE direto (nunca recriando a linha), EAN
     gravado sujo (ex: sufixo ".0" de planilha lida como float, de antes da
     correção de `normalizar_ean` estar em uso naquele upload específico) em
-    `RegistroCompraGPS.ean`, `ItemTabelaGruppy.ean` e `FilaResolucaoEAN.ean`.
+    `ItemTabelaGruppy.ean` e `FilaResolucaoEAN.ean`. (As compras da planilha
+    do GPS saíram em 05/10/2026: as da API já chegam limpas — pedido/transformar.py.)
 
     Pré-requisito pro reprocessamento da fila (ver `reprocessar_fila_resolucao`):
     um `EanGenerico` criado pra um EAN sujo nunca bateria contra um upload
     futuro, que já chega normalizado — resolver o fuzzy-match sem limpar a
     chave deixaria o resultado órfão de novo no próximo upload.
-
-    `RegistroCompraGPS` tem `UniqueConstraint(loja_id, ean, ano_mes)` — se a
-    versão limpa colidir com uma linha JÁ existente pra essa loja+mês
-    (dado financeiro real, não só chave de dedup), a linha suja é PULADA
-    (nunca mescla/sobrescreve compra às cegas) e contada em
-    `registros_compra_gps_colisoes_puladas`, pra revisão manual.
 
     `FilaResolucaoEAN` tem EAN único (chave de dedup, sem valor financeiro
     "de verdade" fora do acumulado) — se colidir, mescla a linha suja na já
@@ -750,7 +743,7 @@ def limpar_eans_sujos(session: Session) -> ResultadoLimpezaEan:
     legitimamente repetir entre tabelas/vigências) — UPDATE direto, sem
     checagem de colisão.
 
-    Os UPDATEs de `ItemTabelaGruppy`/`RegistroCompraGPS` são Core (via
+    Os UPDATEs de `ItemTabelaGruppy` são Core (via
     `update(...)`), não ORM `session.add` — não passam pelo unit-of-work,
     então uma instância ORM dessas linhas já carregada em memória ANTES
     desta chamada (na mesma session) não reflete o novo EAN sozinha; só
@@ -765,27 +758,6 @@ def limpar_eans_sujos(session: Session) -> ResultadoLimpezaEan:
         if ean_limpo and ean_limpo != ean_sujo:
             session.execute(update(ItemTabelaGruppy).where(ItemTabelaGruppy.id == item_id).values(ean=ean_limpo))
             itens_corrigidos += 1
-
-    # --- RegistroCompraGPS: UniqueConstraint(loja_id, ean, ano_mes) — pula colisão ---
-    linhas_gps = session.execute(
-        select(RegistroCompraGPS.id, RegistroCompraGPS.loja_id, RegistroCompraGPS.ean, RegistroCompraGPS.ano_mes)
-    ).all()
-    chaves_existentes = {(loja_id, ean, ano_mes) for _id, loja_id, ean, ano_mes in linhas_gps}
-    gps_corrigidos = 0
-    gps_colisoes = 0
-    for reg_id, loja_id, ean_sujo, ano_mes in linhas_gps:
-        ean_limpo = normalizar_ean(ean_sujo)
-        if not ean_limpo or ean_limpo == ean_sujo:
-            continue
-        chave_origem = (loja_id, ean_sujo, ano_mes)
-        chave_destino = (loja_id, ean_limpo, ano_mes)
-        if chave_destino in chaves_existentes:
-            gps_colisoes += 1
-            continue
-        session.execute(update(RegistroCompraGPS).where(RegistroCompraGPS.id == reg_id).values(ean=ean_limpo))
-        chaves_existentes.discard(chave_origem)
-        chaves_existentes.add(chave_destino)
-        gps_corrigidos += 1
 
     # --- FilaResolucaoEAN: EAN único — mescla e remove duplicata em colisão ---
     itens_fila = session.execute(select(FilaResolucaoEAN)).scalars().all()
@@ -818,8 +790,6 @@ def limpar_eans_sujos(session: Session) -> ResultadoLimpezaEan:
     session.flush()
 
     return ResultadoLimpezaEan(
-        registros_compra_gps_corrigidos=gps_corrigidos,
-        registros_compra_gps_colisoes_puladas=gps_colisoes,
         itens_tabela_gruppy_corrigidos=itens_corrigidos,
         fila_resolucao_ean_corrigidos=fila_corrigidos,
         fila_resolucao_ean_colisoes_mescladas=fila_mesclados,
@@ -975,39 +945,3 @@ def soma_ocorrencias_pendentes(session: Session, origem: OrigemFila) -> int:
         FilaResolucaoEAN.status == StatusFila.PENDENTE, FilaResolucaoEAN.origem == origem)) or 0)
 
 
-def recalcular_valores_fila_ean(session: Session) -> int:
-    """Recalcula valor e ocorrências de TODO item pendente da fila de EAN a
-    partir das compras VIGENTES (`registros_compra_gps` + `compras_gps_orfas`),
-    numa instrução só.
-
-    Substitui a soma incremental envio a envio: reenviar o mesmo mês três
-    vezes somava três vezes, e a prioridade da fila ficava errada justamente
-    pra quem reenvia pra atualizar os dados. Agora o valor é sempre "quanto
-    dinheiro de compra, hoje, depende deste EAN", independente de quantos
-    envios aconteceram. `aparece_em_estoque` é zerado: o estoque saiu da
-    análise. Devolve quantos itens foram recalculados."""
-    from core.models import CompraGPSOrfa
-
-    def _soma_valor(tabela):
-        return (
-            select(func.coalesce(func.sum(tabela.quantidade * tabela.custo_unitario), 0))
-            .where(tabela.ean == FilaResolucaoEAN.ean)
-            .scalar_subquery()
-        )
-
-    def _contagem(tabela):
-        return select(func.count()).select_from(tabela).where(tabela.ean == FilaResolucaoEAN.ean).scalar_subquery()
-
-    # "Loja (API)" fica de fora: o valor dele é o VENDIDO nas lojas, regravado
-    # por integrations/fila_loja.py — aqui viraria 0 (não há compra GPS).
-    stmt = (
-        update(FilaResolucaoEAN)
-        .where(FilaResolucaoEAN.status == StatusFila.PENDENTE, FilaResolucaoEAN.origem != OrigemFila.LOJA_API)
-        .values(
-            valor_total_acumulado=_soma_valor(RegistroCompraGPS) + _soma_valor(CompraGPSOrfa),
-            qtd_ocorrencias=_contagem(RegistroCompraGPS) + _contagem(CompraGPSOrfa),
-            aparece_em_estoque=False,
-        )
-        .execution_options(synchronize_session=False)
-    )
-    return session.execute(stmt).rowcount

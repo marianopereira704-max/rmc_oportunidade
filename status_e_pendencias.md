@@ -1,6 +1,105 @@
 # RMC Oportunidades — status e pendências
 
-Registro consolidado para retomar o trabalho sem precisar refazer a análise. Atualizado em 23/09/2026.
+Registro consolidado para retomar o trabalho sem precisar refazer a análise. Atualizado em 26/10/2026.
+
+## Dashboard · Ruptura e histórico do estoque (27/10/2026, sem commit)
+
+Página Ruptura redesenhada e aprovada (perda medida pelo histórico do estoque, projeção na transição, risco pela
+frequência de venda, investimento pela sugestão do Assistente). Detalhes no `CLAUDE.md` e em
+`docs/specs/2026-10-26-dashboard-ruptura-design.md`.
+
+**Falta:**
+- **A foto do estoque precisa rodar TODA noite** (o histórico depende disso). A 1ª coleta ficou agendada pelo Mariano
+  no Windows para 00:05 de 28/10 (script `C:/Users/RMC - 0014/rmc_rotina/coleta_estoque.ps1`, modo `--so-estoque`, 8
+  partes; logs em `rmc_rotina/logs`). Decidir: publicar só a rotina no GitHub (A) ou agendar nesta máquina toda noite (B).
+- Conferir em 28/10 os logs e o 1º dia do histórico no Spaces (`pedido/historico_estoque/`).
+- A API do GPS estava lenta em 27/10 (14,5 min para o estoque de uma empresa de 1 loja): medir a duração da coleta.
+- Ao publicar o app: nada a carregar (o histórico vem da rotina).
+
+## Classificação de produtos em cascata (25–26/10/2026, sem commit)
+
+Feito (etapas C1–C7 do plano `docs/specs/2026-10-25-classificacao-produtos-plano.md`): 5 categorias fixas
+(Propagado, Genérico, Similar, Perfumaria, Em classificação) pela ordem manual → IQVIA → CMED (só Genérico e
+Similar); a FEBRAFAR não classifica mais, só identifica na cascata. Tabela nova `classificacao_ean` (migração
+0019), seção "Classificação de produtos" nas Configurações (cascata + "Editar correspondência"), o Assistente
+(Comprador) e o Dashboard usando a mesma classificação. Carregado só no banco **dev** e no Spaces
+(`pedido/categorias/classificacao_ean.parquet`).
+
+**Falta:**
+- **Ao publicar:** a migração 0019 roda sozinha; depois, em Dados → Importar → Categorias, clicar em "Carregar
+  fontes" no app publicado (o arquivo já está no Spaces). Sem isso, a classificação usa só a IQVIA e o manual.
+- **Base inicial de categorias com a CMED nova:** a lista de 09/10/2026 é diferente da que está na base (que
+  decide os dias de estoque). Atualizar é outra decisão — não foi feito (`--so-classificacao`).
+- **MIP/OTC da FEBRAFAR:** analisar à parte (decisão de 25/10/2026).
+- **1ª abertura depois de reiniciar o app:** 7–9 s para ler as fontes (uma vez por processo e por versão,
+  compartilhado por todas as sessões). Se incomodar, ler a FEBRAFAR/CMED do parquet do Spaces em vez do banco.
+
+## Guardado para depois (dependem de um resultado) — 07/10/2026
+
+1. **Análise baixa o arquivo inteiro da rede** (o filtro por EAN só pula a
+   decodificação): ~23 MB/mês estimado, ~140 MB no gráfico de 6 meses, tudo
+   na memória do Streamlit Cloud. Fazer a leitura por faixas (pyarrow
+   S3FileSystem: só o rodapé + blocos/colunas necessários) QUANDO o job
+   `rede` tiver gerado os arquivos reais no Spaces — medir antes e depois.
+2. **Carga inicial da rotina ~11 noites**: compras de 1 mês levam 1,7–4 min
+   no GPS (medido 07/10, empresa de 1 loja); 4 partes ≈ 37 empresas/noite
+   de 388. Opção: 8 partes (12 ≈ 4 noites), com risco de sobrecarregar o GPS
+   (502 em 05/10). Decidir depois de ver o resultado da execução manual de
+   07/10 e das primeiras noites com o código novo.
+
+## Rotina do GPS — fases (08/10/2026, sem commit)
+
+Fase 1 (carga de agosto e setembro para todas as empresas) → fase 2
+(manutenção) sozinha; 8 partes; vínculo automático; código da loja sem
+espaços. **Publicar os 8 arquivos da rotina** (`pedido/__main__.py`,
+`coleta.py`, `plano.py`, `rede.py`, `transformar.py`, `armazenamento.py`,
+`.github/workflows/rotina_pedido.yml`, `tests/test_pedido.py`) — conferido
+contra o `main`: 365 testes passando. Os 40 arquivos vazios da empresa
+690ba7e2… (código com espaços) ficam órfãos no bucket; a rotina baixa de
+novo com o caminho certo.
+
+## 00000. Rodada de 07/10/2026: login individual das lojas (etapas 1–5, concluído)
+
+Feito (sem commit): (1) lojas da rede = status "Ativo" da T.I. (594) e grupo
+econômico pela sigla; (2) login por e-mail das lojas, links de criar/recuperar
+senha pelo Gmail; (3) aba **Cadastro** (ADM e Consultor) — lista pela loja da
+barra, Novo/Editar, Atribuir Painéis, Atribuir Empresas (só do grupo),
+e-mail de ativação com link pra copiar, Excluir/Reativar; a sincronização de
+lojas tira sozinha o acesso a loja que saiu da rede ou do grupo (histórico em
+`usuarios_lojas_historico`). Detalhes no `CLAUDE.md`.
+
+**Falta:**
+- (Feito na etapa 4: painéis atribuídos valendo na barra lateral e linhas de
+  compra do Comprador no Assistente — por enquanto só Genéricos e
+  Perfumaria se distinguem; Similares/Propagados dependem do catálogo.)
+- (Feito na etapa 5: catálogo IQVIA — linhas por SETOR_NEC, personalizáveis
+  por loja em Configurações de Pedidos; genéricos pelo GMRS. Carga única: o
+  CD_PERIODO antigo não importa, não chegam catálogos novos.)
+- Carregar o catálogo no banco real: `python -m pedido.carga_catalogo
+  --catalogo <xlsx do Downloads> --executar` (grava no Spaces) e o botão
+  Dados → Importar → Categorias de produtos → "Carregar catálogo".
+- Ao publicar: `EMAIL_REMETENTE`, `EMAIL_SENHA_APP` e `APP_URL` nos Secrets do
+  Streamlit Cloud.
+
+## 0000. Rodada de 05–06/10/2026: Análise pela API do GPS
+
+A Análise de Oportunidade (Por Loja e Por Produto) passou a ler as compras da
+API do GPS (rotina da madrugada → arquivo da rede por mês, `pedido/rede.py`),
+com todo produto da tabela Gruppy e as regras de preço do Assistente compra a
+compra. Saíram: o envio da planilha do GPS, a fila de CNPJ órfão, a regra da
+planilha (menor preço, recuo CMV/custo médio, preço médio 3m) e o script
+`limpeza_gps_regra_antiga.py` (que também apagava a Gruppy — perigoso hoje).
+Detalhes no `CLAUDE.md`.
+
+**Pendente, depende do Mariano:**
+1. Publicar (push no main) — a rotina nova só roda no GitHub depois disso; a
+   primeira execução baixa 3 meses a mais de compras de cada empresa.
+2. Depois de publicar: `python limpeza_compras_planilha.py` (prévia) e
+   `--executar` — apaga as compras da planilha, a fila de CNPJ órfão e os
+   registros de envio. Substitui a pendência 1 da rodada de 23/09 abaixo.
+3. Com a rede online: conferir a cobertura de lojas (planilha de agosto = 336
+   lojas), reanalisar as notas da MILLENIUM (~2,2× o cadastro, lojas Reis) e a
+   questão de embalagem/fardo.
 
 ## 000. Rodada de 24/09/2026: colunas novas e ordenação nas análises
 

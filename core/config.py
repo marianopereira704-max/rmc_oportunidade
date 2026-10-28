@@ -206,6 +206,28 @@ class GpsApiConfig:
 
 
 @dataclass
+class EmailConfig:
+    """E-mails do sistema (ativação e "esqueci minha senha" — 07/10/2026).
+    Gmail por SMTP com SENHA DE APP (a senha normal da conta não funciona
+    por SMTP): `EMAIL_REMETENTE` e `EMAIL_SENHA_APP` só no secrets.toml /
+    Secrets do Streamlit Cloud, nunca no código. `APP_URL` é o endereço que
+    vai no link do e-mail (local: http://localhost:8501; publicado: o do
+    Streamlit Cloud)."""
+    remetente: str | None = field(default_factory=lambda: _get("EMAIL_REMETENTE"))
+    senha_app: str | None = field(default_factory=lambda: _get("EMAIL_SENHA_APP"))
+    nome_remetente: str = field(default_factory=lambda: _get("EMAIL_NOME_REMETENTE", "Assistente de Pedidos RMC"))
+    smtp_host: str = field(default_factory=lambda: _get("EMAIL_SMTP_HOST", "smtp.gmail.com"))
+    smtp_porta: int = field(default_factory=lambda: int(_get("EMAIL_SMTP_PORTA", "587")))
+    app_url: str = field(default_factory=lambda: (_get("APP_URL", "http://localhost:8501") or "").rstrip("/"))
+    horas_ativacao: int = 48
+    horas_recuperacao: int = 1
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.remetente and self.senha_app)
+
+
+@dataclass
 class CookieConfig:
     """Segredo usado para assinar o cookie de sessão "lembrar-me". Nunca deve
     ficar hardcoded no código-fonte (bug conhecido do projeto anterior,
@@ -404,6 +426,7 @@ class AppConfig:
     gps_api: GpsApiConfig = field(default_factory=GpsApiConfig)
     pedido: PedidoConfig = field(default_factory=PedidoConfig)
     cookie: CookieConfig = field(default_factory=CookieConfig)
+    email: EmailConfig = field(default_factory=EmailConfig)
     reconciliacao: ReconciliacaoConfig = field(default_factory=ReconciliacaoConfig)
     analise: AnaliseConfig = field(default_factory=AnaliseConfig)
     colunas: ColunasMapeamentoConfig = field(default_factory=ColunasMapeamentoConfig)
@@ -419,7 +442,7 @@ class AppConfig:
         default_factory=lambda: _get_int_list("PAGE_SIZE_OPCOES", [25, 50, 100, 200])
     )
     periodos_meses_opcoes: list[int] = field(
-        default_factory=lambda: _get_int_list("PERIODOS_MESES_OPCOES", [1, 2, 3, 6])
+        default_factory=lambda: _get_int_list("PERIODOS_MESES_OPCOES", [1, 2, 3])  # até 3 meses fechados (05/10/2026)
     )
     nome_rede: str = field(default_factory=lambda: _get("NOME_REDE", "Rede"))
     nome_fornecedor: str = field(default_factory=lambda: _get("NOME_FORNECEDOR", "RMC"))

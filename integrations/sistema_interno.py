@@ -24,16 +24,24 @@ de 2.188 registros reais):
   2.188 — esperado ficar vazio na maioria das lojas). Outros setores (PBM,
   Supervisão, Assistente de Pedidos, Expansão, Qualidade, Produtos
   Exclusivos) são ignorados — não têm campo correspondente no model.
-- grupo_economico continua sem mapear (None) — decisão pendente separada:
-  só 7 de 2.188 registros têm acronym_economic_group preenchido, e nesses 7
-  a relação com economic_group (lista de IDs) nem sempre bate 1:1, então não
-  dá pra inferir sozinho qual vira o nome do grupo.
+- Loja DA REDE (07/10/2026) = active=true E status_title "Ativo". O
+  `active` sozinho trazia também os cadastros "Portal do PBM" (192) e
+  "Institucional" (27): 813 "ativas", 594 da rede. Quem não está na lista
+  fica com `na_rede` = False (nada se apaga) e sai das telas e da rotina.
+- grupo_economico = `acronym_economic_group` ("GE787" = GE + o código da
+  loja principal do grupo). Em 09/2026 só 7 lojas traziam a sigla; em
+  07/10/2026, as 594 da rede (472 de 475 conferências lista × sigla batem).
+  209 lojas estão em grupos de 2+ (multi-lojas), o resto é grupo de 1.
+- Depois de gravar, os acessos dos usuários de loja são conferidos
+  (integrations/usuarios.py::ajustar_acessos): loja fora da rede ou do grupo
+  da loja principal sai do acesso, com registro em `usuarios_lojas_historico`.
 """
 from __future__ import annotations
 
 import datetime as dt
 
 import requests
+from sqlalchemy import update
 
 from core.config import settings
 from core.db import get_session
@@ -56,9 +64,14 @@ _SETOR_PARA_CAMPO = {
 # ~4.500 parâmetros, folgado mesmo nas versões antigas.
 _TAMANHO_BLOCO_LOJAS = 500
 
-# Colunas sobrescritas quando o CNPJ já existe. `grupo_economico` fica de fora
-# DE PROPÓSITO — ver a docstring do módulo e a de `insert_com_atualizacao`.
+# Status que define a loja da rede (ver a docstring do módulo).
+STATUS_DA_REDE = "Ativo"
+
+# Colunas sobrescritas quando o CNPJ já existe. `grupo_economico` entrou em
+# 07/10/2026: desde então ele VEM desta origem (antes ficava de fora porque
+# era preenchido por outra decisão).
 _COLUNAS_ATUALIZADAS = [
+    "grupo_economico", "na_rede",
     "razao_social", "uf", "cidade",
     "atendente_comercial", "consultor_farma", "consultor_interno",
     "fonte", "atualizado_em",
@@ -91,6 +104,10 @@ def _texto_curto(valor, limite: int) -> str | None:
         return None
     t = str(valor).strip()
     return t[:limite] or None
+
+
+def da_rede(item: dict) -> bool:
+    return item.get("active") is True and (item.get("status_title") or "").strip() == STATUS_DA_REDE
 
 
 def _gravar_lojas_em_bloco(session, linhas: list[dict]) -> None:
@@ -140,7 +157,13 @@ class SistemaInternoLojasAdapter(IntegrationAdapter):
 
         registros = self._buscar_lojas_api()
 
-        ativos = [item for item in registros if item.get("active") is True]
+        ativos = [item for item in registros if da_rede(item)]
+        if registros and not ativos:
+            # Resposta sem nenhuma loja "Ativo" é defeito da API, não a rede
+            # inteira saindo — marcar tudo como fora da rede tiraria todas as
+            # lojas das telas. Nada é alterado.
+            raise RuntimeError(f"A API do sistema interno devolveu {len(registros)} cadastro(s) e nenhum com status "
+                               f"\"{STATUS_DA_REDE}\" — nada foi alterado.")
         lojas_com_setor_duplicado = 0
 
         # Deduplicado por CNPJ, mantendo a ÚLTIMA ocorrência — mesmo resultado
@@ -162,10 +185,8 @@ class SistemaInternoLojasAdapter(IntegrationAdapter):
                 "atendente_comercial": campos_time.get("atendente_comercial"),
                 "consultor_farma": campos_time.get("consultor_farma"),
                 "consultor_interno": campos_time.get("consultor_interno"),
-                # grupo_economico NÃO entra aqui nem na lista de colunas
-                # atualizadas: é pendente de decisão separada (ver docstring
-                # do módulo) e sobrescrevê-lo apagaria dado que não é desta
-                # origem.
+                "grupo_economico": _texto_curto(item.get("acronym_economic_group"), 150),
+                "na_rede": True,
                 "fonte": "sistema_interno",
                 "atualizado_em": dt.datetime.utcnow(),
                 "legacy_id": item.get("legacyId"),
@@ -176,13 +197,33 @@ class SistemaInternoLojasAdapter(IntegrationAdapter):
             }
 
         with get_session() as session:
+            # Tudo numa transação: quem não veio na lista fica fora da rede,
+            # quem veio volta (ou continua) nela.
+            fora = 0
+            if por_cnpj:
+                fora = session.execute(
+                    update(Loja).where(Loja.na_rede.is_not(False), Loja.cnpj.not_in(list(por_cnpj)))
+                    .values(na_rede=False)
+                ).rowcount
             _gravar_lojas_em_bloco(session, list(por_cnpj.values()))
+            # Acesso dos usuários de loja (07/10/2026, Q32): loja que saiu da
+            # rede ou do grupo econômico sai sozinha, com registro no histórico.
+            from integrations import usuarios
+
+            acessos = usuarios.ajustar_acessos(session)
 
         processados = len(ativos)
         mensagem = (
-            f"{processados} lojas ativas sincronizadas com sucesso "
-            f"(de {len(registros)} recebidas da API, só active=true)."
+            f"{processados} lojas da rede sincronizadas com sucesso "
+            f"(de {len(registros)} recebidas da API, só status \"{STATUS_DA_REDE}\")."
         )
+        if fora:
+            mensagem += f" {fora} loja(s) saíram da rede (ficam guardadas, fora das telas)."
+        if acessos["excluidos"] or acessos["retiradas"]:
+            mensagem += (
+                f" Acessos: {acessos['excluidos']} usuário(s) excluído(s) (loja principal fora da rede) e "
+                f"{acessos['retiradas']} loja(s) adicional(is) retirada(s) (fora da rede ou do grupo econômico)."
+            )
         if lojas_com_setor_duplicado:
             mensagem += (
                 f" {lojas_com_setor_duplicado} loja(s) tinham mais de uma pessoa no mesmo "

@@ -235,17 +235,71 @@ def _rotina(tmp_path, cliente, orcamento=10_000, relogio=None, tentativas=3):
 def test_carga_completa_e_depois_nada_a_fazer(tmp_path):
     cli = ClienteFalso()
     rel = _rotina(tmp_path, cli).executar(["E1"], "p1")
-    assert rel.unidades_com_falha == 0 and rel.unidades_ok == 4 + 8 + 1
+    # Compras: 6 meses fechados + o corrente (Análise); vendas: 3 + o corrente.
+    assert rel.unidades_com_falha == 0 and rel.unidades_ok == 7 + 8 + 1
     armaz = ArmazenamentoLocal(tmp_path)
     assert armaz.existe(CH.mes("E1", "2", COMPRAS, "2026-06"))           # loja sem compra: arquivo vazio
     assert armaz.existe(CH.dia("E1", "1", VENDAS, dt.date(2026, 9, 26)))
     assert armaz.ler_df(CH.estoque("E1", "1"))["qtd_estoque"].tolist() == [3.0]
     assert armaz.existe(CH.catalogo("E1"))  # produtos da empresa, pro relatório Sem Classificação
     assert rel.prontos_montados == 2 and armaz.existe("pedido/pronto/E1/1/meta.json")  # tela abre sem juntar brutos
-    # Segunda execução no mesmo dia: nada a baixar.
+    # Modelo de estoque do Dashboard (22/10/2026): montado na mesma passada, um por loja, sem banco.
+    assert rel.modelos_montados == 2 and armaz.existe("pedido/estoque/E1/1/meta.json")
+    assert armaz.ler_json("pedido/estoque/E1/1/meta.json")["skus"] == 1          # o produto com 3 un. em estoque
+    assert armaz.ler_json(CH.marcador_compras("E1"))["meses"]["2026-08"] == "2026-09-27"
+    # Segunda execução no mesmo dia: só as compras dos últimos 5 dias, de
+    # novo (nota lançada com atraso — 05/10/2026).
     cli2 = ClienteFalso()
     rel2 = _rotina(tmp_path, cli2).executar(["E1"], "p1")
-    assert cli2.chamadas == [] and rel2.unidades_ok == 0
+    assert cli2.chamadas == [("compras", dt.date(2026, 9, 22), dt.date(2026, 9, 26))] and rel2.unidades_ok == 1
+
+
+def test_falha_no_modelo_de_estoque_nao_derruba_o_pronto_e_vai_pro_relatorio(tmp_path, monkeypatch):
+    def quebrar(*a, **k):
+        raise RuntimeError("deu ruim no modelo")
+    monkeypatch.setattr(coleta.estoque_modelo, "atualizar", quebrar)
+    rel = _rotina(tmp_path, ClienteFalso()).executar(["E1"], "p1")
+    assert rel.prontos_montados == 2 and rel.modelos_montados == 0                 # o pronto saiu normalmente
+    assert [f["unidade"] for f in rel.falhas] == ["modelo de estoque E1/1", "modelo de estoque E1/2"]
+    assert ArmazenamentoLocal(tmp_path).existe("pedido/pronto/E1/1/meta.json")
+
+
+def test_foto_de_estoque_vai_para_o_historico_de_cada_loja(tmp_path):
+    """27/10/2026: a perda por ruptura é medida; a rotina guarda o que mudou no estoque a cada foto."""
+    rel = _rotina(tmp_path, ClienteFalso()).executar(["E1"], "p1")
+    armaz = ArmazenamentoLocal(tmp_path)
+    assert rel.historicos_gravados == 2
+    loja1 = armaz.ler_df(CH.historico_estoque("E1", "1", "2026-09"))
+    assert list(zip(loja1["codigo_produto"], loja1["data"], loja1["estoque"])) == [("9", "2026-09-27", 3.0)]
+    assert armaz.ler_json(CH.historico_estoque_fotos("E1", "2"))["dias"] == ["2026-09-27"]
+
+
+def test_so_estoque_baixa_so_a_foto_e_grava_o_historico(tmp_path):
+    """--so-estoque (27/10/2026): começar o histórico num dia sem rotina completa."""
+    cli = ClienteFalso()
+    rot = coleta.Coleta(cli, ArmazenamentoLocal(tmp_path), CH, HOJE, 3, 10_000, 3, relogio=Relogio(), so_estoque=True)
+    rel = rot.executar(["E1"], "p1")
+    armaz = ArmazenamentoLocal(tmp_path)
+    assert cli.chamadas == [("estoque",)] and rel.unidades_ok == 1 and rel.historicos_gravados == 2
+    assert rel.prontos_montados == 0 and not armaz.existe("pedido/pronto/E1/1/meta.json")
+    assert armaz.existe(CH.historico_estoque("E1", "1", "2026-09"))
+
+
+def test_falha_no_historico_nao_derruba_a_foto_e_vai_pro_relatorio(tmp_path, monkeypatch):
+    def quebrar(*a, **k):
+        raise RuntimeError("deu ruim no histórico")
+    monkeypatch.setattr(coleta.historico_estoque, "registrar", quebrar)
+    rel = _rotina(tmp_path, ClienteFalso()).executar(["E1"], "p1")
+    armaz = ArmazenamentoLocal(tmp_path)
+    assert armaz.ler_df(CH.estoque("E1", "1"))["qtd_estoque"].tolist() == [3.0]          # a foto saiu
+    assert armaz.existe(CH.marcador_estoque("E1")) and rel.historicos_gravados == 0
+    assert [f["unidade"] for f in rel.falhas] == ["histórico do estoque E1/1", "histórico do estoque E1/2"]
+
+
+def test_segunda_passada_nao_remonta_o_modelo_se_nada_mudou(tmp_path):
+    _rotina(tmp_path, ClienteFalso()).executar(["E1"], "p1")
+    rel2 = _rotina(tmp_path, ClienteFalso()).executar(["E1"], "p1")
+    assert rel2.prontos_montados == 2 and rel2.modelos_montados == 0                # em dia: só relê
 
 
 def test_consulta_que_falha_volta_pra_fila_e_sai_na_segunda_volta(tmp_path):
@@ -269,7 +323,7 @@ def test_orcamento_de_tempo_para_e_a_proxima_execucao_continua(tmp_path):
     assert rel.parou_por_tempo and rel.unidades_ok == 5
     cli2 = ClienteFalso()
     rel2 = _rotina(tmp_path, cli2).executar(["E1"], "p1")
-    assert rel2.unidades_ok == 13 - 5  # só o que faltou
+    assert rel2.unidades_ok == 16 - 5  # só o que faltou
 
 
 def test_filtro_de_lojas_ativas(tmp_path):
@@ -281,8 +335,306 @@ def test_filtro_de_lojas_ativas(tmp_path):
     assert not armaz.existe(CH.mes("E1", "2", VENDAS, "2026-06"))
 
 
+class ClienteLojasInstavel(ClienteFalso):
+    """A lista de lojas responde 502 nas primeiras N chamadas (05/10/2026:
+    366 de 388 empresas assim)."""
+    def __init__(self, falhar_lojas_vezes, **kw):
+        super().__init__(**kw)
+        self.falhar_lojas_vezes = falhar_lojas_vezes
+
+    def listar_lojas(self, emp):
+        if self.falhar_lojas_vezes > 0:
+            self.falhar_lojas_vezes -= 1
+            raise RuntimeError("A API do GPS respondeu 502 em /lojas")
+        return super().listar_lojas(emp)
+
+
+def test_empresa_cuja_lista_de_lojas_falhou_volta_depois_de_uma_pausa(tmp_path):
+    pausas = []
+    rotina = coleta.Coleta(ClienteLojasInstavel(1), ArmazenamentoLocal(tmp_path), CH, HOJE, 3, 10_000, 3,
+                           relogio=Relogio(), dormir=pausas.append)
+    rel = rotina.executar(["E1"], "p1")
+    assert pausas == [120.0] and rel.empresas_processadas == 1 and rel.unidades_ok == 16
+    assert rel.empresas_sem_lista_de_lojas == 0 and not [f for f in rel.falhas if f["unidade"].startswith("lojas")]
+
+
+def test_lista_de_lojas_que_falha_em_todas_as_voltas_entra_uma_vez_no_relatorio(tmp_path):
+    pausas = []
+    rotina = coleta.Coleta(ClienteLojasInstavel(99), ArmazenamentoLocal(tmp_path), CH, HOJE, 3, 10_000, 3,
+                           relogio=Relogio(), dormir=pausas.append)
+    rel = rotina.executar(["E1", "E2"], "p1")
+    assert len(pausas) == 2 and rel.empresas_processadas == 0 and rel.empresas_sem_lista_de_lojas == 2
+    assert sorted(f["unidade"] for f in rel.falhas) == ["lojas E1", "lojas E2"] and "502" in rel.falhas[0]["erro"]
+
+
+def test_chamada_inicial_tenta_de_novo_com_espera():
+    from pedido import __main__ as rotina
+
+    esperas, respostas = [], [RuntimeError("502"), RuntimeError("502"), ["E1"]]
+
+    def chamada():
+        r = respostas.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+    assert rotina._com_tentativas(chamada, "teste", esperas=(1, 2, 3), dormir=esperas.append) == ["E1"]
+    assert esperas == [1, 2]
+    with pytest.raises(RuntimeError):
+        rotina._com_tentativas(lambda: (_ for _ in ()).throw(RuntimeError("fora")), "teste", esperas=(1,),
+                               dormir=esperas.append)
+
+
+def test_execucao_que_cai_no_inicio_grava_relatorio_com_o_erro(tmp_path, monkeypatch):
+    """Execuções de 03 a 07/10/2026: morriam em ~30 s sem relatório nenhum."""
+    from pedido import __main__ as rotina
+
+    class SemEmpresas:
+        def listar_empresas(self):
+            raise RuntimeError("A API do GPS respondeu 502 em /empresas")
+
+    monkeypatch.setattr(rotina, "cliente_das_configuracoes", lambda **kw: SemEmpresas())
+    monkeypatch.setattr(rotina, "ESPERAS_INICIAIS", ())
+    monkeypatch.setattr(rotina, "_com_tentativas", lambda f, d, esperas=(), dormir=None: f())
+    assert rotina.main(["--destino", f"local:{tmp_path}", "--hoje", "2026-10-07", "--todas-as-lojas"]) == 1
+    data, relatorios = coleta.ultimas_execucoes(ArmazenamentoLocal(tmp_path), CH)
+    assert data == "2026-10-07" and "502" in relatorios[0]["erro_geral"] and relatorios[0]["parte"] == "parte1de1"
+
+
 def test_divisao_entre_execucoes_paralelas_e_estavel_e_completa():
     ids = [f"e{i:02d}" for i in range(10)]
     partes = [coleta.dividir(list(reversed(ids)), p, 4) for p in range(4)]
     assert sorted(sum(partes, [])) == ids
     assert partes[0] == coleta.dividir(ids, 0, 4)
+
+
+# ---------------------------------------------------------------------------
+# Compras da Análise: 6 meses, mês fechado até o dia 6, últimos 5 dias
+# ---------------------------------------------------------------------------
+
+def test_mes_fechado_e_baixado_de_novo_ate_o_dia_6():
+    """Nota emitida em setembro e lançada em 3/10 só aparece baixando setembro
+    de novo; a baixa do dia 6 (ou depois) é a definitiva."""
+    assert plano.dia_definitivo("2026-09") == dt.date(2026, 10, 6)
+    assert plano.dia_definitivo("2026-12") == dt.date(2027, 1, 6)
+    dia3 = dt.date(2026, 10, 3)
+    assert plano.compras_a_rebaixar(dia3, 6, {"2026-09": "2026-10-02"}) == ({"2026-09"}, {dt.date(2026, 10, 1), dt.date(2026, 10, 2)})
+    assert plano.compras_a_rebaixar(dia3, 6, {"2026-09": "2026-10-03"})[0] == set()        # já baixado hoje
+    assert plano.compras_a_rebaixar(dt.date(2026, 10, 9), 6, {"2026-09": "2026-10-06"})[0] == set()  # definitivo
+    assert plano.compras_a_rebaixar(dt.date(2026, 10, 9), 6, {})[0] == {"2026-09"}            # sem registro
+    assert plano.compras_a_rebaixar(dt.date(2026, 10, 9), 6, {"2026-09": "2026-10-05"})[0] == {"2026-09"}
+
+
+def test_compras_seis_meses_e_vendas_tres():
+    existentes = set()
+    for mes in ("2026-03", "2026-04", "2026-05", "2026-06", "2026-07"):
+        existentes.add(CH.mes("E1", "1", COMPRAS, mes))
+    us = plano.unidades_da_empresa(CH, existentes, "E1", ["1"], HOJE, 3, HOJE.isoformat(),
+                                   meses_compras=6, compras_baixadas={"2026-08": "2026-09-10"})
+    compras = [(u.inicio, u.fim) for u in us if u.tipo == COMPRAS]
+    # Falta agosto (o arquivo) e o mês corrente; março–julho já estão.
+    assert compras == [(dt.date(2026, 8, 1), dt.date(2026, 8, 31)), (dt.date(2026, 9, 1), dt.date(2026, 9, 26))]
+    assert min(u.inicio for u in us if u.tipo == VENDAS) == dt.date(2026, 6, 1)
+
+
+def test_compras_guardam_o_nome_do_produto():
+    df = transformar.compras([{"TipoCompra": "0", "CodigoLoja": "1", "CodigoProduto": "10",
+                               "ProdutoRelacionado_NomeProduto": " LOSARTANA 50MG 30CP ", "Quantidade": 1}])
+    assert df.loc[0, "nome"] == "LOSARTANA 50MG 30CP"
+
+
+
+# ---------------------------------------------------------------------------
+# Compras da rede por mês (pedido/rede.py)
+# ---------------------------------------------------------------------------
+
+def _compra(loja, produto, ean, data, qtd, unit, desc=0, fracao=1, nome=None):
+    return {"TipoCompra": "0", "CodigoLoja": loja, "CodigoProduto": produto, "ProdutoRelacionado_CodigoBarras": ean,
+            "DataEmissaoNF": data, "Quantidade": qtd, "VlrUnitario": unit, "VlrDesconto": desc, "Fracao": fracao,
+            "NroNF": "123", "NomeRazaoSocialFornecedor": "DIST", "ProdutoRelacionado_NomeProduto": nome}
+
+
+def test_rede_junta_as_lojas_por_mes_e_so_refaz_quando_muda(tmp_path):
+    from pedido import rede
+
+    armaz = ArmazenamentoLocal(tmp_path)
+    c = transformar.compras([_compra("1", "10", "0789", "2026-09-03", 2, 30.0, desc=10, fracao=3, nome="DISPLAY X"),
+                             _compra("2", "11", "0123", "2026-09-04", 1, 5.0)])
+    for loja, fatia in transformar.por_loja(c, ["1", "2"]).items():
+        armaz.salvar_df(CH.mes("E1", loja, COMPRAS, "2026-09"), fatia)
+    armaz.salvar_df(CH.estoque("E1", "1"), transformar.estoque([
+        {"CodigoLoja": "1", "CodigoProduto": "10", "NomeProduto": "DISPLAY X", "VlrPrecoCompra": 9.0, "VlrPrecoVenda": 15.0}]))
+    armaz.salvar_json(CH.marcador_compras("E1"), {"meses": {"2026-09": "2026-10-06"}})
+
+    assert rede.meses_visiveis(dt.date(2026, 10, 5)) == ["2026-04", "2026-05", "2026-06", "2026-07", "2026-08"]
+    resumo = rede.atualizar(armaz, CH, dt.date(2026, 10, 6))
+    assert {"mes": "2026-09", "situacao": "montado", "lojas": 2, "linhas": 2} == {k: v for k, v in resumo[-1].items() if k != "segundos"}
+    df = armaz.ler_df(CH.compras_rede("2026-09"))
+    assert df["ean"].tolist() == ["123", "789"]                          # ordenado pelo EAN (chave, sem zeros)
+    x = df[df["ean"] == "789"].iloc[0]
+    assert x["quantidade"] == 6 and x["preco"] == pytest.approx(9.0)      # 2 displays de 3 a R$ 30 com 10%
+    assert x["custo_cadastro"] == 9.0 and x["preco_venda"] == 15.0 and x["nome"] == "DISPLAY X"
+    so_um = armaz.ler_df(CH.compras_rede("2026-09"), filtros=[("ean", "in", ["123"])])
+    assert so_um["codigo_loja"].tolist() == ["2"]
+    resumo = armaz.ler_df(CH.compras_rede_resumo("2026-09")).set_index("ean")
+    assert resumo.loc["789", "valor"] == pytest.approx(54) and resumo.loc["789", "lojas"] == 1
+
+    assert rede.atualizar(armaz, CH, dt.date(2026, 10, 7))[-1]["situacao"] == "em dia"
+    armaz.salvar_json(CH.marcador_compras("E1"), {"meses": {"2026-09": "2026-10-08"}})  # mês baixado de novo
+    assert rede.atualizar(armaz, CH, dt.date(2026, 10, 8))[-1]["situacao"] == "montado"
+
+
+# ---------------------------------------------------------------------------
+# Fases da rotina (08/10/2026): carga inicial só com meses fechados, depois
+# manutenção (dia a dia de todas primeiro, meses antigos depois)
+# ---------------------------------------------------------------------------
+
+CARGA = ["2026-07", "2026-08"]   # meses fechados para o HOJE dos testes (27/09/2026)
+
+
+def _fase(tmp_path, cliente, fase, status=None, tentativas=3):
+    return coleta.Coleta(cliente, ArmazenamentoLocal(tmp_path), CH, HOJE, 3, 10_000, tentativas, relogio=Relogio(),
+                         dormir=lambda s: None, fase=fase, meses_carga=CARGA, status_carga=status)
+
+
+def test_carga_baixa_so_os_meses_fechados_e_marca_a_empresa(tmp_path):
+    cli = ClienteFalso()
+    rel = _fase(tmp_path, cli, "carga").executar(["E1"], "p1")
+    meses = sorted({c[1].isoformat()[:7] if c[0] == "compras" else c[2].isoformat()[:7] for c in cli.chamadas})
+    assert meses == CARGA and not [c for c in cli.chamadas if c[0] == "estoque"]
+    assert rel.unidades_ok == 2 + 2 * 2 and rel.fase == "carga" and rel.empresas_carga_completa == 1
+    assert ArmazenamentoLocal(tmp_path).ler_json(CH.carga("E1")) == {
+        "meses": CARGA, "completa": True, "tentativas": 0, "atualizado": "2026-09-27"}
+    # Carga feita: rodar de novo não pede nada à API (mês fechado não é refeito).
+    cli2 = ClienteFalso()
+    _fase(tmp_path, cli2, "carga").executar(["E1"], "p1")
+    assert cli2.chamadas == []
+
+
+def test_falha_na_carga_soma_tentativa_e_parar_pelo_tempo_nao(tmp_path):
+    marcador = lambda: ArmazenamentoLocal(tmp_path).ler_json(CH.carga("E1"))  # noqa: E731
+    _fase(tmp_path, ClienteFalso(falhar_vendas_vezes=99), "carga", tentativas=2).executar(["E1"], "p1")
+    assert marcador()["completa"] is False and marcador()["tentativas"] == 1
+    _fase(tmp_path, ClienteFalso(falhar_vendas_vezes=99), "carga", status={"E1": marcador()},
+          tentativas=2).executar(["E1"], "p1")
+    assert marcador()["tentativas"] == 2
+    # Parar pelo tempo no meio da empresa: não completa, mas também não conta tentativa.
+    relogio = Relogio()
+    rotina = coleta.Coleta(ClienteFalso(relogio=relogio, custo_por_chamada=60), ArmazenamentoLocal(tmp_path / "t"),
+                           CH, HOJE, 3, 90, 3, relogio=relogio, dormir=lambda s: None, fase="carga",
+                           meses_carga=CARGA)
+    rotina.executar(["E1"], "p1")
+    m = ArmazenamentoLocal(tmp_path / "t").ler_json(CH.carga("E1"))
+    assert m["completa"] is False and m["tentativas"] == 0
+
+
+def test_manutencao_faz_o_dia_a_dia_de_todas_antes_dos_meses_antigos(tmp_path):
+    cli = ClienteFalso()
+    _fase(tmp_path, cli, "manutencao").executar(["E1", "E2"], "p1")
+    tipos = [(c[0], (c[1] if c[0] == "compras" else c[2] if c[0] == "vendas" else None)) for c in cli.chamadas]
+    # Primeiro, de E1 e E2: mês corrente (compras e vendas) e estoque.
+    primeiras = tipos[:2 * (1 + 2 + 1)]
+    assert all(t == "estoque" or d.month == 9 for t, d in primeiras)
+    assert sum(1 for t, _ in primeiras if t == "estoque") == 2
+    # Depois, os meses fechados que faltavam (complemento).
+    assert all(t != "estoque" and d.month < 9 for t, d in tipos[len(primeiras):])
+
+
+def test_fase_da_execucao_e_ordem_das_empresas():
+    from pedido import __main__ as rotina
+
+    completa = {"meses": rotina.MESES_CARGA, "completa": True, "tentativas": 0}
+    falhou_1 = {"meses": rotina.MESES_CARGA, "completa": False, "tentativas": 1}
+    desistiu = {"meses": rotina.MESES_CARGA, "completa": False, "tentativas": 3}
+    status = {"a": completa, "b": falhou_1, "d": desistiu}
+    fase, empresas = rotina._fase_e_empresas(["a", "b", "c", "d"], status, 0, 1)
+    assert fase == "carga" and empresas == ["c", "b"]          # nunca tentada primeiro; a e d não seguram
+    fase, empresas = rotina._fase_e_empresas(["a", "d"], status, 0, 1)
+    assert fase == "manutencao" and empresas == ["a", "d"]
+    # Carga de outros meses (variável mudou): começa de novo.
+    assert rotina._fase_e_empresas(["a"], {"a": {**completa, "meses": ["2025-01"]}}, 0, 1)[0] == "carga"
+
+
+def test_codigo_da_loja_com_espacos_nao_gera_arquivo_vazio(tmp_path):
+    """08/10/2026: "1" + 49 espaços na lista de lojas e "1" nos dados — a
+    separação por loja não casava e os arquivos saíam vazios."""
+    class ComEspacos(ClienteFalso):
+        def listar_lojas(self, emp):
+            return [{"CodigoLoja": "1" + " " * 49, "NomeLoja": "L1"}]
+
+    _rotina(tmp_path, ComEspacos()).executar(["E1"], "p1")
+    armaz = ArmazenamentoLocal(tmp_path)
+    assert armaz.ler_df(CH.estoque("E1", "1"))["qtd_estoque"].tolist() == [3.0]
+    assert armaz.ler_json(CH.lojas_gps("E1"))[0]["CodigoLoja"] == "1"
+
+
+# ---------------------------------------------------------------------------
+# Vínculo pelo CEP (08/10/2026, pedido/vinculo.py)
+# ---------------------------------------------------------------------------
+
+def _rmc_cep(cnpj, nome, numero, cep, cidade="NATAL", uf="RN"):
+    return {"cnpj": cnpj, "razao_social": nome, "nome_fantasia": nome, "numero": numero, "bairro": None,
+            "cidade": cidade, "uf": uf, "cep": cep}
+
+
+def _gps_cep(nome, numero, cep, uf="RN"):
+    return {"id_empresa": "E", "codigo_loja": "1", "nome_loja": nome, "cnpj": None, "numero": numero, "uf": uf, "cep": cep}
+
+
+def test_cep_de_rua_e_numero_iguais_ligam_mesmo_com_nome_diferente():
+    from pedido import vinculo
+
+    rmc = [_rmc_cep("1", "ISABELLE DE SANTANA BORGES", "54", "59152-250"), _rmc_cep("2", "OUTRA", "54", "59000-100")]
+    s = vinculo.sugerir([_gps_cep("MEGA FARMA 5 PIRANGI", "54", "59152250")], rmc)[0]
+    assert (s.situacao, s.metodo, s.cnpj_rmc) == (vinculo.AUTOMATICO, vinculo.POR_CEP, "1")
+
+
+def test_cep_de_cidade_nao_decide_sozinho():
+    from pedido import vinculo
+
+    rmc = [_rmc_cep("1", "ISABELLE DE SANTANA BORGES", "54", "59173-000")]
+    s = vinculo.sugerir([_gps_cep("MEGA FARMA 5 PIRANGI", "54", "59173000")], rmc)[0]
+    assert s.situacao == vinculo.CONFIRMAR and s.metodo == vinculo.POR_ENDERECO      # como antes: número sem nome
+
+
+def test_cep_desempata_numero_repetido_na_uf():
+    from pedido import vinculo
+
+    rmc = [_rmc_cep("1", "DROGARIA FERRARI", "100", "59600-000", cidade="MOSSORO"),
+           _rmc_cep("2", "DROGARIA FERRARI CENTRO", "100", "59010-000", cidade="NATAL")]
+    s = vinculo.sugerir([_gps_cep("DROGARIA FERRARI", "100", "59010-000")], rmc)[0]
+    assert (s.situacao, s.cnpj_rmc) == (vinculo.AUTOMATICO, "2")
+
+
+def test_mesmo_cep_de_rua_sem_numero_vira_sugestao():
+    from pedido import vinculo
+
+    rmc = [_rmc_cep("1", "FARMACIA X", "10", "59152-250")]
+    s = vinculo.sugerir([_gps_cep("LOJA Y", None, "59152250")], rmc)[0]
+    assert (s.situacao, s.metodo, s.cnpj_rmc) == (vinculo.CONFIRMAR, vinculo.POR_CEP, "1")
+
+
+def test_sessao_com_prazo_total_corta_resposta_que_nao_acaba(monkeypatch):
+    """09/10/2026: uma consulta ficou 8 h pendurada — o timeout do requests é
+    por leitura, não do total."""
+    import requests
+    from pedido import __main__ as rotina
+
+    class RespostaLenta:
+        def __init__(self):
+            self.fechada = False
+
+        def iter_content(self, chunk_size):
+            for _ in range(10):
+                tempo[0] += 100          # cada pedaço "leva" 100 s
+                yield b"x"
+
+        def close(self):
+            self.fechada = True
+
+    tempo = [0.0]
+    resposta = RespostaLenta()
+    monkeypatch.setattr(rotina.time, "monotonic", lambda: tempo[0])
+    monkeypatch.setattr(requests.Session, "request", lambda self, m, u, **kw: resposta)
+    with pytest.raises(requests.Timeout, match="prazo total"):
+        rotina._SessaoComPrazo(480).request("GET", "http://x")
+    assert resposta.fechada

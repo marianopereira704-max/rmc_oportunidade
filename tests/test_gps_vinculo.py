@@ -70,4 +70,49 @@ def test_le_as_lojas_que_a_rotina_gravou(tmp_path):
                                             "Estado": "RN            ", "Cidade": "GOIANINHA"}])
     lojas = gps_vinculo.lojas_gps_salvas(armaz, ch)
     assert lojas == [{"id_empresa": "E1", "codigo_loja": "1", "nome_loja": "L1", "cnpj": None, "numero": "37",
-                      "uf": "RN", "cidade": "GOIANINHA"}]
+                      "uf": "RN", "cidade": "GOIANINHA", "cep": None}]
+
+
+def test_codigo_com_espacos_nao_duplica_e_fica_limpo(session, tmp_path):
+    """08/10/2026: uma empresa do GPS manda o código da loja com espaços no
+    fim ("1" + 49 espaços). O vínculo antigo, gravado assim, era tomado por
+    loja nova e o recálculo inteiro caía na chave única."""
+    session.add(VinculoLojaGps(id_empresa_gps="M", codigo_loja_gps="1" + " " * 39,
+                               situacao=SituacaoVinculoGps.CONFIRMADO, loja_id=2))
+    session.flush()
+    armaz, ch = ArmazenamentoLocal(tmp_path), Chaves("pedido")
+    armaz.salvar_json(ch.lojas_gps("M"), [{"CodigoLoja": "1" + " " * 49, "NomeLoja": "MEGA FARMA 1", "Numero": "37",
+                                           "Estado": "RN"}])
+    lojas = gps_vinculo.lojas_gps_salvas(armaz, ch)
+    assert lojas[0]["codigo_loja"] == "1"
+    gps_vinculo.recalcular(session, lojas)
+    v = _vinculo(session, "M")
+    assert v.codigo_loja_gps == "1" and v.situacao == SituacaoVinculoGps.CONFIRMADO   # decisão humana mantida
+    assert gps_vinculo.recalcular_se_houver_novas(session, armaz, ch) is None           # nada novo: não recalcula
+
+
+def test_planilha_de_codigos_do_gps(session):
+    """Formatos reais da planilha exportada do GPS (08/10/2026)."""
+    import pandas as pd
+
+    df = pd.DataFrame({
+        "Empresa": ["2089 - Mega Farma", "2089 - Mega Farma", "2246 - 1124 - DROGARIA COSTA E VERLI LTDA",
+                    "2316 - [GPS] 2316 - DROGARIA AVENIDA LTDA - 2154", "sem código", "2783 - FARMACIA VIDA - 793/1880"],
+        "Cnpj": ["10.296.546/0001-95", "10.296.546/0002-76", "07.111.111/0001-11", None, "1", "54.462.721/0001-42"],
+        "idEmp": ["6901107ed4a5e05f99b7f4ab", "6901107ED4A5E05F99B7F4AB", "6908ae1bbe8d380678f413f7",
+                  "69124b93f16c6d8b5b5fcb05", "690e006aafbc06cb740fa77e", "não é id"],
+    })
+    lida = gps_vinculo.ler_planilha_codigos(df)
+    por_id = {e["id_empresa_gps"]: e for e in lida.empresas}
+    assert por_id["6901107ed4a5e05f99b7f4ab"]["codigo_gps"] == "2089"
+    assert por_id["6901107ed4a5e05f99b7f4ab"]["cnpjs"] == {"10296546000195", "10296546000276"}   # uma empresa, 2 lojas
+    assert por_id["6908ae1bbe8d380678f413f7"]["nome"] == "1124 - DROGARIA COSTA E VERLI LTDA"
+    assert por_id["69124b93f16c6d8b5b5fcb05"]["nome"] == "DROGARIA AVENIDA LTDA - 2154"
+    assert [n for n, _ in lida.ignoradas] == [6, 7]          # sem código; idEmp fora do formato
+    assert gps_vinculo.importar_codigos(session, lida, "Admin") == 3
+    # Reenviar atualiza e não apaga o que não veio.
+    gps_vinculo.importar_codigos(session, gps_vinculo.ler_planilha_codigos(df.iloc[[2]]), "Admin")
+    codigos = gps_vinculo.empresas(session)
+    assert set(codigos) == set(por_id) and codigos["6901107ed4a5e05f99b7f4ab"].codigo == "2089"
+    with pytest.raises(ValueError, match="idEmp"):
+        gps_vinculo.ler_planilha_codigos(pd.DataFrame({"Empresa": ["1 - X"]}))

@@ -180,6 +180,28 @@ def _compra_de_referencia(c: pd.DataFrame, fator: float) -> pd.DataFrame:
     return escolhida
 
 
+def produtos_da_loja(est: pd.DataFrame, compras: pd.DataFrame, vendas: pd.DataFrame,
+                     genericos: pd.DataFrame) -> pd.DataFrame:
+    """Todo produto (código da loja) que aparece no estoque, nas compras ou nas vendas, com a LINHA do pedido: o
+    genérico da Base Genéricos ("G<id>", vários EANs viram um) ou o próprio código ("P<código>"). Os EANs já vêm
+    na chave (`cat.chaves_ean`). Separado do `calcular` em 27/10/2026: a página Compras do Dashboard agrupa as
+    compras pela mesma linha, inclusive de produto comprado que nunca vendeu (que o `calcular` não lista)."""
+    if "vlr_preco_venda" not in est.columns:  # pronto montado antes da coluna existir
+        est = est.assign(vlr_preco_venda=np.nan)
+    colunas_compra = ["codigo_produto", "ean", "laboratorio"] + (["nome"] if "nome" in compras.columns else [])
+    produtos = pd.concat([
+        est[["codigo_produto", "ean", "nome", "laboratorio", "qtd_estoque", "vlr_preco_compra", "vlr_preco_venda"]],
+        compras[colunas_compra].drop_duplicates("codigo_produto"),
+        vendas[["codigo_produto"]].drop_duplicates(),
+    ], ignore_index=True).drop_duplicates("codigo_produto", keep="first").reset_index(drop=True)
+    gen = genericos.drop_duplicates("ean").set_index("ean")
+    id_gen = produtos["ean"].map(gen["base_generico_id"])
+    produtos["linha"] = np.where(id_gen.notna(), "G" + id_gen.astype("Int64").astype(str), "P" + produtos["codigo_produto"].astype(str))
+    produtos["nome_linha"] = produtos["ean"].map(gen["nome_canonico"]).fillna(produtos["nome"])
+    produtos["nome_linha"] = produtos["nome_linha"].fillna("Produto " + produtos["codigo_produto"].astype(str))
+    return produtos
+
+
 def calcular(pronto: Pronto, base_categorias: pd.DataFrame, genericos: pd.DataFrame,
              p: Parametros = Parametros(), correcoes: dict[str, float] | None = None) -> pd.DataFrame:
     """Todas as linhas que VENDERAM na janela (listadas ou não — o filtro
@@ -200,18 +222,7 @@ def calcular(pronto: Pronto, base_categorias: pd.DataFrame, genericos: pd.DataFr
     vendas = pronto.vendas
 
     # -- produto (código da loja) → linha do pedido --------------------------
-    if "vlr_preco_venda" not in est.columns:  # pronto montado antes da coluna existir
-        est["vlr_preco_venda"] = np.nan
-    produtos = pd.concat([
-        est[["codigo_produto", "ean", "nome", "laboratorio", "qtd_estoque", "vlr_preco_compra", "vlr_preco_venda"]],
-        compras[["codigo_produto", "ean", "laboratorio"]].drop_duplicates("codigo_produto"),
-        vendas[["codigo_produto"]].drop_duplicates(),
-    ], ignore_index=True).drop_duplicates("codigo_produto", keep="first").reset_index(drop=True)
-    gen = genericos.drop_duplicates("ean").set_index("ean")
-    id_gen = produtos["ean"].map(gen["base_generico_id"])
-    produtos["linha"] = np.where(id_gen.notna(), "G" + id_gen.astype("Int64").astype(str), "P" + produtos["codigo_produto"].astype(str))
-    produtos["nome_linha"] = produtos["ean"].map(gen["nome_canonico"]).fillna(produtos["nome"])
-    produtos["nome_linha"] = produtos["nome_linha"].fillna("Produto " + produtos["codigo_produto"].astype(str))
+    produtos = produtos_da_loja(est, compras, vendas, genericos)
     linha_do_produto = produtos.set_index("codigo_produto")["linha"]
 
     # -- vendas por linha ------------------------------------------------------
@@ -249,6 +260,11 @@ def calcular(pronto: Pronto, base_categorias: pd.DataFrame, genericos: pd.DataFr
     com_ean = membros.dropna(subset=["ean"]).drop_duplicates(["linha", "ean"]).sort_values(["linha", "ean"])
     por_linha["eans"] = com_ean.groupby("linha")["ean"].agg(list).reindex(por_linha.index)
     por_linha["eans"] = [e if isinstance(e, list) else [] for e in por_linha["eans"]]
+    # Os códigos de produto da linha (27/10/2026): o histórico do estoque é por código, e a Ruptura do Dashboard
+    # mede a falta da LINHA (um genérico só falta quando todos os seus produtos faltam).
+    cods = membros.drop_duplicates(["linha", "codigo_produto"]).sort_values(["linha", "codigo_produto"])
+    por_linha["codigos"] = cods.groupby("linha")["codigo_produto"].agg(list).reindex(por_linha.index)
+    por_linha["codigos"] = [[str(c) for c in x] if isinstance(x, list) else [] for x in por_linha["codigos"]]
     # Negativo por EAN conta como 0 (não trava); o GPS "cru" fica pra mostrar.
     por_linha["estoque_gps"] = grp["_estoque"].sum()
     por_linha["estoque"] = membros["_estoque"].clip(lower=0).groupby(membros["linha"]).sum().reindex(por_linha.index)
@@ -418,7 +434,7 @@ def _tags(marcas: list) -> list[list[str]]:
 
 
 COLUNAS = [
-    "linha", "nome", "generico", "ean_principal", "eans", "categoria", "grupo", "laboratorio", "laboratorio_cadastro",
+    "linha", "nome", "generico", "ean_principal", "eans", "codigos", "categoria", "grupo", "laboratorio", "laboratorio_cadastro",
     "unidades", "valor", "unidades_90d", "valor_90d", "venda_90d", "demanda_dia", "estoque", "estoque_gps", "estoque_corrigido", "negativo",
     "eans_negativos", "estoque_min", "estoque_max",
     "sugestao", "listar", "ruptura", "ruptura_proxima", "giro_baixo", "venda_pontual", "curva", "curva_valor", "curva_unidades",

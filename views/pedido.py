@@ -43,15 +43,16 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
 
-from core import analise, auth, theme, ui
+from core import acesso, analise, auth, dicas, theme, ui
 from core.config import settings
 from core.db import get_session
 from pedido import calculo
 from pedido import categorias as cat
 from pedido import configuracao as cfg
+from pedido import linhas as linhas_compra
 from pedido.configuracao import ConfigPedido
 from views import analise_comum as comum
-from views import loja_barra
+from views import loja_barra, popups
 from views import tabela as tb
 
 _KEY = "pedido"
@@ -172,6 +173,50 @@ def _versoes() -> tuple:
         return categorias_integ.versao(session), pedido_tela.versao_genericos(session)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _versao_catalogo() -> tuple:
+    """Versão das fontes da classificação de produtos (catálogo IQVIA, FEBRAFAR/CMED por EAN e as categorias
+    manuais), conferida no máximo a cada 5 min: uma consulta a mais a cada clique (~140 ms até NY) seria cara.
+    O nome ficou o de antes (07/10/2026), quando só o catálogo IQVIA dava a linha de compra."""
+    from integrations import catalogo, classificacao
+    from integrations import categorias as categorias_integ
+
+    with get_session() as session:
+        return catalogo.versao(session), classificacao.versao(session), categorias_integ.versao(session)
+
+
+@st.cache_data(max_entries=2, show_spinner=False)
+def _classificacao(versao: tuple, por_setor: tuple, por_cmed: tuple) -> pd.DataFrame:
+    """EAN → (categoria, origem) de todos os EANs classificados (cascata de classificação, 25/10/2026: manual,
+    IQVIA, CMED — pedido/classificacao.py). Lido e classificado uma vez por versão das fontes e por mapa de
+    correspondência, e compartilhado por todas as sessões: ~6 s para ler as três fontes do banco em NY, 0,5 s
+    para classificar (medido em 26/10/2026, 273 mil EANs). Guarda só os classificados, como categorias do pandas."""
+    from integrations import classificacao as dados
+    from pedido import classificacao as cl
+
+    with get_session() as session:
+        universo = dados.universo(session)
+    return cl.tabela_por_ean(cl.classificar(universo, dict(por_setor), dict(por_cmed)), dict(por_cmed))
+
+
+def _categorias_da_loja(todas: pd.DataFrame, config: ConfigPedido) -> dict:
+    """EAN → (categoria, origem) só dos EANs desta loja (a busca por produto é por EAN). As correspondências são
+    as do PADRÃO: a classificação é do produto, igual em todas as lojas (`linhas_*` não se personalizam)."""
+    from pedido import classificacao as cl
+
+    if todas.empty:
+        return {}
+    tabela = _classificacao(_versao_catalogo(), tuple(sorted(config.linhas_por_setor.items())),
+                            tuple(sorted(config.linhas_por_cmed.items())))
+    return cl.mapa_da_loja(tabela, cl.eans_da_tabela(todas))
+
+
+def categorias_da_loja(todas: pd.DataFrame, config: ConfigPedido) -> dict:
+    """EAN → (categoria, origem) só dos produtos desta loja: o Dashboard usa para dar a linha de compra (a
+    categoria fixa) de cada produto."""
+    return _categorias_da_loja(todas, config)
+
+
 @st.cache_data(max_entries=2, show_spinner=False)
 def _base_categorias(versao: tuple) -> pd.DataFrame:
     from integrations import categorias as categorias_integ
@@ -208,9 +253,22 @@ def _calcular(empresa: str, loja: str, meses: int, versoes: tuple, params: calcu
     return linhas, p.meta
 
 
+def calculo_da_loja(loja: dict, config: ConfigPedido, correcoes: dict) -> tuple[pd.DataFrame, dict] | None:
+    """O MESMO cálculo e o MESMO cache da tela do Assistente, para outras
+    telas (Dashboard, 21/10/2026): quem abre o Dashboard e depois o Assistente
+    da mesma loja não calcula duas vezes. `correcoes`: o que
+    `pedido_rascunho.correcoes` devolve (linha → Correcao). None = a rotina
+    ainda não coletou nenhuma foto de estoque desta empresa."""
+    marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
+    return _calcular(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados, _versoes(), parametros(config),
+                     tuple(sorted((l, c.estoque) for l, c in correcoes.items())),
+                     foto=f"{marcador.get('data')}|{marcador.get('gerado_em')}")
+
+
 def invalidar() -> None:
     """Chamar depois de mudar categorias ou genéricos (aba Dados)."""
     _versoes.clear()
+    _versao_catalogo.clear()   # categoria manual muda a classificação de produtos (cascata, 25/10/2026)
     _calcular.clear()
     configuracao.clear()
     _invalidar_estado()   # personalização salva em Configurações: vale já, nesta sessão
@@ -305,16 +363,17 @@ def _dica_status(tag: str, r: dict, p: calculo.Parametros) -> str | None:
         return (f"O sistema de vendas mostra estoque negativo em: {r['eans_negativos']}.\n\n"
                 "No cálculo, o negativo conta como zero.")
     if tag == calculo.RUPTURA:
-        return "Estoque zerado." if p.ruptura_unidades == 0 else f"Estoque de até {_numero(p.ruptura_unidades)} unidade(s)."
+        return "Estoque zerado." if p.ruptura_unidades == 0 else f"Estoque de até {dicas.qtd(p.ruptura_unidades, 'unidade')}."
     if tag == calculo.RUPTURA_PROXIMA:
-        return f"O estoque cobre {p.dias_ruptura} dia(s) de venda ou menos."
+        return f"O estoque cobre {dicas.qtd(p.dias_ruptura, 'dia')} de venda ou menos."
     if tag == calculo.CORRIGIDO:
         return ("O sistema de vendas mostra estoque negativo.\n\nVale o estoque digitado aqui até o sistema de "
                 "vendas deixar de mostrar negativo.")
     if tag == calculo.SEM_CLASSIFICACAO:
         return f"Produto sem categoria: sugestão com {p.dias_sem_classificacao} dias estimados."
     if tag == calculo.GIRO_BAIXO:
-        return f"Vendeu no máximo {_numero(p.giro_baixo_max_unidades)} unidade(s) nos últimos {p.giro_baixo_dias} dias."
+        return (f"Vendeu no máximo {dicas.qtd(p.giro_baixo_max_unidades, 'unidade')} nos últimos "
+                f"{dicas.qtd(p.giro_baixo_dias, 'dia')}.")
     if tag == calculo.VENDA_PONTUAL:
         unidades = f"{_numero(r['unidades_90d'])} unidade" + ("" if r["unidades_90d"] == 1 else "s")
         entre = ("os produtos que mais faturam na loja" if r["curva_valor"] == "A"
@@ -518,9 +577,12 @@ def _texto_sem_classificacao(n: int, dias: int) -> str:
             "normal.")
 
 
-@st.dialog("Produtos sem classificação")
+@popups.popup("Produtos sem classificação", "aviso")
 def _dialog_saiba_mais(n: int, dias: int) -> None:
     st.markdown(_texto_sem_classificacao(n, dias))
+    _, entendi = popups.botoes("Entendi", None, chave=f"{_KEY}_saiba_mais_rodape")
+    if entendi:
+        st.rerun()
 
 
 def _responder_aviso(usuario_id: int, loja_id: int, tipo: str, foto: str, resposta: str) -> None:
@@ -531,7 +593,7 @@ def _responder_aviso(usuario_id: int, loja_id: int, tipo: str, foto: str, respos
     _invalidar_estado()
 
 
-@st.dialog("Estoque negativo", dismissible=False)
+@popups.popup("Estoque negativo", "aviso", dismissible=False)
 def _alerta_negativos(usuario_id: int, loja_id: int, foto: str, n: int) -> None:
     """1º pop-up ao abrir a loja. Sem X: a resposta é o que libera a lista."""
     from integrations import pedido_area
@@ -541,30 +603,32 @@ def _alerta_negativos(usuario_id: int, loja_id: int, foto: str, n: int) -> None:
     st.caption("Com estoque zero, a sugestão cobre o ideal inteiro do produto. Corrigindo, a linha é recalculada "
                "com o estoque que você digitar; os que ficarem sem correção contam como zero. A pergunta volta "
                "quando chegar uma foto nova do estoque.")
-    c1, c2 = st.columns(2)
-    if c1.button("Corrigir manualmente", use_container_width=True):
+    corrigir, zero = popups.botoes("Considerar todos zero", "Corrigir manualmente", chave=f"{_KEY}_alerta_neg")
+    if corrigir:
         _responder_aviso(usuario_id, loja_id, pedido_area.AVISO_NEGATIVO, foto, "corrigir")
         st.session_state[_ABRIR_NEGATIVOS] = True   # um pop-up não abre outro: abre no rerun
         st.rerun()
-    if c2.button("Considerar todos zero", type="primary", use_container_width=True):
+    if zero:
         _responder_aviso(usuario_id, loja_id, pedido_area.AVISO_NEGATIVO, foto, "zero")
         st.rerun()
 
 
-@st.dialog("Produtos sem classificação", dismissible=False)
+@popups.popup("Produtos sem classificação", "aviso", dismissible=False)
 def _alerta_sem_classificacao(usuario_id: int, loja_id: int, foto: str, n: int, dias: int) -> None:
     """2º pop-up ao abrir a loja: só informa (classificar é da administração)."""
     from integrations import pedido_area
 
     st.markdown(_texto_sem_classificacao(n, dias))
-    if st.button("Entendi", type="primary", use_container_width=True):
+    _, entendi = popups.botoes("Entendi", None, chave=f"{_KEY}_alerta_sem")
+    if entendi:
         _responder_aviso(usuario_id, loja_id, pedido_area.AVISO_SEM_CLASSIFICACAO, foto, "entendi")
         st.rerun()
 
 
 def _resumo_config(c: ConfigPedido) -> str:
-    proprias = f" · {len(c.dias_por_categoria)} categoria(s) com dias próprios" if c.dias_por_categoria else ""
-    return (f"medicamento {c.dias_medicamento} dias · perfumaria {c.dias_perfumaria} · "
+    proprias = (f", {dicas.qtd(len(c.dias_por_categoria), 'categoria')} com dias próprios"
+                if c.dias_por_categoria else "")
+    return (f"medicamento {c.dias_medicamento} dias, perfumaria {c.dias_perfumaria}, "
             f"ruptura próxima {c.dias_ruptura} dias{proprias}")
 
 
@@ -578,7 +642,8 @@ def _escolher_parametros(loja_id: int, personalizado: ConfigPedido, padrao: Conf
         return st.pills(
             "Parâmetros", list(rotulos), format_func=rotulos.get, key=f"{_KEY}_param_{loja_id}",
             label_visibility="collapsed",
-            help=f"Personalizado desta loja: {_resumo_config(personalizado)}.  \nPadrão: {_resumo_config(padrao)}.",
+            help=dicas.dica(f"Personalizado desta loja: {_resumo_config(personalizado)}",
+                        f"Padrão: {_resumo_config(padrao)}"),
         )
 
 
@@ -635,7 +700,7 @@ def _linha_filtros(loja_id: int, todas: pd.DataFrame) -> tuple[str | None, tuple
     return (busca or None), tuple(escolhidas), tuple(fabs), tuple(tags)
 
 
-@st.dialog("Estoque negativo", width="large")
+@popups.popup("Estoque negativo", "longo")
 def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: dict) -> None:
     from integrations import pedido_rascunho
 
@@ -657,10 +722,11 @@ def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: 
         column_config={"Estoque correto": st.column_config.TextColumn(max_chars=8)},
         height=min(35 * len(tabela) + 40, 420),
     )
-    c1, c2 = st.columns(2)
-    if c1.button("Fechar", use_container_width=True):
+    aviso = st.empty()   # erros acima do rodapé (que fica preso embaixo)
+    cancelar, salvar = popups.botoes("Salvar correções", chave=f"{_KEY}_negativos_rodape")
+    if cancelar:
         st.rerun()
-    if c2.button("Salvar", type="primary", use_container_width=True):
+    if salvar:
         valores, erros = {}, []
         for r in editada.to_dict("records"):
             texto = str(r["Estoque correto"] or "").strip().replace(".", "").replace(",", ".")
@@ -677,8 +743,7 @@ def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: 
                 continue
             valores[r["linha"]] = valor
         if erros:
-            for e in erros:
-                st.error(e)
+            aviso.error("\n".join(f"- {e}" for e in erros))
             return
         gps = dict(zip(negativos["linha"], negativos["estoque_gps"].astype(float)))
         with get_session() as session:
@@ -689,7 +754,7 @@ def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: 
         st.rerun()
 
 
-@st.dialog("Listas", width="medium")   # "large" ficava largo demais (02/10/2026)
+@popups.popup("Listas", "curto")
 def _dialog_listas(loja: dict, usuario: dict, pedido: pd.DataFrame, listas: list, aberta_id: int | None,
                    tem_alteracoes: bool) -> None:
     """Botão "Listas" do rodapé (02/10/2026): duas abas — salvar o pedido
@@ -752,16 +817,16 @@ def _dialog_listas(loja: dict, usuario: dict, pedido: pd.DataFrame, listas: list
                     st.rerun()
 
 
-@st.dialog("Descartar alterações")
+@popups.popup("Descartar alterações", "aviso")
 def _dialog_descartar(loja: dict, usuario: dict, alterados: int) -> None:
     from integrations import pedido_area
 
     st.write(f"As {alterados} alteração(ões) da sua área de trabalho nesta loja (quantidades digitadas e marcações) "
              "voltam para a sugestão do sistema. As listas salvas não mudam.")
-    c1, c2 = st.columns(2)
-    if c1.button("Cancelar", use_container_width=True):
+    cancelar, descartar = popups.botoes("Descartar alterações", chave=f"{_KEY}_descartar_rodape", destrutivo=True)
+    if cancelar:
         st.rerun()
-    if c2.button("Descartar", type="primary", use_container_width=True):
+    if descartar:
         with get_session() as session:
             pedido_area.descartar(session, usuario["id"], loja["id"])
         _concluir("success", "Alterações descartadas: o pedido voltou à sugestão.")
@@ -803,7 +868,7 @@ _TIPOS_EXPORTACAO = {
 _XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-@st.dialog("Exportar")
+@popups.popup("Exportar", "curto")
 def _dialog_exportar(loja: dict, pedido: pd.DataFrame, todas: pd.DataFrame, usuario: dict) -> None:
     """Três exportações (01/10/2026). Só o formato Gruppy é "o pedido": ele
     fica registrado (aviso contra pedido duplicado) e encerra a lista aberta.
@@ -872,9 +937,22 @@ def render() -> None:
         _render()
 
 
-def _titulo() -> None:
-    """Só o título: a data dos dados foi pro pé da barra lateral (02/10/2026)."""
-    st.markdown('<div class="rmc-pedido-titulo">Assistente de pedido</div>', unsafe_allow_html=True)
+def _titulo(linhas_comprador=None) -> None:
+    """Só o título: a data dos dados foi pro pé da barra lateral (02/10/2026).
+    Comprador: as linhas dele na MESMA linha do título, discretas (07/10/2026)
+    — numa linha embaixo, empurravam a tela 34 px e o Assistente dele saía
+    com outro respiro que o de todo mundo."""
+    titulo = '<div class="rmc-pedido-titulo">Assistente de pedido</div>'
+    if linhas_comprador:
+        from integrations import usuarios
+
+        nomes = ", ".join(usuarios.LINHAS_COMPRA[c] for c in usuarios.LINHAS_COMPRA if c in linhas_comprador)
+        dica = dicas.dica("Você vê só os produtos das suas linhas.",
+                          "Produto sem linha definida aparece para todos os compradores.")
+        titulo = (f'<div class="rmc-pedido-cab">{titulo}<span class="rmc-pedido-linhas dica-abaixo" '
+                  f'data-dica="{dicas.atributo(dica)}">'
+                  f'Linhas de compra: {html.escape(nomes)}</span></div>')
+    st.markdown(titulo, unsafe_allow_html=True)
 
 
 def _render() -> None:
@@ -922,6 +1000,17 @@ def _render() -> None:
         return
     todas, meta = resultado
     todas = calculo.aplicar_area(todas, area.itens)
+    # Comprador: só as linhas de compra dele (etapa 4, 07/10/2026). Cortado
+    # AQUI, antes de tudo: o resto não entra na lista, nos cards, no
+    # orçamento, nos pop-ups nem na exportação (Q9 B). Proprietário: tudo.
+    # A linha de cada produto é a categoria fixa da cascata de classificação
+    # (25/10/2026, pedido/classificacao.py): manual, IQVIA, CMED, senão "Em
+    # classificação" — que aparece para todos os compradores. Com o mapa do
+    # PADRÃO: a classificação é do produto, não se personaliza por loja.
+    linhas_comprador = usuario.get("linhas") if usuario["nivel"] == acesso.COMPRADOR else None
+    if linhas_comprador:
+        from pedido import classificacao as classif
+        todas = classif.filtrar(todas, linhas_comprador, _categorias_da_loja(todas, padrao))
     ocultar = st.session_state.get(f"{_KEY}_giro", True)
     pedido = calculo.lista(todas, ocultar_giro_baixo=ocultar)
     # Só os do PEDIDO: a loja inteira tinha 60 produtos com EAN negativo na
@@ -931,7 +1020,7 @@ def _render() -> None:
     n_sem = int((pedido["grupo"] == cat.SEM_CLASSIFICACAO).sum()) if not pedido.empty else 0
 
     with st.container(key="pedido-topo"):
-        _titulo()
+        _titulo(linhas_comprador)
     # Um pop-up por vez (Streamlit): o que estiver pendente abre, na ordem
     # combinada — negativos, sem classificação. Sem botão "Estoque negativo"
     # (02/10/2026): corrigir é pelo pop-up, uma vez por foto do GPS.

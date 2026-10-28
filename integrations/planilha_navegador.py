@@ -8,17 +8,14 @@ primeira aba em CSV, compacta (gzip) e manda só isso. Aqui o CSV vira um
 DataFrame equivalente ao que `pd.read_excel` produzia, com uma fração do
 custo.
 
-Também lê o RODAPÉ que o Power BI acrescenta à exportação — de onde saem o
-mês filtrado ("2026/Ago. (AnoMesFiltro)") e o aviso de exportação cortada no
-limite de linhas ("Exported data exceeded the allowed volume").
+(A leitura do rodapé do Power BI saiu em 05/10/2026 junto com o envio da
+planilha do GPS — as compras vêm da API.)
 """
 from __future__ import annotations
 
 import base64
 import gzip
 import io
-import re
-import unicodedata
 from dataclasses import dataclass
 
 import pandas as pd
@@ -51,37 +48,6 @@ def decodificar_payload(payload: dict) -> PlanilhaRecebida:
     )
 
 
-@dataclass
-class InfoRodape:
-    ano_mes: str | None  # "2026-08", quando o rodapé traz o filtro AnoMesFiltro
-    exportacao_cortada: bool
 
 
-_MESES_ABREVIADOS = {
-    "jan": 1, "fev": 2, "mar": 3, "abr": 4, "mai": 5, "jun": 6,
-    "jul": 7, "ago": 8, "set": 9, "out": 10, "nov": 11, "dez": 12,
-    # Power BI em inglês
-    "feb": 2, "apr": 4, "may": 5, "aug": 8, "sep": 9, "oct": 10, "dec": 12,
-}
 
-_PADRAO_ANO_MES = re.compile(r"(\d{4})\s*/\s*([a-z]{3})[a-z]*\.?\s*\(\s*anomesfiltro\s*\)", re.IGNORECASE)
-_MARCAS_CORTE = ("exceeded the allowed volume", "excederam o volume permitido", "excedeu o volume permitido")
-
-
-def _sem_acento(texto: str) -> str:
-    return unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
-
-
-def ler_rodape(df: pd.DataFrame, linhas: int = 20) -> InfoRodape:
-    """Procura, só no texto das últimas `linhas` linhas, o filtro de mês e o
-    aviso de corte. Nenhum dos dois achados é obrigatório: arquivo sem rodapé
-    devolve `InfoRodape(None, False)`."""
-    textos = [v for v in df.tail(linhas).to_numpy().ravel() if isinstance(v, str)]
-    texto = _sem_acento(" ".join(textos)).lower()
-
-    ano_mes = None
-    achado = _PADRAO_ANO_MES.search(texto)
-    if achado and achado.group(2).lower() in _MESES_ABREVIADOS:
-        ano_mes = f"{int(achado.group(1)):04d}-{_MESES_ABREVIADOS[achado.group(2).lower()]:02d}"
-
-    return InfoRodape(ano_mes=ano_mes, exportacao_cortada=any(m in texto for m in _MARCAS_CORTE))

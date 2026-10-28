@@ -49,6 +49,7 @@ from core.models import (
 )
 from integrations import mapeamento as mapeamento_integ
 from integrations.base import IntegrationAdapter, ResultadoSincronizacao, StatusIntegracao
+from pedido import categorias as categorias_pedido
 from reconciliation import motor as reconciliation_motor
 from reconciliation.normalizador import normalizar_ean, normalizar_percentual
 from storage import filesystem
@@ -149,6 +150,19 @@ def _inativar_cobertura_sobreposta(session: Session, laboratorio: str, ufs_novas
         cobertura.inativada_por = inativada_por
 
 
+def _eans_genericos(session: Session, eans: pd.Series) -> set[str]:
+    """Chaves (pedido/categorias.chave_ean) dos EANs da planilha que a base
+    de categorias diz serem genéricos."""
+    from core.models import CategoriaEan
+
+    chaves = sorted({c for c in categorias_pedido.chaves_ean(eans.astype("string")).dropna()})
+    saida: set[str] = set()
+    for i in range(0, len(chaves), 1000):
+        saida.update(session.scalars(select(CategoriaEan.ean).where(
+            CategoriaEan.ean.in_(chaves[i:i + 1000]), CategoriaEan.categoria == categorias_pedido.GENERICO)))
+    return saida
+
+
 def laboratorios_existentes(session: Session) -> list[str]:
     linhas = session.execute(select(TabelaGruppy.laboratorio).distinct().order_by(TabelaGruppy.laboratorio)).all()
     return [linha[0] for linha in linhas]
@@ -231,6 +245,7 @@ def processar_planilha_gruppy(
     # (Series inteira reconstruída por linha).
     df_norm = pd.DataFrame({campo: df[coluna] for campo, coluna in mapa.items()})
     novos_itens: list[ItemTabelaGruppy] = []
+    genericos = _eans_genericos(session, df_norm["ean"])
 
     with session.no_autoflush:  # ver justificativa detalhada em integrations/gps.py::_processar_linhas
         for linha in df_norm.itertuples(index=False):
@@ -291,6 +306,13 @@ def processar_planilha_gruppy(
                 )
             )
 
+            processados += 1
+            # Só GENÉRICO (pela base de categorias) passa pela reconciliação
+            # (05/10/2026): a Análise compara todo produto da Gruppy, e o que
+            # não é genérico compara pelo próprio EAN — sem isso, uma tabela
+            # de éticos ou fraldas jogava milhares de EANs na fila.
+            if categorias_pedido.chave_ean(ean) not in genericos:
+                continue
             # Reconciliação de EAN é side-effect aqui: registra resolvido ou
             # enfileira. `valor` fica 0 de propósito — a Gruppy é catálogo de
             # preço unitário, não valor transacionado; a fila prioriza por
@@ -301,7 +323,6 @@ def processar_planilha_gruppy(
                 cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
                 cache_fila_pendente=cache_fila_pendente, cache_descricao_pendente=cache_descricao_pendente,
             )
-            processados += 1
 
     if novos_itens:
         session.add_all(novos_itens)

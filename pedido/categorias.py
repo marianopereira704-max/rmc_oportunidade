@@ -154,15 +154,23 @@ def ler_febrafar(caminho: str | Path) -> pd.DataFrame:
 
 
 def ler_cmed(caminho: str | Path) -> pd.DataFrame:
-    """Lista de preços da CMED (xlsx do gov.br) → ean, tipo, descricao. O
-    arquivo tem ~40 linhas de apresentação antes do cabeçalho; procura a
-    linha que tem "EAN 1". Cada apresentação tem até 3 EANs."""
-    topo = pd.read_excel(caminho, header=None, nrows=80, dtype=str)
-    linha = next((i for i in range(len(topo))
-                  if any(_chave_texto(v) == "EAN1" for v in topo.iloc[i].tolist())), None)
-    if linha is None:
-        raise ValueError("CMED: cabeçalho com a coluna 'EAN 1' não encontrado nas 80 primeiras linhas")
-    bruto = pd.read_excel(caminho, header=linha, dtype=str)
+    """Lista de preços da CMED (xlsx do gov.br) → ean, tipo, descricao. Procura o cabeçalho (a linha que tem
+    "EAN 1") em TODAS as abas: o arquivo de 09/10/2026 tem duas — "Cabeçalho" (só apresentação e legenda) e
+    "Lista PMC" (a tabela, com o cabeçalho na 1ª linha) —, enquanto o de antes tinha uma aba só, com ~40 linhas de
+    apresentação antes do cabeçalho. Cada apresentação tem até 3 EANs."""
+    arquivo = pd.ExcelFile(caminho)
+    aba, linha = None, None
+    for nome in arquivo.sheet_names:
+        topo = pd.read_excel(arquivo, sheet_name=nome, header=None, nrows=80, dtype=str)
+        linha = next((i for i in range(len(topo))
+                      if any(_chave_texto(v) == "EAN1" for v in topo.iloc[i].tolist())), None)
+        if linha is not None:
+            aba = nome
+            break
+    if aba is None:
+        raise ValueError("CMED: cabeçalho com a coluna 'EAN 1' não encontrado nas 80 primeiras linhas de nenhuma aba "
+                         f"(abas: {arquivo.sheet_names})")
+    bruto = pd.read_excel(arquivo, sheet_name=aba, header=linha, dtype=str)
     colunas = {_chave_texto(c): c for c in bruto.columns}
     tipo = next((c for k, c in colunas.items() if k.startswith("TIPODEPRODUTO")), None)
     if tipo is None:
@@ -211,6 +219,31 @@ def montar_base_inicial(febrafar: pd.DataFrame, cmed: pd.DataFrame) -> pd.DataFr
     })
     base["descricao"] = base["descricao"].astype("string").str.slice(0, 200)
     return base.sort_values("ean").reset_index(drop=True)
+
+
+def montar_classificacao(febrafar: pd.DataFrame, cmed: pd.DataFrame) -> pd.DataFrame:
+    """O que cada fonte diz de cada EAN, SEM decidir nada (25/10/2026, cascata de classificação): `ean`,
+    `febrafar` (categoria oficial) e `cmed_tipo` (o tipo como a CMED escreve: Genérico, Similar, Novo…). A
+    `montar_base_inicial` guarda uma categoria só por EAN (a vencedora); aqui ficam as duas, porque a cascata mostra
+    a FEBRAFAR e a CMED mesmo quando não foram elas a decidir. EAN repetido: na FEBRAFAR vale a categoria de
+    verdade antes do "EM CLASSIFICAÇÃO"; na CMED, o Genérico antes dos outros tipos (mesma regra da base)."""
+    f = febrafar.assign(_pendente=febrafar["categoria"] == EM_CLASSIFICACAO)
+    f = f.sort_values("_pendente", kind="stable").drop_duplicates("ean")[["ean", "categoria"]]
+    f = f.rename(columns={"categoria": "febrafar"})
+    c = cmed.assign(_generico=cmed["tipo"].map(_chave_texto) == "GENERICO")
+    c = c.sort_values("_generico", ascending=False, kind="stable").drop_duplicates("ean")[["ean", "tipo"]]
+    c = c.assign(tipo=c["tipo"].astype("string").str.strip()).rename(columns={"tipo": "cmed_tipo"})
+    return f.merge(c, on="ean", how="outer").sort_values("ean").reset_index(drop=True)
+
+
+def resumo_classificacao(dados: pd.DataFrame) -> dict:
+    """Contagens da prévia: quantos EANs, e quantos por tipo da CMED (é o que o Mariano confere antes de gravar)."""
+    return {
+        "eans": int(len(dados)),
+        "com_febrafar": int(dados["febrafar"].notna().sum()),
+        "com_cmed": int(dados["cmed_tipo"].notna().sum()),
+        "por_tipo_cmed": {k: int(v) for k, v in dados["cmed_tipo"].value_counts().items()},
+    }
 
 
 def resumo(base: pd.DataFrame) -> dict:

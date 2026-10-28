@@ -10,7 +10,7 @@ import pandas as pd
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from core.models import BaseGenerico, EanGenerico, Loja, SituacaoVinculoGps, VinculoLojaGps
+from core.models import BaseGenerico, EanGenerico, Loja, SituacaoVinculoGps, VinculoLojaGps, loja_da_rede
 from pedido import categorias as cat
 
 _VALIDOS = (SituacaoVinculoGps.AUTOMATICO, SituacaoVinculoGps.CONFIRMADO)
@@ -21,12 +21,13 @@ def lojas(session: Session) -> list[dict]:
     vínculo válido. Loja sem vínculo continua na lista — a tela diz por que
     ela não tem pedido, em vez de sumir com ela."""
     vinculos = {
-        v.loja_id: (v.id_empresa_gps, v.codigo_loja_gps)
+        v.loja_id: (v.id_empresa_gps, v.codigo_loja_gps.strip())   # sem espaços: ver gps_vinculo.recalcular
         for v in session.scalars(select(VinculoLojaGps).where(
             VinculoLojaGps.situacao.in_(_VALIDOS), VinculoLojaGps.loja_id.is_not(None)))
     }
     saida = []
-    for l in session.scalars(select(Loja).order_by(Loja.razao_social)):
+    # Só as lojas da rede (status "Ativo" — 07/10/2026).
+    for l in session.scalars(select(Loja).where(loja_da_rede()).order_by(Loja.razao_social)):
         gps = vinculos.get(l.id)
         saida.append({
             "id": l.id, "razao_social": l.razao_social, "nome_fantasia": l.nome_fantasia, "cnpj": l.cnpj,

@@ -35,6 +35,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--cmed", required=True, help="lista de preços da CMED (.xlsx do gov.br)")
     p.add_argument("--destino", default="spaces", help="'spaces' ou 'local:<pasta>'")
     p.add_argument("--executar", action="store_true", help="grava o arquivo (sem isso, só a prévia)")
+    p.add_argument("--so-classificacao", action="store_true",
+                   help="grava só o arquivo da classificação por EAN (cascata) e NÃO refaz a base inicial: a base "
+                        "decide os dias de estoque, e atualizar a CMED nela é outra decisão")
     a = p.parse_args(argv)
 
     comeco = time.monotonic()
@@ -42,22 +45,37 @@ def main(argv: list[str] | None = None) -> int:
     cmed = categorias.ler_cmed(a.cmed)
     base = categorias.montar_base_inicial(febrafar, cmed)
     resumo = categorias.resumo(base)
+    classificacao = categorias.montar_classificacao(febrafar, cmed)
+    resumo_class = categorias.resumo_classificacao(classificacao)
     print(f"lidos: FEBRAFAR {len(febrafar)} EANs, CMED {len(cmed)} EANs ({time.monotonic() - comeco:.0f}s)")
     print(json.dumps(resumo, ensure_ascii=False, indent=1))
+    # Os tipos da CMED que o arquivo realmente traz (design de 25/10/2026: só Genérico e Similar classificam; os
+    # demais vão para "Em classificação"). Conferir esta lista antes de gravar.
+    print("Classificação por EAN (cascata):")
+    print(json.dumps(resumo_class, ensure_ascii=False, indent=1))
 
     chaves = Chaves(settings.pedido.prefixo)
     if not a.executar:
-        print(f"PRÉVIA — nada gravado. Com --executar grava {chaves.base_categorias()} em {a.destino}.")
+        alvo = chaves.classificacao_ean() if a.so_classificacao else f"{chaves.base_categorias()} e {chaves.classificacao_ean()}"
+        print(f"PRÉVIA — nada gravado. Com --executar grava {alvo} em {a.destino}.")
         return 0
 
     armaz = ArmazenamentoLocal(a.destino.split(":", 1)[1]) if a.destino.startswith("local:") else do_ambiente()
-    armaz.salvar_df(chaves.base_categorias(), base)
-    armaz.salvar_json(chaves.base_categorias_info(), {
-        **resumo,
+    if not a.so_classificacao:
+        armaz.salvar_df(chaves.base_categorias(), base)
+        armaz.salvar_json(chaves.base_categorias_info(), {
+            **resumo,
+            "gerado_em": dt.datetime.now().isoformat(timespec="seconds"),
+            "fontes": {"febrafar": Path(a.febrafar).name, "cmed": Path(a.cmed).name},
+        })
+    armaz.salvar_df(chaves.classificacao_ean(), classificacao)
+    armaz.salvar_json(chaves.classificacao_ean_info(), {
+        **resumo_class,
         "gerado_em": dt.datetime.now().isoformat(timespec="seconds"),
         "fontes": {"febrafar": Path(a.febrafar).name, "cmed": Path(a.cmed).name},
     })
-    print(f"gravado: {chaves.base_categorias()} ({a.destino})")
+    gravados = chaves.classificacao_ean() if a.so_classificacao else f"{chaves.base_categorias()} e {chaves.classificacao_ean()}"
+    print(f"gravado: {gravados} ({a.destino})")
     return 0
 
 

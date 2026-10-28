@@ -21,7 +21,6 @@ import datetime as dt
 import pytest
 
 from integrations import gps_api
-from integrations.base import StatusIntegracao
 
 
 class _RespostaFalsa:
@@ -65,18 +64,6 @@ def _cliente(manipulador, **kwargs) -> gps_api.ClienteGpsApi:
 # ---------------------------------------------------------------------------
 # Janela de datas
 # ---------------------------------------------------------------------------
-
-def test_janela_sobreposta_cobre_os_dias_pedidos():
-    inicio, fim = gps_api.janela_sobreposta(dt.date(2026, 9, 15), dias=45)
-
-    assert fim == dt.date(2026, 9, 15)
-    assert inicio == dt.date(2026, 8, 1)
-    assert (fim - inicio).days == 45
-
-
-def test_janela_sobreposta_recusa_dias_negativos():
-    with pytest.raises(ValueError):
-        gps_api.janela_sobreposta(dt.date(2026, 9, 15), dias=-1)
 
 
 def test_compras_manda_as_datas_no_formato_iso():
@@ -280,66 +267,10 @@ def test_detalhe_empresa_falha_alto_se_data_vier_como_lista():
         cliente.detalhe_empresa("1")
 
 
-def test_coletar_compras_itera_todas_as_empresas():
-    """Decisão confirmada com o cliente: o RMC tem mais de uma empresa no GPS,
-    então a coleta percorre a lista inteira, não um id fixo."""
-    cliente = _cliente(_api_com_duas_empresas, limite_pagina=2)
-    recebidos: list[tuple[str, dict]] = []
-
-    coleta = gps_api.coletar_compras(
-        cliente, hoje=dt.date(2026, 9, 15), dias_sobreposicao=45,
-        consumidor=lambda id_empresa, registro: recebidos.append((id_empresa, registro)),
-    )
-
-    assert coleta.empresas == 2
-    assert coleta.registros == 3
-    assert [r[0] for r in recebidos] == ["1", "2", "2"]
-    assert coleta.data_inicio == dt.date(2026, 8, 1) and coleta.data_fim == dt.date(2026, 9, 15)
-
-
-def test_coletar_compras_usa_a_janela_em_todas_as_empresas():
-    cliente = _cliente(_api_com_duas_empresas, limite_pagina=2)
-
-    gps_api.coletar_compras(cliente, hoje=dt.date(2026, 9, 15), dias_sobreposicao=10)
-
-    chamadas_compras = [c for c in cliente._http.chamadas if "compras" in c[0]]
-    assert chamadas_compras, "nenhuma chamada de compras foi feita"
-    for _url, params, _headers in chamadas_compras:
-        assert params["dataInicio"] == "2026-09-05"
-        assert params["dataFim"] == "2026-09-15"
-
 
 # ---------------------------------------------------------------------------
 # Adapter — o limite explícito do que ainda não existe
 # ---------------------------------------------------------------------------
-
-def test_adapter_reporta_indisponivel_sem_configuracao(monkeypatch):
-    monkeypatch.setattr("integrations.gps_api.settings.gps_api.base_url", None)
-    monkeypatch.setattr("integrations.gps_api.settings.gps_api.api_key", None)
-
-    adaptador = gps_api.GpsApiComprasAdapter()
-
-    assert adaptador.status() == StatusIntegracao.INDISPONIVEL
-    resultado = adaptador.sincronizar()
-    assert resultado.registros_processados == 0
-    assert "não configurada" in resultado.mensagem
-
-
-def test_adapter_coleta_mas_nao_grava_e_avisa_que_falta_o_mapeamento(monkeypatch):
-    """Trava de contrato: enquanto o mapeamento de campos não existir, a
-    sincronização NÃO pode dizer que processou registro nenhum. Se um dia
-    alguém implementar a gravação, este teste falha e obriga a atualizar o
-    contrato de propósito."""
-    monkeypatch.setattr("integrations.gps_api.settings.gps_api.base_url", "http://api-de-teste")
-    monkeypatch.setattr("integrations.gps_api.settings.gps_api.api_key", "chave-de-teste")
-    cliente = _cliente(_api_com_duas_empresas, limite_pagina=2)
-
-    resultado = gps_api.GpsApiComprasAdapter().sincronizar(cliente=cliente, hoje=dt.date(2026, 9, 15))
-
-    assert resultado.status == StatusIntegracao.MANUAL
-    assert resultado.registros_processados == 0
-    assert "NADA foi gravado" in resultado.mensagem
-    assert "3 registro(s)" in resultado.mensagem
 
 
 def test_cliente_das_configuracoes_recusa_sem_chave(monkeypatch):

@@ -88,6 +88,9 @@ def _ambiente() -> dict:
         "SEED_QTD_GENERICOS": "60",
         "SEED_QTD_MESES": "3",
         "SEED_SEMENTE_ALEATORIA": "42",
+        # Por Loja (compras da rede, 05/10/2026): "hoje" fixo — "Último mês"
+        # é sempre agosto/2026 (tests/visual/compras_rede.py).
+        "RMC_HOJE": "2026-10-06",
         "PYTHONIOENCODING": "utf-8",
     })
     return env
@@ -128,6 +131,9 @@ def _preparar_banco(env: dict) -> None:
                    stdout=subprocess.DEVNULL)
     # Loja com dados do Pedido: sem ela o pop-up de filtros nem abre.
     subprocess.run([sys.executable, "-m", "tests.visual.loja_ficticia"], cwd=RAIZ, env=env, check=True,
+                   stdout=subprocess.DEVNULL)
+    # Compras da rede (Por Loja): o seed não cria o arquivo da rede.
+    subprocess.run([sys.executable, "-m", "tests.visual.compras_rede"], cwd=RAIZ, env=env, check=True,
                    stdout=subprocess.DEVNULL)
 
 
@@ -194,9 +200,9 @@ def _abrir_detalhe(page, texto_do_popup: str, botao) -> None:
 def _abrir_login(page, url: str) -> None:
     page.goto(url)
     # Durante o rerun inicial o Streamlit mostra por um instante o login
-    # antigo e o novo juntos (dois campos "CNPJ"); espera sobrar um só.
+    # antigo e o novo juntos (dois campos "E-mail ou CNPJ"); espera sobrar um só.
     page.wait_for_function(
-        """() => document.querySelectorAll('input[aria-label="CNPJ"]').length === 1""",
+        """() => document.querySelectorAll('input[aria-label="E-mail ou CNPJ"]').length === 1""",
         timeout=120_000,
     )
     # Logo depois de abrir, a leitura do cookie "lembrar-me" roda o app de
@@ -206,8 +212,8 @@ def _abrir_login(page, url: str) -> None:
 
 def _entrar(page, url: str) -> None:
     _abrir_login(page, url)
-    page.get_by_label("CNPJ").fill("30208213000174")
-    page.get_by_label("CNPJ").press("Tab")
+    page.get_by_label("E-mail ou CNPJ").fill("30208213000174")
+    page.get_by_label("E-mail ou CNPJ").press("Tab")
     # O Tab formata o CNPJ e roda o app de novo; senha digitada durante esse
     # rerun era apagada (visto em 24/09/2026: "Informe CNPJ e senha").
     _estabilizar(page)
@@ -219,10 +225,32 @@ def _entrar(page, url: str) -> None:
 def _escolher_laboratorio(page) -> None:
     faixa = page.locator('[class*="st-key-faixa-laboratorio"]')
     faixa.wait_for(timeout=60_000)
+    # Logo depois do clique na barra a tela anterior ainda está na página: a
+    # escolha caía nela e se perdia (Por Produto, 05/10/2026).
+    _estabilizar(page)
     if faixa.locator("input").input_value() == "":
         faixa.locator("input").click()
         page.get_by_role("option").first.click()
     page.locator(".linha.corpo").first.wait_for(timeout=120_000)  # tabela (views/tabela.py)
+
+
+_DIALOGO = 'div[data-testid="stDialog"] section[role="dialog"]'
+
+
+def _popup(page, abrir, nome: str, fechar: str = "Escape"):
+    """Abre um pop-up, entrega a captura e fecha (ESC ou pelo botão `fechar`
+    — formulário longo não fecha por ESC, Q14 de 07/10/2026)."""
+    abrir.click()
+    dialogo = page.locator(_DIALOGO)
+    dialogo.wait_for(timeout=60_000)
+    _estabilizar(page)
+    yield nome, []
+    if fechar == "Escape":
+        page.keyboard.press("Escape")
+    else:
+        dialogo.get_by_role("button", name=fechar, exact=True).click()
+    dialogo.wait_for(state="detached", timeout=30_000)
+    _estabilizar(page)
 
 
 def _telas(page, url):
@@ -234,24 +262,52 @@ def _telas(page, url):
     page.get_by_role("button", name="Por Loja").click()
     _escolher_laboratorio(page)
     yield "por_loja", []
-    _abrir_detalhe(page, "Produtos comprados", page.locator("button.acao"))
+    _abrir_detalhe(page, "Compras desta loja", page.locator("button.acao"))
     yield "por_loja_detalhe", []
     page.keyboard.press("Escape")
 
     page.get_by_role("button", name="Por Produto").click()
     _escolher_laboratorio(page)
     yield "por_produto", []
-    _abrir_detalhe(page, "Genérico", page.locator("button.acao"))
+    _abrir_detalhe(page, "Notas fiscais do período", page.locator("button.acao"))
     yield "por_produto_detalhe", []
     page.keyboard.press("Escape")
 
     # Pela chave do botão (st-key-nav_<seção>), não pelo nome: o nome
     # acessível inclui o ícone e "Pedido" também casava com "Configurações
     # de Pedidos" (28/09/2026).
-    for secao in ("pedido", "dashboard", "config_pedido"):
+    # Espera a tela PEDIDA (st-key-tela-<nome>), não "qualquer tela": logo
+    # depois do clique a anterior (Por Produto) ainda está na página, e a
+    # captura saía dela às vezes (05/10/2026).
+    for secao, tela in (("pedido", "pedido"), ("config_pedido", "config-pedido")):
         page.locator(f'[class*="st-key-nav_{secao}"] button').click()
-        page.locator('[class*="st-key-tela-"]').first.wait_for(timeout=60_000)
+        page.locator(f'[class*="st-key-tela-{tela}"]').first.wait_for(timeout=60_000)
+        _estabilizar(page)
         yield secao, []
+    # Dica (22/10/2026, core/dicas.py): o balão do help= das Configurações, com o mesmo visual do balão dos
+    # cards e da tabela. Só aparece com o mouse em cima do "?".
+    page.locator('[data-testid="stTooltipIcon"]').first.scroll_into_view_if_needed()
+    page.locator('[data-testid="stTooltipIcon"]').first.hover()
+    page.locator('[data-testid="stTooltipContent"]').first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    yield "config_pedido_dica", []
+    page.mouse.move(1, 1)
+    page.locator('[data-testid="stTooltipContent"]').first.wait_for(state="detached", timeout=30_000)
+    page.evaluate("window.scrollTo(0, 0)")
+    # Configurações → Classificação de produtos (25/10/2026, no lugar da tabela "Linhas de compra"): a seção
+    # fica no fim da página; a foto alinha o título dela ao topo. Depois, a 1ª categoria aberta (a setinha no
+    # fim da barra) e o pop-up "Editar correspondência".
+    page.get_by_text("Classificação de produtos", exact=True).first.evaluate("e => e.scrollIntoView({block: 'start'})")
+    page.locator(".rmc-cascata").first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    yield "config_pedido_classificacao", []
+    page.locator(".rmc-cascata > details > summary").first.click()
+    page.locator(".rmc-cascata > details[open] .filhos").first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "config_pedido_classificacao_aberta", []
+    yield from _popup(page, page.locator('[class*="st-key-classificacao_produtos_editar"] button'),
+                      "config_pedido_correspondencia")
 
     # Assistente de pedido com a loja fictícia (01/10/2026): ao abrir a loja,
     # os pop-ups de alerta (estoque negativo → sem classificação) e, como ela
@@ -271,6 +327,10 @@ def _telas(page, url):
     if dialogo.count():
         yield "pedido_alerta", []
         page.get_by_role("button", name="Considerar todos zero").click()
+        # 2º alerta (só informa) — também na régua dos pop-ups.
+        dialogo.get_by_role("button", name="Entendi").wait_for(timeout=60_000)
+        _estabilizar(page)
+        yield "pedido_alerta_sem", []
         page.get_by_role("button", name="Entendi").click()
         dialogo.wait_for(state="detached", timeout=60_000)
     parametros.wait_for(timeout=60_000)
@@ -288,15 +348,125 @@ def _telas(page, url):
         page.locator('[class*="st-key-pedido_cat_"] input').click()
         page.get_by_role("option").nth(1).wait_for(timeout=30_000)
         page.get_by_role("option").nth(1).click()
-        page.keyboard.press("Escape")
+        # Espera a tela assentar ANTES do ESC (08/10/2026): o ESC no meio do
+        # recálculo da escolha fazia ela se perder — a falha intermitente
+        # deste passo, duas vezes seguidas no mesmo dia.
+        _estabilizar(page)
         try:
             etiqueta.first.wait_for(timeout=15_000)
+            page.keyboard.press("Escape")
             break
         except Exception:  # noqa: BLE001 — tenta de novo
             continue
     etiqueta.first.wait_for(timeout=15_000)
     _estabilizar(page)
     yield "pedido_filtrado", []
+    # Pop-ups do Assistente (07/10/2026): "Saiba mais", Listas e Exportar.
+    yield from _popup(page, page.locator('[class*="st-key-pedido_saiba_mais"] button'), "pedido_saiba_mais")
+    yield from _popup(page, page.get_by_role("button", name="Listas"), "pedido_listas")
+    yield from _popup(page, page.get_by_role("button", name="Exportar"), "pedido_exportar")
+
+    # Dashboard (21/10/2026). Vem DEPOIS do Assistente de propósito: precisa de uma loja escolhida na
+    # barra lateral, e escolhê-la antes mudaria a barra de todas as capturas anteriores. O menu começa
+    # recolhido: abre o pai (`.st-key-nav_dashboard` é a classe EXATA do pai; o [class*=] casaria
+    # também as filhas). Três páginas desde 22/10/2026: Estoque (nova, 22/10/2026),
+    # Ruptura (a tela de 21/10/2026, sem mudança) e Compras (em construção).
+    page.locator(".st-key-nav_dashboard button").click()
+    page.locator(".st-key-nav_dashboard_estoque button").wait_for(timeout=60_000)
+    page.locator(".st-key-nav_dashboard_estoque button").click()
+    page.locator('[class*="st-key-tela-dashboard-estoque"]').first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    page.locator(".linha.corpo.clicavel").first.wait_for(timeout=120_000)
+    page.mouse.move(1, 1)
+    yield "dashboard_estoque", []
+    # Dica do card "Valor em excesso" (22/10/2026): o balão único do app, com dois parágrafos.
+    page.locator(".rmc-kpi").nth(2).hover()
+    _estabilizar(page)
+    yield "dashboard_estoque_dica", []
+    page.mouse.move(1, 1)
+    # Filtro da página: clicar numa linha da análise por categoria (a linha fica, o resto escurece e os
+    # cards, o gráfico e os críticos refazem); depois a tabela de críticos alinhada ao topo e o detalhe.
+    page.locator(".linha.corpo.clicavel").first.click()
+    page.locator(".linha.corpo.selecionada").first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "dashboard_estoque_filtrado", []
+    page.locator(".linha.corpo.selecionada").first.click()   # clicar de novo no único selecionado tira o filtro
+    page.locator(".linha.corpo.selecionada").first.wait_for(state="detached", timeout=30_000)
+    _estabilizar(page)
+    # Análise por categoria (26/10/2026): a setinha no fim da 1ª categoria abre o detalhamento (IQVIA → FEBRAFAR →
+    # CMED) sem rodar o script; fecha de novo para as capturas seguintes.
+    page.locator("button.abrir").first.click()
+    page.locator(".linha.corpo.sub:not(.oculta)").first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "dashboard_estoque_detalhamento", []
+    page.locator("button.abrir").first.click()
+    page.locator(".linha.corpo.sub:not(.oculta)").first.wait_for(state="detached", timeout=30_000)
+    _estabilizar(page)
+    page.get_by_text("Produtos críticos", exact=True).first.evaluate("e => e.scrollIntoView({block: 'start'})")
+    _estabilizar(page)
+    yield "dashboard_estoque_criticos", []
+    yield from _popup(page, page.locator("button.acao").first, "dashboard_estoque_detalhe")
+    page.locator(".st-key-nav_dashboard_ruptura button").click()
+    page.locator('[class*="st-key-tela-dashboard-ruptura"]').first.wait_for(timeout=60_000)
+    page.locator(".barra").first.wait_for(timeout=120_000)
+    page.locator(".linha.corpo.clicavel").first.wait_for(timeout=120_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)   # sem o mouse em cima de uma barra: a dica dela entraria na foto
+    yield "dashboard_ruptura", []
+    # Página nova (27/10/2026): sem chips de filtro — a barra escolhida fica marcada (aria-pressed) e o resto
+    # escurece. Uma barra (clique), depois duas (Ctrl+clique), depois tira (clique na única escolhida).
+    page.locator('.barra[data-chave="A"]').first.click()
+    page.locator('.barra[data-chave="A"][aria-pressed="true"]').first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "dashboard_ruptura_filtrado", []
+    page.locator('.barra[data-chave="B"]').first.click(modifiers=["Control"])
+    page.locator('.barra[data-chave="B"][aria-pressed="true"]').first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "dashboard_ruptura_filtrado_duas", []
+    page.locator('.barra[data-chave="B"]').first.click()          # sobra só a B
+    page.locator('.barra[data-chave="A"][aria-pressed="true"]').first.wait_for(state="detached", timeout=30_000)
+    page.locator('.barra[data-chave="B"]').first.click()          # clique na única escolhida: tira o filtro
+    page.locator('.barra[aria-pressed="true"]').first.wait_for(state="detached", timeout=30_000)
+    _estabilizar(page)
+    # Ruptura por categoria: a setinha abre IQVIA › FEBRAFAR › CMED; fecha de novo para as fotos seguintes.
+    page.locator("button.abrir").first.click()
+    page.locator(".linha.corpo.sub:not(.oculta)").first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "dashboard_ruptura_detalhamento", []
+    page.locator("button.abrir").first.click()
+    page.locator(".linha.corpo.sub:not(.oculta)").first.wait_for(state="detached", timeout=30_000)
+    _estabilizar(page)
+    # A tabela começa na dobra: a foto alinha o título dela ao topo (o
+    # `scroll_into_view_if_needed` não rola quando o título já aparece embaixo).
+    page.get_by_text("Produtos críticos", exact=True).first.evaluate("e => e.scrollIntoView({block: 'start'})")
+    _estabilizar(page)
+    yield "dashboard_ruptura_tabela", []
+    yield from _popup(page, page.locator("button.acao").first, "dashboard_ruptura_detalhe")
+    page.locator(".st-key-nav_dashboard_compras button").click()
+    page.locator('[class*="st-key-tela-dashboard-compras"]').first.wait_for(timeout=60_000)
+    # Página nova (27/10/2026): pílulas de período, cards, compras por categoria, distribuição, dotação × consumido
+    # (gráfico do plotly) e os produtos não otimizados.
+    page.locator(".barra").first.wait_for(timeout=120_000)
+    page.locator(".linha.corpo.clicavel").first.wait_for(timeout=120_000)
+    page.locator(".js-plotly-plot").first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "dashboard_compras", []
+    page.get_by_text("Produtos com compra não otimizada", exact=True).first.evaluate("e => e.scrollIntoView({block: 'start'})")
+    _estabilizar(page)
+    yield "dashboard_compras_produtos", []
+    yield from _popup(page, page.locator("button.acao").first, "dashboard_compras_detalhe")
+    page.evaluate("window.scrollTo(0, 0)")
+    page.locator('[class*="st-key-dash-compras-periodo"]').get_by_text("Últimos 3 meses").click()
+    page.get_by_text("Julho a setembro/2026", exact=False).first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "dashboard_compras_tres_meses", []
 
     # Aba Dados reorganizada em 29/09/2026: Pendências / Importar / Rotinas /
     # Explorador. O aviso "foi reorganizada" sai antes das fotos (senão elas
@@ -308,21 +478,74 @@ def _telas(page, url):
         aviso.click()
     page.get_by_text("Fila de Resolução de EAN").first.wait_for(timeout=60_000)
     yield "dados_fila_ean", []
-    for texto, nome in (("CNPJ órfão", "dados_fila_cnpj"), ("Vínculo de lojas GPS", "dados_vinculo"),
-                        ("Sem Classificação", "dados_sem_classificacao")):
+    # A fila de CNPJ órfão saiu em 05/10/2026 (compras pela API).
+    for texto, nome in (("Vínculo de lojas GPS", "dados_vinculo"), ("Sem Classificação", "dados_sem_classificacao")):
         page.get_by_test_id("stButtonGroup").get_by_text(texto).click()
         page.locator('[data-testid="stMarkdownContainer"]').filter(has_text="O que é:").first.wait_for(timeout=60_000)
         yield nome, []
     page.get_by_role("tab", name="Importar").click()
-    page.get_by_text("Compras das Lojas (GPS)").first.wait_for(timeout=60_000)
-    # Mês/ano padrão = data de hoje: mascarados, senão a foto muda todo mês.
-    yield "dados_importar", [page.get_by_test_id("stSelectbox").filter(has_text="Mês de referência"),
-                             page.get_by_test_id("stNumberInput")]
+    # O envio da planilha do GPS (com mês/ano mascarados) saiu em 05/10/2026.
+    page.get_by_text("Base Genéricos (planilha curada)").first.wait_for(timeout=60_000)
+    yield "dados_importar", []
     page.get_by_role("tab", name="Rotinas").click()
     page.get_by_text("Rotina do GPS").first.wait_for(timeout=60_000)
     yield "dados_rotinas", []
     page.get_by_role("tab", name="Explorador de Arquivos").click()
     yield "dados_explorador", []
+
+    # Cadastro (07/10/2026): a loja da barra continua a fictícia (escolhida
+    # no Assistente), com dois usuários (tests/visual/loja_ficticia.py).
+    page.locator('[class*="st-key-nav_cadastro"] button').click()
+    page.locator('[class*="st-key-cadastro-linha-"]').first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    yield "cadastro", []
+    page.locator('[class*="st-key-cadastro_novo"] button').click()
+    page.get_by_role("dialog").get_by_text("Identificação").first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    yield "cadastro_novo", []
+    page.get_by_role("dialog").get_by_role("button", name="Cancelar", exact=True).click()
+    page.locator(_DIALOGO).wait_for(state="detached", timeout=30_000)
+    linha = page.locator('[class*="st-key-cadastro-linha-"]').filter(has_text="Carlos Souza")
+    yield from _popup(page, linha.locator('[class*="st-key-cadastro_editar_"] button:visible').first, "cadastro_editar",
+                      fechar="Cancelar")
+    yield from _popup(page, linha.locator('[class*="st-key-cadastro_paineis_"] button:visible').first, "cadastro_paineis")
+    yield from _popup(page, linha.locator('[class*="st-key-cadastro_empresas_"] button:visible').first, "cadastro_empresas")
+    yield from _popup(page, linha.locator('[class*="st-key-cadastro_email_"] button:visible').first, "cadastro_email")
+    yield from _popup(page, linha.locator('[class*="st-key-cadastro_excluir_"] button:visible').first, "cadastro_excluir")
+    # Celular (Q8): uma vez só, na volta de 1280 px — o pop-up ocupa a tela
+    # menos 32 px.
+    largura_original = page.viewport_size["width"]
+    if largura_original == LARGURAS[0]:
+        page.set_viewport_size({"width": 390, "height": 844})
+        _estabilizar(page)
+        yield from _popup(page, page.locator('[class*="st-key-cadastro_novo"] button'), "celular_cadastro_novo",
+                          fechar="Cancelar")
+        yield from _popup(page, linha.locator('[class*="st-key-cadastro_excluir_"] button:visible').first,
+                          "celular_cadastro_excluir")
+        page.set_viewport_size({"width": largura_original, "height": ALTURA})
+        _estabilizar(page)
+
+    # Usuário de loja (etapa 4, 07/10/2026): Ana, Compradora de Genéricos e
+    # Similares só com o painel do Assistente — a barra mostra só ele, a loja
+    # vem fixa e a lista sai cortada pelas linhas dela.
+    page.locator('[class*="st-key-nav_sair"] button').click()
+    _abrir_login(page, url)
+    page.get_by_label("E-mail ou CNPJ").fill("ana.compras@ficticia.com.br")
+    page.get_by_label("Senha").fill("senha-teste-1")
+    page.get_by_role("button", name="Entrar").click()
+    page.locator('[class*="st-key-tela-pedido"]').first.wait_for(timeout=120_000)
+    dialogo = page.locator('div[data-testid="stDialog"] section[role="dialog"]')
+    parametros = page.locator('[class*="st-key-pedido-parametros"]')
+    dialogo.or_(parametros).first.wait_for(timeout=120_000)
+    if dialogo.count():
+        page.get_by_role("button", name="Considerar todos zero").click()
+        page.get_by_role("button", name="Entendi").click()
+        dialogo.wait_for(state="detached", timeout=60_000)
+    parametros.wait_for(timeout=60_000)
+    page.get_by_role("radio", name="Personalizado desta loja").click()
+    page.locator(".linha.corpo").first.wait_for(timeout=120_000)
+    _estabilizar(page)
+    yield "pedido_comprador", []
 
 
 def _comparar(atual: Path, referencia: Path, diferenca: Path) -> tuple[bool, float]:
@@ -394,9 +617,55 @@ def _verificar_tabelas(page, tela: str, largura: int, falhas: list[str]) -> None
             falhas.append(f"{tela} @ {largura}px, tabela [{nome}]: título quebrado {tabela['quebrados']}")
 
 
+# Regra dos pop-ups (grill de 07/10/2026, views/popups.py), medida em toda
+# captura com pop-up aberto: largura do tipo (ou a área do conteúdo − 32 px,
+# a menor), centro na área do conteúdo (à direita da barra lateral aberta),
+# centro na vertical e o rodapé de botões visível sem rolar.
+POPUP_TOLERANCIA_PX = 8
+_JS_POPUP = """() => {
+  const d = document.querySelector('div[data-testid="stDialog"] section[role="dialog"]');
+  if (!d) return null;
+  const marca = d.querySelector('[class*="st-key-popup-aviso"], [class*="st-key-popup-curto"], '
+    + '[class*="st-key-popup-longo"], [class*="st-key-popup-detalhe"]');
+  const tipo = marca ? marca.className.match(/st-key-popup-(aviso|curto|longo|detalhe)/)[1] : null;
+  const sb = document.querySelector('section[data-testid="stSidebar"][aria-expanded="true"]');
+  const barra = sb && innerWidth >= 640 ? sb.getBoundingClientRect().width : 0;
+  const r = d.getBoundingClientRect();
+  const rodape = d.querySelector('[class*="st-key-popup-rodape"]');
+  const rr = rodape ? rodape.getBoundingClientRect() : null;
+  return {tipo, barra, vw: innerWidth, vh: innerHeight, x: r.left, w: r.width, top: r.top, bottom: r.bottom,
+          rodapeFundo: rr ? rr.bottom : null};
+}"""
+
+
+def _verificar_popup(page, tela: str, largura: int, falhas: list[str]) -> None:
+    from core.theme import POPUP_LARGURAS
+
+    m = page.evaluate(_JS_POPUP)
+    if m is None:
+        return
+    onde = f"{tela} @ {largura}px, pop-up"
+    if m["tipo"] is None:
+        falhas.append(f"{onde}: feito sem a fábrica views/popups.py (sem tipo)")
+        return
+    t = POPUP_TOLERANCIA_PX
+    area = m["vw"] - m["barra"]
+    esperado = min(POPUP_LARGURAS[m["tipo"]], area - 32)
+    if abs(m["w"] - esperado) > 2:
+        falhas.append(f"{onde} {m['tipo']}: largura {m['w']:.0f} px, esperado {esperado:.0f}")
+    centro_area = m["barra"] + area / 2
+    if abs(m["x"] + m["w"] / 2 - centro_area) > t:
+        falhas.append(f"{onde}: centro em {m['x'] + m['w'] / 2:.0f} px, área do conteúdo em {centro_area:.0f}")
+    if abs((m["top"] + m["bottom"]) / 2 - m["vh"] / 2) > t:
+        falhas.append(f"{onde}: fora do centro vertical (topo {m['top']:.0f}, base {m['bottom']:.0f})")
+    if m["rodapeFundo"] is not None and m["rodapeFundo"] > m["vh"] + 1:
+        falhas.append(f"{onde}: rodapé de botões fora da tela ({m['rodapeFundo']:.0f} > {m['vh']})")
+
+
 def _registrar(page, tela, largura, mascaras, atualizar, falhas_contrato, conferidos, falhas_visuais,
                falhas_layout) -> None:
     _verificar_tabelas(page, tela, largura, falhas_layout)
+    _verificar_popup(page, tela, largura, falhas_layout)
     from core.theme import SELETORES_STREAMLIT
 
     for nome, (seletor, tela_contrato) in SELETORES_STREAMLIT.items():
@@ -409,6 +678,10 @@ def _registrar(page, tela, largura, mascaras, atualizar, falhas_contrato, confer
     # "Atualização dos dados" no pé da barra (02/10/2026): os meses do
     # data.seed vêm do dia de hoje — sem a máscara, toda imagem "mudaria"
     # na virada do mês.
+    # Notificações (st.toast, 02/10/2026) somem sozinhas em 5 s: a captura
+    # pegava às vezes com, às vezes sem — saem da página antes da foto
+    # (05/10/2026). Máscara não resolve: ela só existe quando o toast existe.
+    page.evaluate("""() => document.querySelectorAll('[data-testid="stToast"]').forEach(t => t.remove())""")
     mascaras = list(mascaras) + [page.locator(".rmc-atualizacao")]
     page.screenshot(path=str(atual), mask=mascaras, mask_color="#9AA3AF")
     if atualizar:
@@ -473,7 +746,7 @@ def main() -> int:
     print("OK" if not falhas_contrato else "\n".join(f"FALHOU: {f}" for f in falhas_contrato))
     if sem_tela:
         print(f"(não conferidos neste roteiro — sem tela garantida: {', '.join(sem_tela)})")
-    print("\n== TABELAS (vãos iguais entre colunas, títulos numa linha) ==")
+    print("\n== TABELAS E POP-UPS (vãos iguais, títulos numa linha; pop-ups no tamanho e no centro) ==")
     print("OK" if not falhas_layout else "\n".join(f"FALHOU: {f}" for f in falhas_layout))
     print("\n== CAPTURAS ==")
     if args.atualizar:

@@ -34,14 +34,50 @@ def test_niveis_e_secoes():
     assert acesso.pode_ver(acesso.ADM, "config_pedido")
     assert acesso.pode_ver(acesso.CONSULTOR, "pedido") and not acesso.pode_ver(acesso.CONSULTOR, "dados")
     assert not acesso.pode_ver(acesso.CONSULTOR, "config_pedido")
+    # Cadastro (07/10/2026): ADM e Consultor; a loja não cadastra ninguém.
+    assert acesso.pode_ver(acesso.ADM, acesso.CADASTRO) and acesso.pode_ver(acesso.CONSULTOR, acesso.CADASTRO)
+    assert not acesso.pode_ver(acesso.COMPRADOR, acesso.CADASTRO) and not acesso.pode_ver(acesso.PROPRIETARIO, acesso.CADASTRO)
+    # Usuário de loja: só os painéis atribuídos no Cadastro (07/10/2026);
+    # sem painel, nenhuma tela — nunca a Por Loja nem a Administração.
+    todos = ["pedido", "oportunidade_produto", "dashboard", "oportunidade_loja", "dados", "config_pedido"]
     for nivel in (acesso.COMPRADOR, acesso.PROPRIETARIO):
-        assert acesso.pode_ver(nivel, "pedido") and not acesso.pode_ver(nivel, "oportunidade_loja")
-        assert acesso.pode_ver(nivel, "oportunidade_produto") and not acesso.pode_ver(nivel, "dashboard")
-        assert acesso.secao_inicial(nivel) == "pedido"
+        assert acesso.pode_ver(nivel, "pedido", todos) and not acesso.pode_ver(nivel, "oportunidade_loja", todos)
+        assert acesso.pode_ver(nivel, "oportunidade_produto", todos)
+        assert not acesso.pode_ver(nivel, "dados", todos) and not acesso.pode_ver(nivel, "config_pedido", todos)
+        assert not acesso.pode_ver(nivel, "oportunidade_produto", ["pedido"])
+        assert not acesso.pode_ver(nivel, "pedido") and acesso.secao_inicial(nivel) is None
+        assert acesso.secao_inicial(nivel, ["dashboard", "oportunidade_produto"]) == "oportunidade_produto"
+        assert acesso.secao_inicial(nivel, todos) == "pedido"
+    # ADM e Consultor não dependem de painel.
+    assert acesso.pode_ver(acesso.CONSULTOR, "pedido") and acesso.secao_inicial(acesso.ADM) == "oportunidade_loja"
     # Por Loja é só do ADM (02/10/2026); o Consultor começa na Por Produto.
     assert acesso.pode_ver(acesso.ADM, "oportunidade_loja") and not acesso.pode_ver(acesso.CONSULTOR, "oportunidade_loja")
     assert acesso.secao_inicial(acesso.CONSULTOR) == "oportunidade_produto"
     assert acesso.secao_inicial(acesso.ADM) == "oportunidade_loja"
+
+
+def test_dashboard_acesso_por_nivel():
+    """Dashboard (21/10/2026): ADM, Consultor e Proprietário; o Comprador não —
+    mesmo com o painel gravado no cadastro antigo. Um painel só abre as três
+    telas (Estoque, Ruptura, Compras)."""
+    telas = ("dashboard_estoque", "dashboard_ruptura", "dashboard_compras")
+    todos = ["pedido", "oportunidade_produto", "dashboard"]
+    for secao in telas:
+        assert acesso.pode_ver(acesso.ADM, secao) and acesso.pode_ver(acesso.CONSULTOR, secao)
+        assert acesso.pode_ver(acesso.PROPRIETARIO, secao, todos)
+        assert not acesso.pode_ver(acesso.PROPRIETARIO, secao, ["pedido"])          # sem o painel atribuído
+        assert not acesso.pode_ver(acesso.PROPRIETARIO, secao)                      # sem nenhum painel
+        assert not acesso.pode_ver(acesso.COMPRADOR, secao, todos)                  # nem com o painel gravado
+    assert acesso.pode_ver(acesso.PROPRIETARIO, "dashboard", todos)                 # o painel em si (o item pai do menu)
+    assert not acesso.pode_ver(acesso.COMPRADOR, "dashboard", todos)
+    # O Cadastro só oferece ao Comprador os painéis que ele pode receber.
+    assert acesso.paineis_do_nivel(acesso.COMPRADOR) == ("pedido", "oportunidade_produto")
+    assert "dashboard" in acesso.paineis_do_nivel(acesso.PROPRIETARIO)
+    assert "dashboard" in acesso.paineis_do_nivel(None)          # formulário sem nível escolhido
+    # Tela inicial: o painel Dashboard abre em Estoque (a 1ª filha); Comprador com só esse painel fica sem tela.
+    assert acesso.secao_inicial(acesso.PROPRIETARIO, ["dashboard"]) == "dashboard_estoque"
+    assert acesso.secao_inicial(acesso.COMPRADOR, ["dashboard"]) is None
+    assert acesso.secao_inicial(acesso.COMPRADOR, ["dashboard", "pedido"]) == "pedido"
 
 
 def test_opcao_todas_da_barra_lateral():

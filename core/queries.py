@@ -1,23 +1,14 @@
-"""Consultas de apoio das telas de Análise de Oportunidade: meses carregados,
-histórico mensal de um genérico numa loja, preços por laboratório e listas
-dos filtros. O cálculo da oportunidade em si (menor preço pago, recuo de
-preço, vencedor, economia) mora em core/analise.py."""
+"""Consultas de apoio das telas de Análise de Oportunidade: as listas dos
+filtros (UF, atendentes, grupos, lojas) e a paginação. O cálculo da
+oportunidade mora em core/analise_api.py (compras da API, 05/10/2026)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core.models import (
-    EanGenerico,
-    ItemTabelaGruppy,
-    Loja,
-    RegistroCompraGPS,
-    StatusCobertura,
-    TabelaGruppy,
-    TabelaGruppyCobertura,
-)
+from core.models import Loja, loja_da_rede
 
 
 @dataclass
@@ -34,70 +25,7 @@ class PaginaResultado:
         return max(1, -(-self.total_linhas // self.tamanho_pagina))
 
 
-def listar_ultimos_ano_meses(session: Session, quantidade: int) -> list[str]:
-    """Os `quantidade` ano_mes DISTINTOS mais recentes já carregados via GPS
-    — "1 mês" é o mês calendário mais recente com GPS carregado, não uma
-    janela de 30 dias corridos; "6 meses" são os 6 ano_mes mais recentes que
-    existirem, mesmo que não sejam contíguos."""
-    linhas = session.execute(
-        select(RegistroCompraGPS.ano_mes)
-        .distinct()
-        .order_by(RegistroCompraGPS.ano_mes.desc())
-        .limit(max(1, quantidade))
-    ).all()
-    return [r[0] for r in linhas]
 
-
-def historico_compras(
-    session: Session, loja_id: int, base_generico_id: int, ano_mes: str | None = None
-) -> list[dict]:
-    """Histórico mês a mês (todos os EAN do genérico já consolidados) de uma
-    loja pra um genérico específico — usado no gráfico de linha do popup de
-    Detalhes. ano_mes=None devolve todos os meses disponíveis."""
-    peso = RegistroCompraGPS.custo_unitario * RegistroCompraGPS.quantidade
-    stmt = (
-        select(
-            RegistroCompraGPS.ano_mes,
-            func.sum(RegistroCompraGPS.quantidade).label("quantidade"),
-            # Mesma guarda de _compras_periodo_subquery (ver comentário lá).
-            (func.sum(peso) / func.nullif(func.sum(RegistroCompraGPS.quantidade), 0)).label("custo_medio_ponderado"),
-            func.sum(peso).label("valor_total"),
-        )
-        .select_from(RegistroCompraGPS)
-        .join(EanGenerico, EanGenerico.ean == RegistroCompraGPS.ean)
-        .where(RegistroCompraGPS.loja_id == loja_id, EanGenerico.base_generico_id == base_generico_id)
-        .group_by(RegistroCompraGPS.ano_mes)
-        .order_by(RegistroCompraGPS.ano_mes)
-    )
-    if ano_mes:
-        stmt = stmt.where(RegistroCompraGPS.ano_mes == ano_mes)
-    return [dict(r) for r in session.execute(stmt).mappings().all()]
-
-
-def precos_por_laboratorio(session: Session, uf: str, base_generico_ids: list[int]) -> dict[tuple[str, int], float]:
-    """Preço vigente de cada laboratório pra um conjunto pequeno de
-    genéricos — pensado pra ser calculado só pra página atual (os
-    `base_generico_ids` visíveis na tela), nunca pro dataset inteiro."""
-    if not base_generico_ids:
-        return {}
-    stmt = (
-        select(
-            TabelaGruppy.laboratorio,
-            EanGenerico.base_generico_id,
-            func.min(ItemTabelaGruppy.custo_liquido).label("preco"),
-        )
-        .select_from(ItemTabelaGruppy)
-        .join(EanGenerico, EanGenerico.ean == ItemTabelaGruppy.ean)
-        .join(TabelaGruppy, TabelaGruppy.id == ItemTabelaGruppy.tabela_gruppy_id)
-        .join(TabelaGruppyCobertura, TabelaGruppyCobertura.tabela_gruppy_id == TabelaGruppy.id)
-        .where(
-            TabelaGruppyCobertura.status == StatusCobertura.ATIVA,
-            TabelaGruppyCobertura.uf == uf,
-            EanGenerico.base_generico_id.in_(base_generico_ids),
-        )
-        .group_by(TabelaGruppy.laboratorio, EanGenerico.base_generico_id)
-    )
-    return {(lab, bg_id): float(preco) for lab, bg_id, preco in session.execute(stmt).all()}
 
 
 def _lista_distinct(session: Session, coluna) -> list[str]:
@@ -107,13 +35,13 @@ def _lista_distinct(session: Session, coluna) -> list[str]:
     como opção fantasma no dropdown nem virar critério de agrupamento (duas
     lojas com grupo_economico="" não são "do mesmo grupo")."""
     linhas = session.execute(
-        select(coluna).distinct().where(coluna.is_not(None), coluna != "").order_by(coluna)
+        select(coluna).distinct().where(coluna.is_not(None), coluna != "", loja_da_rede()).order_by(coluna)
     ).all()
     return [r[0] for r in linhas]
 
 
 def lista_ufs(session: Session) -> list[str]:
-    return [r[0] for r in session.execute(select(Loja.uf).distinct().order_by(Loja.uf)).all()]
+    return [r[0] for r in session.execute(select(Loja.uf).distinct().where(loja_da_rede()).order_by(Loja.uf)).all()]
 
 
 def lista_atendentes(session: Session) -> list[str]:
@@ -137,5 +65,23 @@ def lista_lojas(session: Session) -> list[dict]:
     atendente e grupo (estes dois montam as opções dos filtros de quem só vê
     algumas lojas — 02/10/2026)."""
     stmt = select(Loja.id, Loja.razao_social, Loja.cnpj, Loja.uf, Loja.atendente_comercial,
-                  Loja.grupo_economico).order_by(Loja.razao_social)
+                  Loja.grupo_economico).where(loja_da_rede()).order_by(Loja.razao_social)
     return [dict(r) for r in session.execute(stmt).mappings().all()]
+
+
+def rotulos_grupos(session: Session) -> dict[str, str]:
+    """Sigla → "GE787 · DROGARIA NOVA NACIONAL LTDA" (Q30/Q34 de 06/10/2026:
+    a sigla sozinha não diz quem é o grupo). A sigla é "GE" + o código da
+    loja principal do grupo — é o nome dela que acompanha; se essa loja não
+    estiver na base, o da loja de menor código do grupo."""
+    linhas = session.execute(
+        select(Loja.grupo_economico, Loja.legacy_id, Loja.razao_social)
+        .where(Loja.grupo_economico.is_not(None), Loja.grupo_economico != "", loja_da_rede())
+        .order_by(Loja.grupo_economico, Loja.legacy_id)
+    ).all()
+    saida: dict[str, str] = {}
+    for sigla, codigo, razao in linhas:
+        nome = (razao or "").strip()
+        if sigla not in saida or sigla == f"GE{codigo}":
+            saida[sigla] = f"{sigla} · {nome}" if nome else sigla
+    return saida

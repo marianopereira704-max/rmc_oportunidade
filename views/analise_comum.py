@@ -4,7 +4,8 @@ do resultado calculado e as colunas/células da tabela de produtos (usada no
 Por Produto e no Detalhes da loja — views/tabela.py).
 
 Cache: o resultado de core/analise.py é guardado por (laboratório, período,
-versão dos dados). Ordenar pelo cabeçalho, trocar de página, buscar ou abrir
+versão dos dados). O da Por Loja nova (core/analise_api.py, compras da API —
+05/10/2026) também, com os arquivos da rede no lugar das compras do banco. Ordenar pelo cabeçalho, trocar de página, buscar ou abrir
 o detalhe só reaproveitam esse resultado em memória — o banco só é
 consultado quando o laboratório ou o período mudam, ou quando os dados
 mudam (novo envio, EAN resolvido, tabela Gruppy nova…). A versão dos dados é
@@ -13,13 +14,16 @@ chamam `invalidar()` pra valer na hora.
 """
 from __future__ import annotations
 
+import datetime as dt
+
 import pandas as pd
 import streamlit as st
 
-from core import analise, theme, ui
+from core import analise, analise_api, dicas, theme, ui
 from core.config import settings
 from core.db import get_session
-from core.queries import PaginaResultado, lista_atendentes, lista_grupos_economicos, lista_lojas, lista_ufs
+from core.queries import (PaginaResultado, lista_atendentes, lista_grupos_economicos, lista_lojas, lista_ufs,
+                          rotulos_grupos)
 from views import tabela as tb
 
 _TODAS = "Todas"
@@ -34,34 +38,8 @@ _LABORATORIO_ESCOLHIDO = "analise_laboratorio_escolhido"
 # Cache
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=30, show_spinner=False)
-def _versao_dados() -> tuple:
-    with get_session() as session:
-        return analise.versao_dados(session)
 
 
-@st.cache_data(max_entries=settings.analise.cache_combinacoes, show_spinner="Calculando a análise...")
-def _resultado_versionado(laboratorio: str, periodo_meses: int, versao: tuple) -> pd.DataFrame:
-    # `versao` não é usada no corpo: ela existe só pra entrar na chave do
-    # cache — dados mudaram, versão mudou, resultado guardado não serve mais.
-    with get_session() as session:
-        return analise.carregar(session, laboratorio, periodo_meses)
-
-
-def resultado(laboratorio: str, periodo_meses: int) -> pd.DataFrame:
-    return _resultado_versionado(laboratorio, periodo_meses, _versao_dados())
-
-
-@st.cache_data(max_entries=settings.analise.cache_combinacoes, show_spinner=False)
-def _anterior_versionado(laboratorio: str, periodo_meses: int, versao: tuple):
-    with get_session() as session:
-        return analise.carregar_anterior(session, laboratorio, periodo_meses)
-
-
-def resultado_anterior(laboratorio: str, periodo_meses: int):
-    """(resultado, meses) do período anterior de mesmo tamanho, ou None —
-    só pra seta dos indicadores. Mesmo cache por versão dos dados."""
-    return _anterior_versionado(laboratorio, periodo_meses, _versao_dados())
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -76,17 +54,112 @@ def _opcoes_filtros() -> dict:
         return {
             "ufs": lista_ufs(session), "atendentes": lista_atendentes(session),
             "grupos": lista_grupos_economicos(session), "lojas": lista_lojas(session),
+            "rotulos_grupos": rotulos_grupos(session),
         }
+
+
+# --- Compras da API (Por Loja, 05/10/2026) ------------------------------------
+
+def _hoje() -> dt.date:
+    """Hoje em Brasília. `RMC_HOJE` (AAAA-MM-DD) fixa a data — só o teste
+    visual usa, pra "Último mês" não mudar com o calendário."""
+    import os
+    from zoneinfo import ZoneInfo
+
+    if os.environ.get("RMC_HOJE"):
+        return dt.date.fromisoformat(os.environ["RMC_HOJE"])
+    return dt.datetime.now(ZoneInfo(settings.pedido.fuso)).date()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _meses_rede(hoje) -> tuple:
+    """((mês, quando foi montado), …) dos meses fechados com arquivo da rede
+    — conferido no Spaces no máximo a cada 5 min (a rotina monta de
+    madrugada)."""
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    return tuple(analise_api.meses_disponiveis(do_ambiente(), Chaves(settings.pedido.prefixo), hoje).items())
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _versao_banco_api() -> tuple:
+    with get_session() as session:
+        return analise_api.versao_banco(session)
+
+
+@st.cache_data(max_entries=settings.analise.cache_combinacoes, show_spinner="Calculando a análise...")
+def _calculo_api(laboratorio: str, meses: tuple, versao: tuple, meses_rede: tuple,
+                 params: analise_api.Parametros) -> tuple[pd.DataFrame, pd.Series]:
+    """`versao`, `meses_rede` e `params` só entram na chave do cache."""
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+    from integrations import pedido_tela
+
+    with get_session() as session:
+        itens = analise_api.itens_gruppy(session, laboratorio)
+        genericos = pedido_tela.genericos(session)
+        eans = analise_api.eans_de_interesse(itens, genericos)
+        vinc = analise_api.vinculos(session)
+        lojas = analise.buscar_lojas(session, vinc["loja_id"].unique()) if not vinc.empty else \
+            pd.DataFrame(columns=analise.COLUNAS_LOJA)
+        categorias = analise_api.categorias_dos_eans(session, eans)
+    # Só os meses do período: a mediana das regras de preço olha as compras
+    # do mesmo período que a tela mostra.
+    compras = analise_api.ler_compras(do_ambiente(), Chaves(settings.pedido.prefixo), list(meses), eans)
+    precos = analise_api.precos_por_chave(itens, genericos)
+    return analise_api.calcular(compras, vinc, lojas, precos, genericos, categorias, list(meses), params)
+
+
+def meses_api(periodo_meses: int) -> list[str]:
+    """Os meses do período (os N fechados mais recentes com arquivo)."""
+    return analise_api.meses_do_periodo([m for m, _ in _meses_rede(_hoje())], periodo_meses)
+
+
+def resultado_api(laboratorio: str, periodo_meses: int) -> tuple[pd.DataFrame, pd.Series, list[str]]:
+    """(linhas por loja × produto × nota, bonificações por loja, meses)."""
+    meses = meses_api(periodo_meses)
+    if not meses:
+        return pd.DataFrame(columns=analise_api.COLUNAS), pd.Series(dtype="int64"), []
+    linhas, bonif = _calculo_api(laboratorio, tuple(meses), _versao_banco_api(), _meses_rede(_hoje()),
+                                 _parametros_api())
+    return linhas, bonif, meses
+
+
+def resultado_api_anterior(laboratorio: str, periodo_meses: int):
+    """(linhas, meses) dos N meses de calendário antes do período, se todos
+    tiverem arquivo; senão None — só pra seta dos indicadores."""
+    disponiveis = [m for m, _ in _meses_rede(_hoje())]
+    anteriores = analise.meses_periodo_anterior(meses_api(periodo_meses), set(disponiveis))
+    if anteriores is None:
+        return None
+    linhas, _ = _calculo_api(laboratorio, tuple(anteriores), _versao_banco_api(), _meses_rede(_hoje()),
+                             _parametros_api())
+    return linhas, anteriores
+
+
+def historico_api(laboratorio: str) -> pd.DataFrame:
+    """As notas de TODOS os meses com arquivo da rede (até 6) — pro gráfico
+    de preço por mês do detalhe da Por Produto. Mesmo cache do cálculo."""
+    meses = tuple(m for m, _ in _meses_rede(_hoje()))
+    if not meses:
+        return pd.DataFrame(columns=analise_api.COLUNAS)
+    linhas, _ = _calculo_api(laboratorio, meses, _versao_banco_api(), _meses_rede(_hoje()), _parametros_api())
+    return linhas
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _parametros_api() -> analise_api.Parametros:
+    return analise_api.parametros_da_configuracao()
 
 
 def invalidar() -> None:
     """Descarta tudo que está guardado — chamar depois de qualquer ação que
-    muda os dados da análise (envio GPS/Gruppy/Base, EAN ou CNPJ resolvido)."""
-    _versao_dados.clear()
-    _resultado_versionado.clear()
-    _anterior_versionado.clear()
+    muda os dados da análise (envio Gruppy/Base/categorias, EAN resolvido, vínculo de loja)."""
     _laboratorios.clear()
     _opcoes_filtros.clear()
+    _versao_banco_api.clear()
+    _calculo_api.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +168,8 @@ def invalidar() -> None:
 
 def rotulo_periodo(qtd_meses: int) -> str:
     """Texto que se explica sozinho — o campo Período não tem mais rótulo.
-    "Últimos N meses" = os N últimos meses CARREGADOS (ano_mes com envio
-    GPS), não os N meses do calendário (core/analise.py)."""
+    "Últimos N meses" = os N últimos meses FECHADOS com dado (na Por Loja,
+    com arquivo de compras da rede — core/analise_api.py)."""
     return "Último mês" if qtd_meses == 1 else f"Últimos {qtd_meses} meses"
 
 
@@ -142,7 +215,8 @@ def faixa_laboratorio(key: str) -> str | None:
     return st.session_state.get(f"{key}_laboratorio")
 
 
-def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None) -> analise.Filtros:
+def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None,
+            categorias: list[str] | None = None) -> analise.Filtros:
     """Linha de filtros; desabilitada (mas visível) enquanto não há
     laboratório, pra deixar claro que dependem dele.
 
@@ -155,7 +229,10 @@ def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None)
     `escolha` (views/loja_barra.py, 02/10/2026): com UMA loja escolhida na
     barra, ficam só busca e período (UF, atendente, grupo e "lojas
     específicas" não fazem sentido pra uma loja); com "Todas", as opções
-    se limitam às lojas que o usuário pode ver."""
+    se limitam às lojas que o usuário pode ver.
+
+    `categorias` (Por Produto, 05/10/2026): as categorias que existem no
+    resultado — com elas, o campo Categoria entra na linha."""
     opcoes = _opcoes_filtros()
     bloqueado = laboratorio is None
     permitidas = escolha.permitidas if escolha is not None else None
@@ -163,17 +240,21 @@ def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None)
     if uma is not None:
         # "collapsed": sem UF/Atendente/Grupo (de rótulo visível) ao lado, o
         # rótulo escondido só deixava um vão acima dos dois campos.
-        f1, f5 = st.columns([5.2, 1.2])
+        if categorias is not None:
+            f1, fc, f5 = st.columns([3.6, 1.6, 1.2])
+        else:
+            (f1, f5), fc = st.columns([5.2, 1.2]), None
         with f1:
             busca = st.text_input("Buscar", placeholder=exemplo_busca, key=f"{key}_busca", disabled=bloqueado,
                                   label_visibility="collapsed")
+        escolhidas = _campo_categoria(fc, key, categorias, bloqueado, "collapsed")
         with f5:
             periodo = st.selectbox(
                 "Período", options=settings.periodos_meses_opcoes, format_func=rotulo_periodo,
                 key=f"{key}_periodo", disabled=bloqueado, label_visibility="collapsed",
             )
         return analise.Filtros(laboratorio=laboratorio, periodo_meses=periodo, busca=busca or None,
-                               loja_ids=[uma["id"]], lojas_permitidas=permitidas)
+                               loja_ids=[uma["id"]], lojas_permitidas=permitidas, categorias=escolhidas)
     lojas_opcoes = opcoes["lojas"]
     if permitidas is not None:
         # Só o que existe nas lojas do usuário (Proprietário com "Todas").
@@ -183,7 +264,10 @@ def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None)
             "atendentes": sorted({l["atendente_comercial"] for l in lojas_opcoes if l.get("atendente_comercial")}),
             "grupos": sorted({l["grupo_economico"] for l in lojas_opcoes if l.get("grupo_economico")}),
         }
-    f1, f2, f3, f4, f5 = st.columns([2.2, 1, 1.4, 1.6, 1.2])
+    if categorias is not None:
+        f1, f2, f3, f4, fc, f5 = st.columns([1.9, 0.8, 1.3, 1.3, 1.4, 1.1])
+    else:
+        (f1, f2, f3, f4, f5), fc = st.columns([2.2, 1, 1.4, 1.6, 1.2]), None
     with f1:
         busca = st.text_input(
             "Buscar", placeholder=exemplo_busca, key=f"{key}_busca", disabled=bloqueado, label_visibility="hidden",
@@ -197,7 +281,9 @@ def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None)
     with f4:
         grupo = st.selectbox(
             "Grupo econômico", options=[_TODOS] + opcoes["grupos"], key=f"{key}_grupo", disabled=bloqueado,
+            format_func=rotulo_grupo,
         )
+    escolhidas = _campo_categoria(fc, key, categorias, bloqueado, "visible")
     with f5:
         periodo = st.selectbox(
             "Período", options=settings.periodos_meses_opcoes, format_func=rotulo_periodo,
@@ -213,7 +299,31 @@ def filtros(key: str, laboratorio: str | None, exemplo_busca: str, escolha=None)
         laboratorio=laboratorio, periodo_meses=periodo, uf=None if uf == _TODAS else uf, busca=busca or None,
         atendente_comercial=None if atendente == _TODOS else atendente,
         grupo_economico=None if grupo == _TODOS else grupo, loja_ids=loja_ids, lojas_permitidas=permitidas,
+        categorias=escolhidas,
     )
+
+
+def rotulo_grupo(sigla: str | None) -> str:
+    """"GE787 · DROGARIA NOVA NACIONAL LTDA" (core/queries.py::rotulos_grupos)."""
+    if not sigla or sigla in (_TODOS, _TODAS):
+        return sigla or "—"
+    return _opcoes_filtros().get("rotulos_grupos", {}).get(sigla, sigla)
+
+
+def _campo_categoria(coluna, key: str, categorias: list[str] | None, bloqueado: bool, rotulo: str):
+    """Multiselect de Categoria (Por Produto). Opção escolhida que sumiu das
+    opções (outro laboratório) continua na lista: o multiselect descarta
+    calado o valor que não está nas opções."""
+    if categorias is None or coluna is None:
+        return None
+    ja = st.session_state.get(f"{key}_categoria", [])
+    opcoes = sorted(set(categorias) | set(ja))
+    with coluna:
+        # Sem rótulo à vista (uma loja), o texto do campo diz o que ele é.
+        escolhidas = st.multiselect("Categoria", opcoes, placeholder="Categoria" if rotulo == "collapsed" else "Todas",
+                                    key=f"{key}_categoria",
+                                    disabled=bloqueado, label_visibility=rotulo)
+    return tuple(escolhidas) or None
 
 
 _MESES_ABREV = ("jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez")
@@ -241,14 +351,21 @@ def indicadores(visao: str, linhas: pd.DataFrame, laboratorio: str, filtros_: an
     produto) — cada tela abre pelo número do seu próprio assunto.
 
     `uma_loja` (Por Produto com uma loja na barra, Q9 de 02/10/2026): o card
-    de lojas ("1 de 1") dá lugar a "Preço acima do laboratório"."""
-    atual = analise.indicadores(linhas)
+    de lojas ("1 de 1") dá lugar a "Preço acima do laboratório".
+
+    Resultado de core/analise_api.py (compras da API, 05/10/2026): "produto"
+    = produto distinto (genérico ou EAN)."""
+    calc = analise_api.indicadores
+    atual = calc(linhas)
     anterior, meses_ant = None, None
-    pacote = resultado_anterior(laboratorio, filtros_.periodo_meses)
+    pacote = resultado_api_anterior(laboratorio, filtros_.periodo_meses)
     if pacote is not None:
         df_ant, meses_ant = pacote
-        anterior = analise.indicadores(analise.filtrar(df_ant, filtros_))
-    dica = f"Comparado com {rotulo_meses(meses_ant)}, com os mesmos filtros" if meses_ant else ""
+        if visao == "produto":
+            df_ant = analise_api.por_produto(df_ant)
+            pacote = (df_ant, meses_ant)
+        anterior = calc(analise.filtrar(df_ant, filtros_))
+    dica = dicas.dica(f"Comparado com {rotulo_meses(meses_ant)}, com os mesmos filtros") if meses_ant else ""
 
     def var(campo: str) -> float | None:
         return analise.variacao(getattr(atual, campo), getattr(anterior, campo)) if anterior else None
@@ -273,7 +390,12 @@ def indicadores(visao: str, linhas: pd.DataFrame, laboratorio: str, filtros_: an
     }
     if uma_loja:
         def acima(df: pd.DataFrame) -> int:
-            return int((pd.to_numeric(df["diferenca"], errors="coerce") > 0).sum()) if not df.empty else 0
+            if df.empty:
+                return 0
+            mascara = pd.to_numeric(df["diferenca"], errors="coerce") > 0
+            if "so_revisar" in df.columns:  # só notas "a revisar": o preço não é confiável (05/10/2026)
+                mascara &= ~df["so_revisar"].astype(bool)
+            return int(mascara.sum())
         n_acima = acima(linhas)
         ant_acima = acima(analise.filtrar(pacote[0], filtros_)) if pacote is not None else None
         lojas = {
@@ -357,43 +479,6 @@ def diferenca(valor) -> str:
     return texto
 
 
-def colunas_produto(laboratorio: str) -> list[tb.ColunaTabela]:
-    """As 8 colunas da tabela de produtos. O título da coluna de preço é o
-    nome do laboratório escolhido (como foi digitado no upload da Gruppy).
-    Larguras pelo conteúdo (views/tabela.py); o nome do produto vai até
-    210 px e quebra linha. Com mais (250–320), em 1280 px ele crescia junto
-    com Laboratório quando faltava espaço: os vãos caíam pro mínimo (12 px) e
-    "GERMED PHARMA" quebrava em duas linhas (medido em 25/09/2026)."""
-    return [
-        tb.ColunaTabela("nome_canonico", "Produto", "fit-content(210px)"),
-        tb.ColunaTabela("laboratorio", "Laboratório", "fit-content(150px)"),
-        tb.ColunaTabela("preco_pago", "Preço pago", direita=True, numerica=True),
-        tb.ColunaTabela("preco_laboratorio", laboratorio, direita=True, numerica=True),
-        tb.ColunaTabela("diferenca", "Diferença un.", direita=True, numerica=True),
-        tb.ColunaTabela("quantidade", "Qtd.", direita=True, numerica=True),
-        tb.ColunaTabela("preco_medio", f"Preço médio ({settings.analise.meses_preco_medio}m)", direita=True, numerica=True),
-        tb.ColunaTabela("economia", "Economia", direita=True, numerica=True),
-    ]
-
-
-def _celula_preco_pago(linha: dict) -> list:
-    """Preço + marcador quando ele não veio direto do VlrUnitario. A dica
-    mostra o VlrUnitario original, pra ninguém estranhar o valor diferente
-    da planilha."""
-    preco = tb.pedaco(moeda(linha["preco_pago"]))
-    original = moeda(linha["vlr_unitario_original"])
-    fonte = linha["fonte"]
-    if fonte == analise.FONTE_CMV:
-        dica = f"VlrUnitario {original} fora do padrão — usado o custo CMV (Fat × %CMV ÷ QTD)"
-        return tb.celula(preco, tb.pedaco("ajustado", "selo-sugestao", dica))
-    if fonte == analise.FONTE_CUSTO_MEDIO:
-        dica = f"VlrUnitario {original} fora do padrão — usado o R$ Custo médio da planilha"
-        return tb.celula(preco, tb.pedaco("ajustado", "selo-sugestao", dica))
-    if fonte == analise.FONTE_FORA:
-        dica = "Nenhum preço da planilha ficou a ±50% do laboratório — provável erro de cadastro; economia não contabilizada"
-        return tb.celula(preco, tb.pedaco("a revisar", "selo-neutro", dica))
-    return tb.celula(preco)
-
 
 def _celula_diferenca(valor) -> list:
     """Com sinal; negativo em vermelho (a loja já paga menos que o laboratório)."""
@@ -405,61 +490,100 @@ def _celula_diferenca(valor) -> list:
     return tb.celula(tb.pedaco(texto))
 
 
-def _celula_preco_medio(linha: dict) -> list:
-    if _vazio(linha["preco_medio"]):
-        return tb.celula(tb.pedaco("—"))
-    pedacos = [tb.pedaco(moeda(linha["preco_medio"]))]
-    meses = int(linha["meses_preco_medio"] or 0)
-    if meses and meses < settings.analise.meses_preco_medio:
-        pedacos.append(tb.pedaco(f"({meses}m)", "aux"))
-    return tb.celula(pedacos)
 
 
-def _celula_economia(linha: dict) -> list:
-    if linha.get("fonte") == analise.FONTE_FORA:
-        return tb.celula(tb.pedaco("Não contabilizada", "selo-neutro"))
-    valor = linha["economia"]
-    if valor and valor > 0:
-        return tb.celula(tb.pedaco(ui.formatar_moeda(float(valor)), "selo-sucesso"))
-    return tb.celula(tb.pedaco("Já otimizada", "selo-neutro"))
+
+# --- Notas fiscais (compras da API, 05/10/2026) ---------------------------
+
+def _data(valor) -> str:
+    texto = str(valor or "")[:10]
+    return f"{texto[8:10]}/{texto[5:7]}/{texto[2:4]}" if len(texto) == 10 else "—"
 
 
-def linha_produto(linha: dict, com_loja: bool) -> dict:
-    """Uma linha da tabela de produtos. `com_loja`: no Por Produto, a loja
-    (razão social · CNPJ) vai embaixo do produto; no Detalhes da loja, não —
-    a loja já é o assunto do popup."""
-    produto = [tb.pedaco(linha["nome_canonico"], "forte")]
-    if com_loja:
-        produto.append([
-            tb.pedaco(f"{(linha.get('razao_social') or '').strip()} ·", "aux"),
-            tb.pedaco(ui.formatar_cnpj(linha["cnpj"]), "aux inteiro"),
-        ])
+def _numero(valor) -> str:
+    return ui.formatar_numero(float(valor)) if valor is not None and not pd.isna(valor) else "—"
+
+
+def _dica_compra(r: dict) -> str:
+    """A nota por trás da linha, organizada (Q9 de 05/10/2026: só na dica)."""
+    partes = [
+        f"Nota fiscal {r['nro_nf'] or '—'}, de {_data(r['data'])}.",
+        f"Fornecedor: {r['fornecedor'] or '—'}.",
+        f"Quantidade: {dicas.qtd(r['quantidade'], 'unidade')}, a {moeda(r['preco_nota'])} por unidade na nota.",
+    ]
+    if r.get("ajustado"):
+        partes.append(
+            f"Preço usado: {moeda(r['preco_pago'])}, o custo de cadastro do sistema de vendas. O valor da "
+            f"nota não combina com o preço de venda ({moeda(r['preco_venda'])}): provavelmente a nota foi "
+            "lançada sem a fração.")
+    return dicas.dica(*partes)
+
+
+_DICA_REVISAR = {
+    analise_api.MOTIVO_DIVERGENCIA: (
+        "O custo de cadastro do sistema de vendas ({cadastro}) e a nota ({nota}) estão muito diferentes, e o preço "
+        "de venda ({venda}) não mostra qual está certo."),
+    analise_api.MOTIVO_ACIMA_VENDA: (
+        "A nota ({nota} por unidade) passa do preço de venda ({venda}), e o cadastro ({cadastro}) também não "
+        "combina com ele."),
+    analise_api.MOTIVO_MEDIANA: (
+        "A nota ({nota} por unidade) está muito diferente das outras compras deste produto na loja."),
+}
+
+
+def _dica_revisar(r: dict) -> str:
+    texto = _DICA_REVISAR.get(r.get("revisar_motivo"), "O preço desta compra parece errado.").format(
+        cadastro=moeda(r["custo_cadastro"]), nota=moeda(r["preco_nota"]), venda=moeda(r["preco_venda"]))
+    return dicas.dica("Preço a conferir.", texto,
+                      "Esta compra não soma economia. Confira a nota no sistema de vendas: geralmente é a "
+                      "embalagem ou a fração lançada errada.")
+
+
+def colunas_notas(laboratorio: str, com_produto: bool = True) -> list[tb.ColunaTabela]:
+    """Tabela de notas fiscais (Q16 de 05/10/2026): uma linha por produto e
+    nota — detalhe da Por Loja e da Por Produto (as mesmas colunas e dicas).
+    `com_produto=False` (detalhe da Por Produto): todas as linhas são do
+    mesmo produto, que já está no topo do pop-up — a coluna só repetiria o
+    nome (e o nome longo, quebrado, deixava o vão da coluna desigual)."""
+    produto = [tb.ColunaTabela("nome_canonico", "Produto", "fit-content(230px)")] if com_produto else []
+    return [
+        *produto,
+        tb.ColunaTabela("laboratorio", "Laboratório", "fit-content(150px)"),
+        tb.ColunaTabela("data", "Compra", direita=True,
+                        dica="Preço pago na nota e a data da nota.\n\nPasse o mouse no preço para ver a nota fiscal, "
+                             "o fornecedor e a quantidade."),
+        tb.ColunaTabela("preco_laboratorio", laboratorio, direita=True, numerica=True),
+        tb.ColunaTabela("diferenca", "Diferença un.", direita=True, numerica=True),
+        tb.ColunaTabela("quantidade", "Qtd.", direita=True, numerica=True),
+        tb.ColunaTabela("economia", "Economia", direita=True, numerica=True),
+    ]
+
+
+def linha_nota(r: dict) -> dict:
+    produto = [tb.pedaco(r["nome_canonico"], "forte quebra")]
+    if r.get("categoria"):
+        categoria = r["categoria"]
+        produto.append(tb.pedaco(categoria.capitalize() if categoria.isupper() else categoria, "aux"))
+    dica = _dica_compra(r)
+    if r.get("a_revisar"):
+        economia = tb.pedaco("A revisar", "selo-revisar", _dica_revisar(r))
+    elif r["economia"] and r["economia"] > 0:
+        economia = tb.pedaco(ui.formatar_moeda(float(r["economia"])), "selo-sucesso")
+    else:
+        economia = tb.pedaco("Já otimizada", "selo-neutro")
     return {
-        "id": f"{linha['loja_id']}-{linha['base_generico_id']}",
+        "id": f"{r['loja_id']}-{r['produto_id']}-{r['nro_nf']}-{r['data']}-{r['fornecedor']}",
+        "classe": "revisar" if r.get("a_revisar") else None,
         "celulas": {
             "nome_canonico": tb.celula(*produto),
-            "laboratorio": tb.celula(tb.pedaco(linha.get("laboratorio") or "—")),
-            "preco_pago": _celula_preco_pago(linha),
-            "preco_laboratorio": tb.celula(tb.pedaco(moeda(linha["preco_laboratorio"]))),
-            "diferenca": _celula_diferenca(linha["diferenca"]),
-            "quantidade": tb.celula(tb.pedaco(ui.formatar_numero(linha["quantidade"]))),
-            "preco_medio": _celula_preco_medio(linha),
-            "economia": _celula_economia(linha),
+            "laboratorio": tb.celula(tb.pedaco(r.get("laboratorio") or "—")),
+            "data": tb.celula(tb.pedaco(moeda(r["preco_pago"]), dica=dica), tb.pedaco(_data(r["data"]), "aux", dica)),
+            "preco_laboratorio": tb.celula(tb.pedaco(moeda(r["preco_laboratorio"]))),
+            "diferenca": _celula_diferenca(r["diferenca"]),
+            "quantidade": tb.celula(tb.pedaco(_numero(r["quantidade"]))),
+            "economia": tb.celula(economia),
         },
     }
-
-
-def tabela_produtos(
-    key: str, key_ordem: str, registros: list[dict], laboratorio: str, com_loja: bool,
-    acao: str | None = None,
-    vazio: tuple[str, str] = ("Nenhuma oportunidade encontrada", "Tente alterar os filtros"),
-) -> None:
-    """Tabela de produtos (8 colunas) — já ordenada/paginada por quem chama."""
-    tb.tabela(
-        key, colunas_produto(laboratorio), [linha_produto(r, com_loja) for r in registros], ordem_atual(key_ordem),
-        ao_ordenar=lambda coluna: alternar_ordem(key_ordem, coluna.campo, coluna.numerica),
-        acao=acao, vazio=vazio, densa=True,
-    )
 
 
 def texto_markdown(texto: str) -> str:

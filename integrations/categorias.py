@@ -239,7 +239,10 @@ def contagens(session: Session) -> dict:
 def catalogos(armaz: Armazenamento, chaves: Chaves) -> pd.DataFrame:
     """Produtos de todas as lojas vinculadas (um arquivo por empresa, gravado
     pela rotina junto com o estoque), somados por EAN."""
-    quadros = [armaz.ler_df(c) for c in armaz.listar(chaves.prefixo_catalogo()) if c.endswith(".parquet")]
+    # Em paralelo (armaz.ler_varios): um arquivo por empresa, ~140 ms cada
+    # até o Spaces — 388 empresas em sequência passavam de 1 min.
+    arquivos = [c for c in armaz.listar(chaves.prefixo_catalogo()) if c.endswith(".parquet")]
+    quadros = armaz.ler_varios(arquivos, armaz.ler_df)
     quadros = [q for q in quadros if not q.empty]
     if not quadros:
         return pd.DataFrame(columns=categorias.COLUNAS_CATALOGO)
@@ -291,6 +294,40 @@ def sem_classificacao(catalogo: pd.DataFrame, base: pd.DataFrame, so_com_estoque
         "CATEGORIA": "",
     })
     return saida.sort_values(["LOJAS COM VENDA", "LOJAS COM ESTOQUE", "PRODUTO"],
+                             ascending=[False, False, True]).reset_index(drop=True)
+
+
+COLUNAS_RELATORIO_ANALISE = [
+    "EAN", "PRODUTO", "TABELA GRUPPY", "LOJAS QUE COMPRARAM", "VALOR COMPRADO", "SITUACAO", "CATEGORIA",
+]
+
+
+def sem_classificacao_analise(itens_gruppy: pd.DataFrame, compras: pd.DataFrame, base: pd.DataFrame) -> pd.DataFrame:
+    """Sub-aba "Análise de Oportunidade" do relatório (Q35 de 05/10/2026): os
+    EANs das tabelas Gruppy sem categoria. Enquanto ninguém classifica, a
+    Análise compara pelo próprio EAN (não soma com os outros EANs do mesmo
+    genérico). `itens_gruppy`: ean (chave), descricao, laboratorio;
+    `compras`: o resumo por EAN das compras da rede (ean, valor, lojas).
+    Pareto pelas lojas que compraram."""
+    if itens_gruppy.empty:
+        return pd.DataFrame(columns=COLUNAS_RELATORIO_ANALISE)
+    g = (itens_gruppy.dropna(subset=["ean"]).groupby("ean", as_index=False)
+         .agg(descricao=("descricao", "first"), laboratorio=("laboratorio", lambda s: " / ".join(sorted(set(s))))))
+    g = g.merge(base[["ean", "categoria"]], on="ean", how="left")
+    categoria = g["categoria"].astype("object")
+    pendente = categoria.isna() | (categoria == categorias.EM_CLASSIFICACAO)
+    g = g[pendente].merge(compras[["ean", "valor", "lojas"]], on="ean", how="left")
+    saida = pd.DataFrame({
+        "EAN": g["ean"],
+        "PRODUTO": g["descricao"],
+        "TABELA GRUPPY": g["laboratorio"],
+        "LOJAS QUE COMPRARAM": g["lojas"].fillna(0).astype(int),
+        "VALOR COMPRADO": g["valor"].fillna(0).round(2),
+        "SITUACAO": g["categoria"].map(
+            lambda c: "Em classificação na FEBRAFAR" if c == categorias.EM_CLASSIFICACAO else "Não encontrado"),
+        "CATEGORIA": "",
+    })
+    return saida.sort_values(["LOJAS QUE COMPRARAM", "VALOR COMPRADO", "PRODUTO"],
                              ascending=[False, False, True]).reset_index(drop=True)
 
 

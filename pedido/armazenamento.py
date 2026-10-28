@@ -10,9 +10,11 @@ compartilhado com outros sistemas: esta classe só escreve e lê; não apaga.
 """
 from __future__ import annotations
 
+import functools
 import io
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -33,21 +35,42 @@ class Armazenamento:
         """Todas as chaves que começam com `prefixo`, em ordem."""
         raise NotImplementedError
 
+    def apagar(self, chave: str) -> None:
+        """Apaga UMA chave (27/10/2026: só a retenção de 13 meses do histórico de estoque usa, com a chave montada
+        e conferida por ela — o bucket é compartilhado com outros sistemas, nunca apagar por padrão de nome)."""
+        raise NotImplementedError
+
     # -- formatos -------------------------------------------------------------
 
-    def salvar_df(self, chave: str, df: pd.DataFrame) -> None:
+    def salvar_df(self, chave: str, df: pd.DataFrame, linhas_por_grupo: int | None = None) -> None:
+        """`linhas_por_grupo`: blocos menores deixam quem lê com filtro pular
+        os blocos que não interessam (pedido/rede.py)."""
         buffer = io.BytesIO()
-        df.to_parquet(buffer, index=False, compression="zstd")
+        extra = {"row_group_size": linhas_por_grupo} if linhas_por_grupo else {}
+        df.to_parquet(buffer, index=False, compression="zstd", **extra)
         self.salvar(chave, buffer.getvalue())
 
-    def ler_df(self, chave: str) -> pd.DataFrame:
-        return pd.read_parquet(io.BytesIO(self.ler(chave)))
+    def ler_df(self, chave: str, colunas: list[str] | None = None, filtros: list | None = None) -> pd.DataFrame:
+        """`colunas`/`filtros`: lidos do arquivo só o que interessa (ex.: a
+        Análise lê das compras da rede só os EANs do laboratório escolhido)."""
+        return pd.read_parquet(io.BytesIO(self.ler(chave)), columns=colunas, filters=filtros)
 
     def salvar_json(self, chave: str, dado: Any) -> None:
         self.salvar(chave, json.dumps(dado, ensure_ascii=False, indent=1, default=str).encode("utf-8"))
 
     def ler_json(self, chave: str) -> Any:
         return json.loads(self.ler(chave).decode("utf-8"))
+
+    def ler_varios(self, chaves: list[str], ler=None, simultaneas: int = 16) -> list:
+        """Lê muitos arquivos AO MESMO TEMPO, na ordem de `chaves` (`ler` =
+        `self.ler_df`/`self.ler_json`; padrão: bytes). Um arquivo por empresa
+        (catálogos, lojas do GPS) lido em sequência custa ~140 ms cada até
+        NY: 388 empresas ≈ 1 min — em 16 de cada vez, ~4 s (07/10/2026)."""
+        ler = ler or self.ler
+        if len(chaves) <= 1:
+            return [ler(c) for c in chaves]
+        with ThreadPoolExecutor(max_workers=min(simultaneas, len(chaves))) as executor:
+            return list(executor.map(ler, chaves))
 
 
 class ArmazenamentoLocal(Armazenamento):
@@ -89,6 +112,9 @@ class ArmazenamentoLocal(Armazenamento):
         chaves = [p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_file() and not p.name.endswith(".tmp")]
         return sorted(c for c in chaves if c.startswith(prefixo))
 
+    def apagar(self, chave: str) -> None:
+        self._caminho(chave).unlink(missing_ok=True)
+
 
 class ArmazenamentoSpaces(Armazenamento):
     """DigitalOcean Spaces (API S3). O `put_object` é atômico: ou a chave
@@ -128,12 +154,27 @@ class ArmazenamentoSpaces(Armazenamento):
             chaves.extend(o["Key"] for o in pagina.get("Contents", []))
         return sorted(chaves)
 
+    def apagar(self, chave: str) -> None:
+        self.cliente.delete_object(Bucket=self.bucket, Key=chave)
+
+
+@functools.lru_cache(maxsize=4)
+def _spaces(endpoint: str, regiao: str, bucket: str, chave_acesso: str, chave_secreta: str) -> "ArmazenamentoSpaces":
+    return ArmazenamentoSpaces(endpoint, regiao, bucket, chave_acesso, chave_secreta)
+
 
 def do_ambiente() -> Armazenamento:
-    """Spaces se estiver configurado; senão, a pasta local de dev."""
+    """Spaces se estiver configurado; senão, a pasta local de dev.
+
+    O cliente do Spaces é UM por processo (07/10/2026): montar um boto3 novo
+    a cada chamada custava ~440 ms, mais uma conexão TLS nova até NY na 1ª
+    consulta — medido: cliente novo + consulta ~720 ms; o mesmo cliente
+    reaproveitado, 136 ms. O app chama isto em várias telas a cada clique.
+    Cliente boto3 é thread-safe (sessões do Streamlit podem dividir); a
+    chave do cache são as credenciais, então trocar o secrets troca o cliente."""
     from core.config import settings
 
     s = settings.spaces
     if s.configured:
-        return ArmazenamentoSpaces(s.endpoint_url, s.region, s.bucket, s.access_key, s.secret_key)
+        return _spaces(s.endpoint_url, s.region, s.bucket, s.access_key, s.secret_key)
     return ArmazenamentoLocal(settings.local_storage_dir)

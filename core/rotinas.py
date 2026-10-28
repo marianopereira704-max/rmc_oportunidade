@@ -56,6 +56,9 @@ ROTINA_REPROCESSAMENTO_FILA_EAN = "reprocessamento_fila_ean"
 # Genéricos vendidos nas lojas (API do GPS) que faltam na Base Genéricos →
 # fila de EAN "Loja (API)" (integrations/fila_loja.py), uma vez por dia.
 ROTINA_FILA_EAN_LOJA_API = "fila_ean_loja_api"
+# Genéricos COMPRADOS (compras da API, 05/10/2026) fora da Base Genéricos →
+# fila de EAN origem GPS, e o valor da fila regravado (integrations/fila_compras.py).
+ROTINA_FILA_EAN_COMPRAS = "fila_ean_compras"
 # Não é rotina diária: é a trava de "um processamento de planilha GPS por vez"
 # (ver `reivindicar_trava`/`liberar_trava`).
 ROTINA_UPLOAD_GPS = "upload_gps"

@@ -13,7 +13,8 @@ import streamlit as st
 from core import acesso, auth, monitoramento, theme
 from core.config import settings
 from core.db import get_session, init_db
-from views import config_pedido, dados, dashboard, login, loja_barra, oportunidade_loja, oportunidade_produto, pedido
+from views import (cadastro, config_pedido, dados, dashboard_compras, dashboard_estoque, dashboard_ruptura, login,
+                   loja_barra, menu_lateral, oportunidade_loja, popups, oportunidade_produto, pedido)
 
 st.set_page_config(
     page_title=f"{settings.nome_fornecedor} Oportunidades",
@@ -25,6 +26,12 @@ st.set_page_config(
 init_db()
 theme.aplicar_tema()
 
+# Link do e-mail de ativação / "esqueci minha senha" (07/10/2026): a tela de
+# criar senha vem antes de tudo — mesmo com alguém já logado neste navegador.
+if st.query_params.get("token"):
+    login.render_criar_senha(st.query_params["token"])
+    st.stop()
+
 usuario_logado = auth.tentar_restaurar_sessao()
 
 if not usuario_logado:
@@ -34,11 +41,25 @@ if not usuario_logado:
 usuario = auth.usuario_atual()
 
 
-@st.dialog("Aviso de infraestrutura")
+# Vínculo automático das lojas do GPS (Q4 de 08/10/2026), em segundo plano —
+# uma vez por sessão; a trava de 10 min é do processo (views/loja_barra.py).
+if not st.session_state.get("_vinculo_conferido"):
+    st.session_state["_vinculo_conferido"] = True
+    loja_barra.conferir_vinculos_em_segundo_plano()
+
+
+def _aviso_ip_fechado() -> None:
+    st.session_state["ip_streamlit_aviso_fechado"] = True
+
+
+# Fechar pelo X/ESC/clique fora também conta como "visto" (07/10/2026): antes
+# só o botão gravava a marca, e o pop-up reabria a cada clique no sistema.
+@popups.popup("Aviso de infraestrutura", "aviso", on_dismiss=_aviso_ip_fechado)
 def _dialog_aviso_ip_streamlit_cloud() -> None:
     st.write("Os IPs do Streamlit Cloud mudaram — atualize o firewall do servidor.")
-    if st.button("Fechar", type="primary", use_container_width=True):
-        st.session_state["ip_streamlit_aviso_fechado"] = True
+    _, entendi = popups.botoes("Entendi", None, chave="ip_streamlit_aviso")
+    if entendi:
+        _aviso_ip_fechado()
         st.rerun()
 
 
@@ -73,28 +94,40 @@ SECOES = [
     ("oportunidade_loja", "Por Loja", ":material/storefront:", "Análise de Oportunidade", oportunidade_loja.render, False),
     ("oportunidade_produto", "Por Produto", ":material/inventory_2:", "Análise de Oportunidade", oportunidade_produto.render, False),
     ("pedido", "Assistente de pedido", ":material/shopping_cart:", "Gestão", pedido.render, False),
-    ("dashboard", "Dashboard", ":material/dashboard:", "Gestão", dashboard.render, False),
+    # O Dashboard é um item PAI recolhível (MENU_PAIS) com três telas filhas
+    # (core/acesso.py::SECOES_DO_PAINEL); o ícone das filhas não aparece.
+    ("dashboard_estoque", "Estoque", ":material/inventory:", "Gestão", dashboard_estoque.render, False),
+    ("dashboard_ruptura", "Ruptura", ":material/dashboard:", "Gestão", dashboard_ruptura.render, False),
+    ("dashboard_compras", "Compras", ":material/shopping_bag:", "Gestão", dashboard_compras.render, False),
     ("dados", "Dados", ":material/folder:", "Administração", dados.render, True),  # só admin
     ("config_pedido", "Configurações de Pedidos", ":material/tune:", "Administração", config_pedido.render, True),
+    # Cadastro: ADM e Consultor (core/acesso.py) — o Consultor vê a
+    # Administração só com ele.
+    ("cadastro", "Cadastro", ":material/group:", "Administração", cadastro.render, False),
 ]
+
+# Itens recolhíveis da barra lateral: painel → (rótulo, ícone). As telas filhas
+# estão em SECOES e em `acesso.SECOES_DO_PAINEL`.
+MENU_PAIS = {"dashboard": ("Dashboard", ":material/dashboard:")}
 
 # Quem vê o quê: core/acesso.py (níveis ADM, Consultor, Comprador,
 # Proprietário). A última coluna de SECOES continua dizendo o que é da
 # Administração, pra leitura; a regra que vale é `acesso.pode_ver`.
 _nivel = usuario["nivel"]
+_paineis = usuario["paineis"]   # usuário de loja: só os painéis atribuídos (Cadastro)
 _ROTULO_NIVEL = {acesso.ADM: "Admin", acesso.CONSULTOR: "Consultor", acesso.COMPRADOR: "Comprador",
                  acesso.PROPRIETARIO: "Proprietário"}
 
 if "secao_ativa" not in st.session_state:
-    st.session_state["secao_ativa"] = acesso.secao_inicial(_nivel)
+    st.session_state["secao_ativa"] = acesso.secao_inicial(_nivel, _paineis)
 
 # Trava de acesso: nunca renderizar uma seção admin-only pra quem não é admin
 # — cobre tanto alguém digitando/injetando a chave quanto o caso real: um
 # admin estava na aba Dados, deu logout, um consultor logou na mesma sessão
 # do navegador, e sem essa checagem a última seção ativa (herdada do usuário
 # anterior) continuava sendo renderizada mesmo sem o botão dela na sidebar.
-if not acesso.pode_ver(_nivel, st.session_state["secao_ativa"]):
-    st.session_state["secao_ativa"] = acesso.secao_inicial(_nivel)
+if not acesso.pode_ver(_nivel, st.session_state["secao_ativa"], _paineis):
+    st.session_state["secao_ativa"] = acesso.secao_inicial(_nivel, _paineis)
 
 with st.sidebar:
     theme.marca_sidebar(
@@ -104,13 +137,27 @@ with st.sidebar:
     loja_barra.barra(usuario)
 
     _ultimo_grupo = None
+    _pais_desenhados = set()
     for chave, rotulo, icone, grupo, _fn, _admin in SECOES:
-        if not acesso.pode_ver(_nivel, chave):
+        if not acesso.pode_ver(_nivel, chave, _paineis):
             continue
         if grupo != _ultimo_grupo:
             theme.nav_grupo_label(grupo, divisoria=True)   # o grupo LOJA vem antes de todos
             _ultimo_grupo = grupo
         ativa = st.session_state["secao_ativa"] == chave
+        pai = acesso.PAINEL_DA_SECAO.get(chave)
+        if pai:
+            # Tela filha de um item recolhível: o pai aparece uma vez, antes da
+            # primeira filha; as filhas só aparecem com o menu aberto.
+            filhas_ativa = acesso.PAINEL_DA_SECAO.get(st.session_state["secao_ativa"]) == pai
+            aberto = menu_lateral.esta_aberto(pai, filhas_ativa)
+            if pai not in _pais_desenhados:
+                menu_lateral.botao_pai(pai, MENU_PAIS[pai][0], MENU_PAIS[pai][1], aberto, filhas_ativa)
+                _pais_desenhados.add(pai)
+            if aberto and menu_lateral.botao_filha(chave, rotulo, ativa):
+                st.session_state["secao_ativa"] = chave
+                st.rerun()
+            continue
         with st.container():
             st.markdown(f'<div class="nav-marker{"-ativo" if ativa else ""}"></div>', unsafe_allow_html=True)
             if st.button(rotulo, key=f"nav_{chave}", icon=icone, use_container_width=True):
@@ -126,4 +173,9 @@ with st.sidebar:
     loja_barra.atualizacao(loja_barra.escolha(usuario))
 
 _secoes_por_chave = {chave: fn for chave, _r, _i, _g, fn, _a in SECOES}
-_secoes_por_chave[st.session_state["secao_ativa"]]()
+if st.session_state["secao_ativa"] is None:
+    # Usuário de loja sem nenhum painel (não deveria acontecer: o Cadastro
+    # exige ao menos um) — melhor um aviso que uma tela que ele não pode ver.
+    st.info("Nenhum painel liberado para o seu usuário. Peça a quem fez o seu cadastro para atribuir os painéis.")
+else:
+    _secoes_por_chave[st.session_state["secao_ativa"]]()

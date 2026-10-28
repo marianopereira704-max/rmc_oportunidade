@@ -18,6 +18,9 @@ COLUNAS_VENDAS = ["data", "codigo_loja", "codigo_produto", "quantidade", "fracao
 COLUNAS_COMPRAS = [
     "data", "codigo_loja", "codigo_produto", "ean", "quantidade", "fracao", "vlr_unitario", "vlr_desconto",
     "vlr_total_liquido", "nro_nf", "fornecedor", "laboratorio",
+    # Nome do produto (05/10/2026): a fila de EAN das compras precisa da
+    # descrição pra sugerir o genérico. Arquivos antigos não têm (fica vazio).
+    "nome",
 ]
 COLUNAS_ESTOQUE = [
     "codigo_loja", "codigo_produto", "ean", "nome", "grupo", "categoria_gps", "laboratorio", "principio_ativo",
@@ -88,6 +91,7 @@ def compras(registros: list[dict]) -> pd.DataFrame:
             "nro_nf": _texto(r.get("NroNF")),
             "fornecedor": _texto(r.get("NomeRazaoSocialFornecedor")),
             "laboratorio": _texto(r.get("ProdutoRelacionado_NomeLaboratorio")),
+            "nome": _texto(r.get("ProdutoRelacionado_NomeProduto")),
         }
         for r in registros
         if _texto(r.get("TipoCompra")) == _TIPO_COMPRA

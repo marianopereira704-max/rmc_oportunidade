@@ -20,12 +20,15 @@ from __future__ import annotations
 
 import datetime as dt
 import html
+import logging
+import threading
+import time
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
 
 import streamlit as st
 
-from core import acesso
+from core import acesso, dicas
 from core.config import settings
 from core.db import get_session
 
@@ -51,6 +54,46 @@ def _lojas() -> list[dict]:
         return pedido_tela.lojas(session)
 
 
+# Vínculo automático das lojas do GPS (Q4 de 08/10/2026): a rotina grava as
+# lojas de empresas novas, e sem vínculo a loja não aparece no Assistente até
+# alguém clicar em "Atualizar vínculos". Confere em SEGUNDO PLANO (ler as
+# lojas de ~400 empresas leva alguns segundos — ninguém espera), no máximo a
+# cada 10 min no PROCESSO (aqui, e não no app.py: o app.py roda de novo a
+# cada clique e zeraria a trava), e só recalcula se houver empresa nova.
+_VINCULO_INTERVALO_S = 600
+_vinculo_trava = threading.Lock()
+_vinculo_ultimo = [0.0]
+
+
+def _conferir_vinculos() -> None:
+    from integrations import gps_vinculo
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    try:
+        with get_session() as session:
+            r = gps_vinculo.recalcular_se_houver_novas(session, do_ambiente(), Chaves(settings.pedido.prefixo))
+        if r is not None:
+            limpar_cache()
+            logging.getLogger(__name__).info("Vínculos GPS recalculados: %s automáticos, %s a confirmar",
+                                             r.automaticos, r.a_confirmar)
+    except Exception:  # noqa: BLE001 — automático e em segundo plano: nunca derruba a tela
+        logging.getLogger(__name__).warning("Falha no vínculo automático das lojas GPS", exc_info=True)
+
+
+def conferir_vinculos_em_segundo_plano() -> None:
+    with _vinculo_trava:
+        if time.monotonic() - _vinculo_ultimo[0] <= _VINCULO_INTERVALO_S:
+            return
+        _vinculo_ultimo[0] = time.monotonic()
+    threading.Thread(target=_conferir_vinculos, daemon=True, name="vinculo-gps").start()
+
+
+def limpar_cache() -> None:
+    """Depois de um vínculo novo (app.py): a loja passa a ter `empresa_gps`."""
+    _lojas.clear()
+
+
 def lojas_do_usuario(usuario: dict) -> list[dict]:
     return acesso.filtrar_lojas(_lojas(), usuario["nivel"], usuario["lojas"])
 
@@ -65,7 +108,8 @@ def rotulo(l: dict) -> str:
 
 def _dica(l: dict) -> str:
     local = "/".join(x for x in (l.get("cidade"), l.get("uf")) if x)
-    return f"{(l.get('razao_social') or '').strip()} — {local}" + (f" · cód. {l['legacy_id']}" if l.get("legacy_id") else "")
+    razao = (l.get("razao_social") or "").strip()
+    return dicas.dica(razao, local + (f"\nCódigo: {l['legacy_id']}" if l.get("legacy_id") else ""))
 
 
 def escolha(usuario: dict) -> Escolha:
@@ -94,7 +138,7 @@ def barra(usuario: dict) -> None:
         return
     if len(lojas) == 1 and todas is None:
         # Uma loja só: texto fixo (uma lista com uma opção é clique à toa).
-        st.markdown(f'<div class="rmc-loja-fixa" title="{html.escape(_dica(lojas[0]))}">'
+        st.markdown(f'<div class="rmc-loja-fixa dica-abaixo" data-dica="{dicas.atributo(_dica(lojas[0]))}">'
                     f'{html.escape(rotulo(lojas[0]))}</div>', unsafe_allow_html=True)
         return
     opcoes = ([TODAS] if todas else []) + list(por_id)
@@ -181,11 +225,14 @@ def _gps(empresa: str | None) -> str | None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _analise() -> str | None:
-    from core.queries import listar_ultimos_ano_meses
-    from views.analise_comum import rotulo_meses
+    """Último mês fechado com compras da rede (a fonte da Análise desde
+    05/10/2026 — core/analise_api.py); antes era o último mês da planilha."""
+    from views.analise_comum import meses_api, rotulo_meses
 
-    with get_session() as session:
-        meses = listar_ultimos_ano_meses(session, 1)
+    try:
+        meses = meses_api(1)
+    except Exception:  # noqa: BLE001 — Spaces fora do ar: a linha some
+        return None
     return f"até {rotulo_meses(meses)}" if meses else None
 
 

@@ -75,12 +75,16 @@ def test_reprocessar_nao_resolve_loja_api_e_recalculo_nao_zera(session):
     r = motor.reprocessar_fila_resolucao(session)
     item = session.query(FilaResolucaoEAN).filter_by(ean="111").one()
     assert r.resolvidos_automaticamente == 0 and item.status == StatusFila.PENDENTE and item.sugestao_base_generico_id
-    motor.recalcular_valores_fila_ean(session)
+    # O valor das compras (integrations/fila_compras.py, 05/10/2026) não
+    # mexe no "Loja (API)"; o item GPS sem compra no período vai a zero.
+    from integrations import fila_compras
+
+    fila_compras.atualizar(session, pd.DataFrame(columns=["ean", "nome", "valor", "compras", "lojas"]), BASE)
     session.refresh(item)
     assert float(item.valor_total_acumulado) == 150                        # valor vendido fica
     gps = session.query(FilaResolucaoEAN).filter_by(ean="555").one()
     session.refresh(gps)
-    assert float(gps.valor_total_acumulado) == 0                           # GPS sem compra vigente: recalculado
+    assert float(gps.valor_total_acumulado) == 0                           # GPS sem compra no período
 
 
 def test_confirmar_item_loja_api_liga_o_ean_ao_generico(session):

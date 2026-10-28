@@ -10,10 +10,10 @@ O que os testes travam, em ordem de importância:
 1. **Custo.** O número de instruções enviadas ao banco não pode crescer com o
    número de lojas. É o bug que estamos corrigindo; sem esse teste ele volta
    na primeira refatoração distraída.
-2. **`grupo_economico` não pode ser apagado.** Ele é preenchido por outra
-   decisão, não por esta origem. Um `SET` que incluísse essa coluna apagaria,
-   a cada sincronização, um dado que não é dela — e ninguém perceberia, porque
-   a sincronização continuaria dizendo "sucesso".
+2. **Loja da rede e grupo econômico (07/10/2026).** Só status "Ativo" é da
+   rede; quem sai fica marcado (`na_rede` False), nunca apagado; resposta sem
+   nenhuma loja "Ativo" não mexe em nada. O grupo econômico passou a vir
+   desta origem (sigla `acronym_economic_group`).
 3. **O comportamento antigo, campo a campo.** A reescrita é de desempenho; o
    resultado gravado tem que ser idêntico ao do laço anterior.
 4. **CNPJ repetido no mesmo lote.** O laço antigo aguentava naturalmente (a
@@ -75,6 +75,7 @@ def _loja_api(cnpj: str, nome: str = "DROGARIA TESTE", uf: str = "MG", cidade: s
         "cnpj": cnpj,
         "businessName": nome,
         "active": True,
+        "status_title": "Ativo",
         "address": {"state": uf, "city": cidade},
         "team": [],
     }
@@ -101,7 +102,9 @@ def test_numero_de_instrucoes_nao_cresce_com_a_quantidade_de_lojas(banco, monkey
 
     selects = [i for i in banco.instrucoes if i == "SELECT"]
     inserts = [i for i in banco.instrucoes if i == "INSERT"]
-    assert len(selects) == 0, f"nenhuma consulta por loja deveria sobrar, vieram {len(selects)}"
+    # Desde 07/10/2026 a sincronização confere os acessos dos usuários de loja
+    # (integrations/usuarios.py::ajustar_acessos): consultas FIXAS, nunca uma por loja.
+    assert len(selects) <= 3, f"nenhuma consulta por loja deveria sobrar, vieram {len(selects)}"
     assert len(inserts) <= 2, f"200 lojas deveriam caber em 1 bloco, vieram {len(inserts)} instruções"
 
 
@@ -118,25 +121,55 @@ def test_mil_lojas_continuam_em_poucas_instrucoes(banco, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# 2. grupo_economico não pode ser apagado
+# 2. Loja da rede e grupo econômico (07/10/2026)
 # ---------------------------------------------------------------------------
 
-def test_sincronizar_nao_apaga_grupo_economico_ja_preenchido(banco, monkeypatch):
-    """`grupo_economico` vem de outra decisão, não desta origem. Se entrasse na
-    lista de colunas atualizadas, cada sincronização o zeraria em silêncio."""
+def test_grupo_economico_vem_da_sigla_e_e_atualizado(banco, monkeypatch):
     with Session(banco) as sessao:
-        sessao.add(Loja(
-            cnpj="123", razao_social="ANTIGA", uf="MG", cidade="BH",
-            grupo_economico="REDE ALFA", fonte="sistema_interno",
-        ))
+        sessao.add(Loja(cnpj="123", razao_social="ANTIGA", uf="MG", cidade="BH", grupo_economico="REDE ALFA",
+                        fonte="sistema_interno"))
         sessao.commit()
 
-    _sincronizar(banco, [_loja_api("123", nome="NOVA RAZAO SOCIAL")], monkeypatch)
+    _sincronizar(banco, [_loja_api("123", nome="NOVA", acronym_economic_group="GE787"),
+                         _loja_api("456", acronym_economic_group=None)], monkeypatch)
 
     with Session(banco) as sessao:
-        loja = sessao.query(Loja).filter_by(cnpj="123").one()
-        assert loja.grupo_economico == "REDE ALFA", "a sincronização apagou um dado que não é dela"
-        assert loja.razao_social == "NOVA RAZAO SOCIAL", "o que É desta origem tem que atualizar"
+        assert sessao.query(Loja).filter_by(cnpj="123").one().grupo_economico == "GE787"
+        assert sessao.query(Loja).filter_by(cnpj="456").one().grupo_economico is None
+
+
+def test_so_status_ativo_e_da_rede_e_quem_sai_fica_marcado(banco, monkeypatch):
+    """O `active` do sistema interno também vale pra cadastros do Portal do PBM
+    e Institucional — 813 "ativas", 594 da rede (07/10/2026)."""
+    with Session(banco) as sessao:
+        sessao.add(Loja(cnpj="999", razao_social="SAIU DA REDE", uf="MG", cidade="BH", fonte="sistema_interno"))
+        sessao.commit()
+
+    resultado = _sincronizar(banco, [
+        _loja_api("111", nome="DA REDE"),
+        _loja_api("222", nome="PBM", status_title="Portal do PBM"),
+        _loja_api("333", nome="INSTITUCIONAL", status_title="Institucional"),
+    ], monkeypatch)
+
+    with Session(banco) as sessao:
+        lojas = {l.cnpj: l.na_rede for l in sessao.query(Loja).all()}
+    assert lojas == {"111": True, "999": False}          # PBM/Institucional nem entram; a antiga sai
+    assert "1 lojas da rede" in resultado.mensagem and "1 loja(s) saíram da rede" in resultado.mensagem
+
+    # Voltou pra rede: volta a ficar True.
+    _sincronizar(banco, [_loja_api("111"), _loja_api("999")], monkeypatch)
+    with Session(banco) as sessao:
+        assert {l.cnpj: l.na_rede for l in sessao.query(Loja).all()} == {"111": True, "999": True}
+
+
+def test_resposta_sem_nenhuma_loja_ativa_nao_mexe_em_nada(banco, monkeypatch):
+    with Session(banco) as sessao:
+        sessao.add(Loja(cnpj="111", razao_social="X", uf="MG", cidade="BH", fonte="sistema_interno", na_rede=True))
+        sessao.commit()
+    with pytest.raises(RuntimeError, match="nada foi alterado"):
+        _sincronizar(banco, [_loja_api("222", status_title="Portal do PBM")], monkeypatch)
+    with Session(banco) as sessao:
+        assert sessao.query(Loja).one().na_rede is True
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +197,8 @@ def test_insere_loja_nova_com_todos_os_campos_da_origem(banco, monkeypatch):
         assert loja.consultor_farma == "Bruno"
         assert loja.atendente_comercial == "Carla"
         assert loja.fonte == "sistema_interno"
-        assert loja.grupo_economico is None, "nunca inventar grupo econômico"
+        assert loja.grupo_economico is None, "sem sigla na origem, sem grupo"
+        assert loja.na_rede is True
         assert isinstance(loja.atualizado_em, dt.datetime)
 
 
@@ -193,7 +227,7 @@ def test_registros_inativos_sao_ignorados(banco, monkeypatch):
 
     with Session(banco) as sessao:
         assert [l.cnpj for l in sessao.query(Loja).all()] == ["111"]
-    assert "1 lojas ativas" in resultado.mensagem
+    assert "1 lojas da rede" in resultado.mensagem
     assert "de 3 recebidas" in resultado.mensagem
 
 
@@ -256,3 +290,27 @@ def test_sem_credenciais_nao_chama_a_api_nem_escreve(banco, monkeypatch):
 
     assert resultado.status == StatusIntegracao.INDISPONIVEL
     assert resultado.registros_processados == 0
+
+
+# ---------------------------------------------------------------------------
+# Listas das telas: só lojas da rede; rótulo do grupo econômico
+# ---------------------------------------------------------------------------
+
+def test_listas_so_da_rede_e_rotulo_do_grupo(banco):
+    from core import queries
+
+    with Session(banco) as sessao:
+        sessao.add_all([
+            Loja(cnpj="1", razao_social="DROGARIA NOVA NACIONAL LTDA", uf="ES", cidade="X", legacy_id=787,
+                 grupo_economico="GE787", na_rede=True),
+            Loja(cnpj="2", razao_social="DROGARIAS REIS F2 LTDA", uf="ES", cidade="X", legacy_id=789,
+                 grupo_economico="GE787", na_rede=True),
+            Loja(cnpj="3", razao_social="SO UMA", uf="MG", cidade="Y", legacy_id=60, grupo_economico="GE60"),
+            Loja(cnpj="4", razao_social="FORA", uf="SP", cidade="Z", legacy_id=5, grupo_economico="GE5", na_rede=False),
+        ])
+        sessao.commit()
+        assert [l["cnpj"] for l in queries.lista_lojas(sessao)] == ["1", "2", "3"]   # vazio conta como da rede
+        assert queries.lista_ufs(sessao) == ["ES", "MG"]
+        assert queries.lista_grupos_economicos(sessao) == ["GE60", "GE787"]
+        assert queries.rotulos_grupos(sessao) == {"GE60": "GE60 · SO UMA", "GE787": "GE787 · DROGARIA NOVA NACIONAL LTDA"}
+

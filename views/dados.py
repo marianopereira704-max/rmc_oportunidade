@@ -4,14 +4,16 @@ Quatro responsabilidades:
 1. Painel de status das 3 integrações.
 2. Explorador de Arquivos estilo Windows sobre o DigitalOcean Spaces (criar
    pasta, mover, renomear, inativar/reativar — nunca excluir de verdade).
-3. Importação manual das planilhas de Gruppy (ofertas) e GPS (compras),
-   enquanto essas duas integrações não tiverem API.
-4. Filas de pendência que o motor de reconciliação e a ingestão do GPS geram
-   (EAN não resolvido, CNPJ órfão) — nunca descartadas silenciosamente.
+3. Importação manual das planilhas da Gruppy (preços), Base Genéricos e
+   categorias. As compras vêm da API do GPS pela rotina diária desde
+   05/10/2026 — o envio da planilha do GPS e a fila de CNPJ órfão saíram.
+4. Filas de pendência (EAN não resolvido, vínculo de lojas GPS, Sem
+   Classificação) — nunca descartadas silenciosamente.
 """
 from __future__ import annotations
 
 import datetime as dt
+import html
 import logging
 
 import pandas as pd
@@ -19,44 +21,44 @@ import streamlit as st
 from sqlalchemy import func, select
 
 from core import auth, rotinas, theme, ui
+from pedido import vinculo as vinculo_rotina
 from core.config import settings
 from core.db import get_session
 from core.models import (
     BaseGenerico,
-    FilaCnpjOrfao,
     FilaResolucaoEAN,
     ItemTabelaGruppy,
     Loja,
+    loja_da_rede,
     ModoCustoGruppy,
     OrigemFila,
-    RegistroCompraGPS,
     StatusFila,
     TabelaGruppy,
     TipoNode,
-    UploadGPS,
 )
 from integrations import base_genericos as base_genericos_integ
-from integrations import gps as gps_integ
-from integrations import gps_processamento
 from integrations import gruppy as gruppy_integ
 from integrations import mapeamento as mapeamento_integ
 from integrations import sistema_interno as loja_integ
 from integrations.base import StatusIntegracao
-from integrations.planilha_navegador import ler_rodape
 from reconciliation import motor as reconciliation_motor
 from storage import filesystem as fs
 from views import analise_comum
 from views import pedido as pedido_view
 from views import leitor_planilha as leitor
+from views import popups
 
 logger = logging.getLogger(__name__)
 
 _SEM_SELECAO = "— selecione —"
 
-_LEITOR_GPS = "gps_leitor"
+
 _LEITOR_GRUPPY = "gruppy_leitor"
 _LEITOR_BASE = "base_genericos_leitor"
 _LEITOR_CATEGORIAS = "categorias_leitor"
+_LEITOR_CODIGOS_GPS = "codigos_gps_leitor"
+_SITUACAO_ROTULO = {"AUTOMATICO": "automático", "CONFIRMADO": "confirmado", "CONFIRMAR": "para confirmar",
+                    "NAO_CLIENTE": "não é cliente", "SEM_CANDIDATO": "sem loja parecida"}
 _LEITOR_CATEGORIAS_PENDENCIAS = "categorias_pendencias_leitor"
 
 
@@ -68,13 +70,6 @@ _ROTULOS_CAMPOS_GRUPPY = {
     "desconto": "Desconto (%)",
 }
 
-_ROTULOS_CAMPOS_GPS = {
-    "cnpj": "CNPJ da loja",
-    "ean": "EAN",
-    "descricao": "Descrição",
-    "quantidade": "Quantidade comprada (ex: Quantidade)",
-    "custo_unitario": "Valor unitário sem ST (ex: VlrUnitario)",
-}
 
 _STATUS_BADGE = {
     StatusIntegracao.DISPONIVEL: ("sucesso", "API disponível"),
@@ -82,22 +77,18 @@ _STATUS_BADGE = {
     StatusIntegracao.INDISPONIVEL: ("sugestao", "Indisponível"),
 }
 
-_MESES = {
-    "01": "Janeiro", "02": "Fevereiro", "03": "Março", "04": "Abril",
-    "05": "Maio", "06": "Junho", "07": "Julho", "08": "Agosto",
-    "09": "Setembro", "10": "Outubro", "11": "Novembro", "12": "Dezembro",
-}
-
 
 def _painel_integracoes() -> None:
     st.markdown("#### Status das integrações")
-    adapters = [loja_integ.SistemaInternoLojasAdapter(), gruppy_integ.GruppyAdapter(), gps_integ.GpsAdapter()]
+    adapters = [loja_integ.SistemaInternoLojasAdapter(), gruppy_integ.GruppyAdapter()]
+    cartoes = [(a.nome, *_STATUS_BADGE[a.status()]) for a in adapters]
+    # Compras desde 05/10/2026: API do GPS, pela rotina da madrugada (Rotinas).
+    cartoes.append(("Compras das Lojas (GPS)", "sucesso", "API (rotina diária)"))
     cols = st.columns(3)
-    for col, adapter in zip(cols, adapters):
-        tipo, texto = _STATUS_BADGE[adapter.status()]
+    for col, (nome, tipo, texto) in zip(cols, cartoes):
         with col:
             st.markdown(
-                f"""<div class="rmc-kpi"><div class="label">{adapter.nome}</div>
+                f"""<div class="rmc-kpi"><div class="label">{nome}</div>
                 {theme.badge(texto, tipo)}</div>""",
                 unsafe_allow_html=True,
             )
@@ -149,7 +140,7 @@ def _purgar_arquivo_fisico(storage_key: str | None) -> str | None:
         )
 
 
-@st.dialog("Excluir definitivamente — Gruppy", width="large")
+@popups.popup("Excluir definitivamente — Gruppy", "aviso")
 def _dialog_excluir_tabela_gruppy(nome_arquivo: str, fs_node_id: int, tabela_id: int, laboratorio: str) -> None:
     with get_session() as session:
         qtd_itens = session.execute(
@@ -165,48 +156,15 @@ def _dialog_excluir_tabela_gruppy(nome_arquivo: str, fs_node_id: int, tabela_id:
     confirmar = st.checkbox(
         "Sim, entendi — quero excluir definitivamente esta tabela.", key=f"confirma_exclusao_gruppy_{fs_node_id}",
     )
-    if confirmar and st.button(
-        "Excluir definitivamente", type="primary", key=f"exec_exclusao_gruppy_{fs_node_id}", use_container_width=True,
-    ):
+    cancelar, excluir = popups.botoes("Excluir definitivamente", chave=f"exclusao_gruppy_{fs_node_id}",
+                                      destrutivo=True, desabilitado=not confirmar)
+    if cancelar:
+        st.rerun()
+    if excluir and confirmar:
         with get_session() as session:
             resultado = gruppy_integ.excluir_tabela_gruppy_definitivamente(session, fs_node_id)
         aviso_purga = _purgar_arquivo_fisico(resultado.storage_key)
         st.session_state["explorador_exclusao_resultado"] = resultado
-        if aviso_purga:
-            st.session_state["explorador_exclusao_aviso_purga"] = aviso_purga
-        st.rerun()
-
-
-@st.dialog("Excluir definitivamente — GPS", width="large")
-def _dialog_excluir_upload_gps(nome_arquivo: str, fs_node_id: int, ano_mes: str) -> None:
-    with get_session() as session:
-        qtd_registros = session.execute(
-            select(func.count()).select_from(RegistroCompraGPS)
-            .where(RegistroCompraGPS.upload_fs_node_id == fs_node_id)
-        ).scalar_one()
-
-    st.warning(
-        f"Isso apaga DE VERDADE (não é inativar — não dá pra desfazer) o upload GPS de "
-        f"**{ano_mes}**, do arquivo **{nome_arquivo}**: **{qtd_registros} registro(s)** de "
-        "compra serão removidos junto, além do próprio arquivo no Explorador."
-    )
-    confirmar = st.checkbox(
-        "Sim, entendi — quero excluir definitivamente este upload.", key=f"confirma_exclusao_gps_{fs_node_id}",
-    )
-    if confirmar and st.button(
-        "Excluir definitivamente", type="primary", key=f"exec_exclusao_gps_{fs_node_id}", use_container_width=True,
-    ):
-        with get_session() as session:
-            resultado = gps_integ.excluir_upload_gps_definitivamente(session, fs_node_id)
-        # Dois bytes físicos: o .xlsx e o atalho de linhas órfãs gravado ao
-        # lado dele (ver integrations/gps_cache_orfaos.py). Um aviso só é
-        # suficiente — a causa de falha é a mesma (storage fora do ar) e o
-        # desfecho também (arquivo órfão até uma limpeza manual).
-        aviso_purga = (
-            _purgar_arquivo_fisico(resultado.storage_key)
-            or _purgar_arquivo_fisico(resultado.storage_key_orfaos)
-        )
-        st.session_state["explorador_exclusao_gps_resultado"] = resultado
         if aviso_purga:
             st.session_state["explorador_exclusao_aviso_purga"] = aviso_purga
         st.rerun()
@@ -244,10 +202,11 @@ def _explorador() -> None:
     usuario = auth.usuario_atual()
     pasta_id = _pasta_atual_id()
     _explicacao(
-        "todos os arquivos enviados ao sistema (planilhas GPS, Gruppy, Base Genéricos, categorias), em pastas.",
+        "todos os arquivos enviados ao sistema (Gruppy, Base Genéricos, categorias e as planilhas do GPS "
+        "de antes da API), em pastas.",
         "cada envio das outras sub-abas guarda o arquivo original aqui, sozinho.",
-        "\"Inativar\" só esconde (vai para _Inativos). \"Excluir definitivamente\" apaga o arquivo e desfaz o "
-        "envio (as compras ou preços que vieram dele).",
+        "\"Inativar\" só esconde (vai para _Inativos). Na tabela Gruppy, \"Excluir definitivamente\" apaga o "
+        "arquivo e os preços que vieram dele.",
     )
 
     if "explorador_exclusao_resultado" in st.session_state:
@@ -255,12 +214,6 @@ def _explorador() -> None:
         st.success(
             f"Tabela Gruppy \"{r.laboratorio}\" excluída definitivamente — "
             f"{r.itens_removidos} item(ns) de preço removidos."
-        )
-    if "explorador_exclusao_gps_resultado" in st.session_state:
-        r = st.session_state.pop("explorador_exclusao_gps_resultado")
-        st.success(
-            f"Upload GPS \"{r.ano_mes}\" excluído definitivamente — "
-            f"{r.registros_removidos} registro(s) de compra removidos."
         )
     if "explorador_exclusao_aviso_purga" in st.session_state:
         st.warning(st.session_state.pop("explorador_exclusao_aviso_purga"))
@@ -301,17 +254,13 @@ def _explorador() -> None:
         pastas_para_mover = fs.listar_todas_pastas(session)
         opcoes_mover = {fs.caminho_texto(session, p): p.id for p in pastas_para_mover}
         # "Excluir definitivamente" existe pra arquivo Gruppy (elo via
-        # TabelaGruppy.upload_fs_node_id) e GPS (elo via UploadGPS.fs_node_id)
-        # — Base Genéricos não tem esse vínculo, nunca entra aqui.
+        # TabelaGruppy.upload_fs_node_id). As planilhas GPS antigas ficam como
+        # histórico (05/10/2026): as compras delas saem pelo script de limpeza.
         tabelas_gruppy_por_fs_node = {
             t.upload_fs_node_id: (t.id, t.laboratorio)
             for t in session.execute(
                 select(TabelaGruppy).where(TabelaGruppy.upload_fs_node_id.is_not(None))
             ).scalars().all()
-        }
-        uploads_gps_por_fs_node = {
-            u.fs_node_id: u.ano_mes
-            for u in session.execute(select(UploadGPS)).scalars().all()
         }
 
     if not itens:
@@ -373,12 +322,6 @@ def _explorador() -> None:
                 if st.button("Excluir definitivamente", key=f"excluir_def_{item.id}", use_container_width=True):
                     _dialog_excluir_tabela_gruppy(item.nome, item.id, tabela_id, laboratorio)
 
-            if item.tipo == TipoNode.ARQUIVO and item.id in uploads_gps_por_fs_node:
-                ano_mes = uploads_gps_por_fs_node[item.id]
-                st.divider()
-                if st.button("Excluir definitivamente", key=f"excluir_def_gps_{item.id}", use_container_width=True):
-                    _dialog_excluir_upload_gps(item.nome, item.id, ano_mes)
-
 
 # ---------------------------------------------------------------------------
 # Importar Planilhas
@@ -410,13 +353,16 @@ def _selecionar_mapeamento(
     return mapa_escolhido
 
 
-@st.dialog("Confirmar mapeamento de colunas — Gruppy", width="large")
+@popups.popup("Confirmar mapeamento de colunas — Gruppy", "longo")
 def _dialog_mapeamento_gruppy(
     usuario: dict, laboratorio: str, ufs: list[str], modo_custo: ModoCustoGruppy,
 ) -> None:
     recebida = leitor.planilha_recebida(_LEITOR_GRUPPY)
     if recebida is None:
         st.info("Selecione a planilha de novo.")
+        # Formulário longo não tem X (Q14): a saída é este botão.
+        if popups.botoes(None, "Fechar", chave="map_gruppy_sem_planilha")[0]:
+            st.rerun()
         return
     df_preview = recebida.df
     colunas_planilha = [str(c) for c in df_preview.columns]
@@ -436,11 +382,12 @@ def _dialog_mapeamento_gruppy(
 
     completo = len(mapa_escolhido) == len(campos)
     if not completo:
-        st.caption("Selecione uma coluna para todo campo obrigatório antes de confirmar.")
-
-    if completo and st.button(
-        "Confirmar e processar", key="map_gruppy_confirmar", type="primary", use_container_width=True
-    ):
+        st.caption("Selecione uma coluna para todo campo obrigatório antes de processar.")
+    aviso = st.empty()   # erro acima do rodapé (que fica preso embaixo)
+    cancelar, processar = popups.botoes("Processar tabela", chave="map_gruppy", desabilitado=not completo)
+    if cancelar:
+        st.rerun()
+    if processar and completo:
         try:
             with st.spinner("Processando a tabela..."):
                 with get_session() as session:
@@ -455,95 +402,8 @@ def _dialog_mapeamento_gruppy(
             st.session_state["gruppy_upload_sucesso"] = resultado.mensagem
             st.rerun()
         except Exception as exc:
-            st.error(f"Erro ao processar planilha: {exc}")
+            aviso.error(f"Erro ao processar planilha: {exc}")
 
-
-def _rotulo_ano_mes(ano_mes: str) -> str:
-    return f"{_MESES.get(ano_mes[5:7], ano_mes[5:7])}/{ano_mes[:4]}"
-
-
-@st.dialog("Confirmar envio — Compras GPS", width="large")
-def _dialog_mapeamento_gps(usuario: dict, ano_mes: str) -> None:
-    recebida = leitor.planilha_recebida(_LEITOR_GPS)
-    if recebida is None:
-        st.info("Selecione a planilha de novo.")
-        return
-    df = recebida.df
-    colunas_planilha = [str(c) for c in df.columns]
-    mapa_automatico = gps_integ.detectar_colunas_automatico(df)
-    campos = gps_integ.CAMPOS_OBRIGATORIOS
-
-    with get_session() as session:
-        sugestao = mapeamento_integ.sugerir_mapeamento(session, OrigemFila.GPS, campos, colunas_planilha, mapa_automatico)
-        uploads_existentes = gps_integ.listar_uploads_gps_no_mes(session, ano_mes)
-
-    # Mês: quem envia informa; o rodapé do BI é só a conferência. Divergência
-    # exige confirmação explícita — com a substituição por CNPJ, o mês errado
-    # sobrescreveria em silêncio os dados bons de outro mês.
-    rodape = ler_rodape(df)
-    mes_confirmado = True
-    if rodape.ano_mes and rodape.ano_mes != ano_mes:
-        st.error(
-            f"**Divergência de mês.** O rodapé do arquivo indica **{_rotulo_ano_mes(rodape.ano_mes)}**, "
-            f"mas o mês escolhido foi **{_rotulo_ano_mes(ano_mes)}**. Se confirmar, as compras dos CNPJs "
-            f"deste arquivo em {_rotulo_ano_mes(ano_mes)} serão substituídas por estas."
-        )
-        mes_confirmado = st.checkbox(
-            f"Confirmo que este arquivo é de {_rotulo_ano_mes(ano_mes)}", key=f"gps_confirma_mes_{ano_mes}",
-        )
-    if rodape.exportacao_cortada:
-        st.warning(
-            "O rodapé do arquivo avisa que a exportação do BI **passou do limite de linhas e foi cortada** "
-            "(\"Exported data exceeded the allowed volume\"). Pode estar faltando compra de alguma loja — "
-            "confira o filtro da exportação. Dá pra continuar mesmo assim."
-        )
-    if uploads_existentes:
-        st.info(
-            f"{_rotulo_ano_mes(ano_mes)} já tem {len(uploads_existentes)} envio(s). Os CNPJs presentes neste "
-            "arquivo terão as compras desse mês **substituídas**; os demais CNPJs continuam como estão."
-        )
-
-    st.caption("Confira qual coluna da planilha corresponde a cada campo antes de processar.")
-    mapa_escolhido = _selecionar_mapeamento(campos, _ROTULOS_CAMPOS_GPS, colunas_planilha, sugestao, "map_gps")
-    if len(mapa_escolhido) != len(campos):
-        st.caption("Selecione uma coluna para todo campo obrigatório antes de confirmar.")
-        return
-
-    # Campos opcionais (laboratório, razão social) não passam pelo popup: vêm
-    # da detecção automática, e o que a pessoa escolheu vence em conflito.
-    mapa = {**mapa_automatico, **mapa_escolhido}
-    try:
-        preparadas = gps_integ.preparar_compras(df, mapa)
-    except Exception as exc:
-        st.error(f"Não consegui interpretar a planilha com esse mapeamento: {exc}")
-        return
-    st.markdown(
-        f"**{len(preparadas.compras):,} compras** de **{len(preparadas.cnpjs_no_arquivo)} CNPJs** "
-        f"serão gravadas em {_rotulo_ano_mes(ano_mes)}. "
-        f"Ignoradas: {preparadas.linhas_sem_compra:,} linhas só de venda, "
-        f"{preparadas.linhas_invalidas} com quantidade ou valor ≤ 0, "
-        f"{preparadas.linhas_sem_chave} sem CNPJ/EAN (rodapé/total).".replace(",", ".")
-    )
-
-    if preparadas.compras.empty:
-        st.error(
-            "Nenhuma compra encontrada com esse mapeamento (linhas com CNPJ, EAN, VlrUnitario e Quantidade). "
-            "Confira se esta é a exportação de compras do GPS — tabela Gruppy e Base Genéricos têm seções próprias."
-        )
-        return
-
-    if st.button(
-        "Confirmar e processar", key="map_gps_confirmar", type="primary", use_container_width=True,
-        disabled=not mes_confirmado,
-    ):
-        with get_session() as session:
-            pasta_id = _subpasta(session, "Compras", "GPS", ano_mes)
-        iniciou, motivo = gps_processamento.iniciar(recebida, preparadas, mapa, ano_mes, pasta_id, usuario["nome"])
-        if not iniciou:
-            st.error(motivo)
-            return
-        leitor.consumir(_LEITOR_GPS)
-        st.rerun()
 
 
 def _importar_gruppy(usuario: dict) -> None:
@@ -617,91 +477,10 @@ def _mostrar_planilha_recebida(chave_leitor: str) -> None:
         st.caption(f"**{recebida.nome}** — {len(recebida.df):,} linhas lidas no seu navegador{tempo}.".replace(",", "."))
 
 
-@st.fragment(run_every=2)
-def _acompanhar_processamento_gps() -> None:
-    """Só existe na tela ENQUANTO há processamento: se refaz sozinho a cada
-    2s (só este trecho, lendo o estado da memória, sem banco). Quando o
-    processamento termina, refaz a página inteira uma vez e some — deixar a
-    atualização periódica ligada o tempo todo faria um arquivo escolhido no
-    meio de uma dessas atualizações parciais ter o evento descartado."""
-    estado = gps_processamento.estado_atual()
-    if estado is None or estado.concluido:
-        st.rerun()
-        return
-    fracao = min(1.0, estado.feito / estado.total) if estado.total else 0.0
-    detalhe = f" — {estado.feito:,}/{estado.total:,}".replace(",", ".") if estado.total > 1 else ""
-    st.progress(
-        fracao,
-        text=f"Processando **{estado.nome_arquivo}** ({_rotulo_ano_mes(estado.ano_mes)}): {estado.fase}{detalhe}",
-    )
-    st.caption("Pode fechar esta aba ou mudar de tela — o processamento continua e o resultado fica registrado aqui.")
 
 
-def _painel_processamento_gps() -> None:
-    estado = gps_processamento.estado_atual()
-    if estado is None or estado.lido_na_tela:
-        return
-    if not estado.concluido:
-        _acompanhar_processamento_gps()
-        return
-    if estado.sucesso:
-        st.success(estado.mensagem)
-    else:
-        st.error(
-            f"O processamento de **{estado.nome_arquivo}** falhou e **nada foi alterado** "
-            f"(os dados anteriores continuam valendo). Erro: {estado.erro}"
-        )
-    if st.button("Ok, entendi", key="gps_resultado_ok"):
-        gps_processamento.marcar_resultado_visto()
-        st.rerun()
 
-
-def _ultimo_envio_gps() -> None:
-    with get_session() as session:
-        controle = rotinas.obter(session, rotinas.ROTINA_UPLOAD_GPS)
-    if controle is None:
-        return
-    if controle.ultimo_sucesso_em is not None:
-        st.caption(
-            f"Último envio concluído: {controle.ultimo_sucesso_em:%d/%m/%Y %H:%M} (UTC) — "
-            f"{controle.ultima_mensagem or ''}"
-        )
-    if controle.ultimo_erro:
-        st.caption(f"Última falha registrada: {controle.ultimo_erro}")
-
-
-def _importar_gps(usuario: dict) -> None:
-    st.markdown("##### Compras das Lojas (GPS)")
-    _explicacao(
-        "o que cada loja comprou no mês (quantidade e valor sem ST) — o \"preço pago\" da Análise de Oportunidade.",
-        "a planilha exportada do BI do GPS, um ou mais arquivos por mês (divididos por atributo de loja).",
-        "envie de novo o mês: o envio **substitui, nesse mês, as compras dos CNPJs presentes no arquivo** — os "
-        "demais continuam. Para desfazer: Explorador de Arquivos → o arquivo → Excluir definitivamente.",
-    )
-
-    _painel_processamento_gps()
-    _ultimo_envio_gps()
-
-    col_mes, col_ano = st.columns(2)
-    with col_mes:
-        mes_label = st.selectbox("Mês de referência", options=list(_MESES.values()), key="gps_mes")
-    with col_ano:
-        ano = st.number_input("Ano", min_value=2020, max_value=2035, value=dt.date.today().year, step=1, key="gps_ano")
-    mes_num = next(k for k, v in _MESES.items() if v == mes_label)
-    ano_mes = f"{int(ano):04d}-{mes_num}"
-
-    leitor.leitor_planilha(_LEITOR_GPS, "Selecionar planilha GPS (.xlsx)")
-    _mostrar_planilha_recebida(_LEITOR_GPS)
-
-    estado = gps_processamento.estado_atual()
-    em_andamento = estado is not None and not estado.concluido
-    if leitor.planilha_recebida(_LEITOR_GPS) is not None and st.button(
-        "Processar planilha GPS", key="gps_processar", disabled=em_andamento,
-    ):
-        _dialog_mapeamento_gps(usuario, ano_mes)
-
-
-@st.dialog("Sincronização automática de lojas falhou", width="large")
+@popups.popup("Sincronização automática de lojas falhou", "aviso")
 def _dialog_falha_sincronizacao_lojas(erro: str) -> None:
     """Falha da API externa vira aviso em pop-up, NUNCA erro no meio da tela:
     a aba continua utilizável e as lojas que já estavam no banco continuam
@@ -712,7 +491,7 @@ def _dialog_falha_sincronizacao_lojas(erro: str) -> None:
         "o que não aconteceu foi a atualização de hoje. Você pode tentar de novo pelo "
         "botão **Forçar sincronização agora**, na aba Importar Planilhas."
     )
-    if st.button("Entendi", key="lojas_falha_fechar", use_container_width=True):
+    if popups.botoes("Entendi", None, chave="lojas_falha")[1]:
         st.rerun()
 
 
@@ -817,16 +596,25 @@ def _fila_ean() -> None:
     usuario = auth.usuario_atual()
     st.markdown("##### Fila de Resolução de EAN")
     _explicacao(
-        "EANs que ainda não estão ligados a um genérico da Base Genéricos — ficam fora da análise e, no Pedido, "
-        "não somam com os outros EANs do mesmo genérico.",
-        "compras do GPS, tabelas da Gruppy e, desde 29/09/2026, genéricos vendidos pelas lojas (\"Loja (API)\", "
-        "conferidos uma vez por dia). Prioridade: dinheiro em jogo (compra; na Loja (API), o vendido).",
+        "genéricos (pela base de categorias) cujo EAN ainda não está ligado a um genérico da Base Genéricos — na "
+        "Análise não somam com os outros EANs do mesmo genérico e, no Pedido, aparecem soltos.",
+        "compras das lojas pela API (origem GPS, conferidas uma vez por dia), tabelas da Gruppy e genéricos "
+        "vendidos pelas lojas (\"Loja (API)\"). Prioridade: dinheiro em jogo (o comprado nos últimos 3 meses "
+        "fechados; na Loja (API), o vendido). Produto que não é genérico não passa por aqui: compara pelo próprio EAN.",
         "confirme a sugestão, vincule a um genérico existente, cadastre um genérico novo ou ignore. Itens "
         "\"Loja (API)\" nunca se resolvem sozinhos: sempre pedem confirmação.",
     )
     if "fila_loja_resultado" in st.session_state:
         st.success(st.session_state.pop("fila_loja_resultado"))
-    if st.button("Conferir agora os genéricos vendidos nas lojas", key="fila_loja_atualizar"):
+    b1, b2 = st.columns(2)
+    if b1.button("Conferir agora os genéricos comprados", key="fila_compras_atualizar", use_container_width=True):
+        with st.spinner("Lendo as compras das lojas..."):
+            try:
+                st.session_state["fila_loja_resultado"] = _atualizar_fila_compras()
+            except Exception as exc:  # noqa: BLE001
+                st.session_state["fila_loja_resultado"] = f"Não foi possível conferir agora: {exc}"
+        st.rerun()
+    if b2.button("Conferir agora os genéricos vendidos nas lojas", key="fila_loja_atualizar", use_container_width=True):
         with st.spinner("Lendo os produtos das lojas..."):
             try:
                 st.session_state["fila_loja_resultado"] = _atualizar_fila_loja()
@@ -837,9 +625,7 @@ def _fila_ean() -> None:
     if "fila_ean_reprocesso_resultado" in st.session_state:
         r = st.session_state.pop("fila_ean_reprocesso_resultado")
         st.success(
-            f"Limpeza de EAN sujo: {r.limpeza.registros_compra_gps_corrigidos} em RegistroCompraGPS "
-            f"({r.limpeza.registros_compra_gps_colisoes_puladas} pulados por colisão), "
-            f"{r.limpeza.itens_tabela_gruppy_corrigidos} em ItemTabelaGruppy, "
+            f"Limpeza de EAN sujo: {r.limpeza.itens_tabela_gruppy_corrigidos} em ItemTabelaGruppy, "
             f"{r.limpeza.fila_resolucao_ean_corrigidos} na própria fila "
             f"({r.limpeza.fila_resolucao_ean_colisoes_mescladas} mesclados por colisão). "
             f"Reprocessamento: {r.itens_avaliados} itens pendentes avaliados — "
@@ -952,74 +738,6 @@ def _fila_ean() -> None:
 # Fila de CNPJ Órfão
 # ---------------------------------------------------------------------------
 
-def _fila_cnpj_orfao() -> None:
-    usuario = auth.usuario_atual()
-    st.markdown("##### Fila de CNPJ Órfão")
-    _explicacao(
-        "CNPJs que apareceram numa compra do GPS mas não batem com nenhuma loja cadastrada.",
-        "os envios de compras do GPS (as compras deles ficam guardadas, não se perdem).",
-        "vincule a uma loja (as compras passam na hora, e os próximos envios já reconhecem) ou ignore.",
-    )
-
-    with get_session() as session:
-        itens = gps_integ.listar_fila_cnpj_orfao_priorizada(session)
-        lojas = session.execute(select(Loja).order_by(Loja.razao_social)).scalars().all()
-        opcoes_loja_id_por_nome = {f"{l.razao_social} — {l.cnpj}": l.id for l in lojas}
-
-        if not itens:
-            st.markdown('<p class="rmc-muted">Nenhum CNPJ pendente.</p>', unsafe_allow_html=True)
-            return
-
-        if opcoes_loja_id_por_nome and st.button(
-            "Resolver automaticamente (CNPJ idêntico)", key="resolver_lote_cnpj_identico"
-        ):
-            with get_session() as s2:
-                resultado = gps_integ.resolver_cnpjs_orfaos_identicos_em_lote(s2, usuario["nome"])
-            if resultado["resolvidos"]:
-                st.success(
-                    f"{resultado['resolvidos']} CNPJ(s) resolvido(s) automaticamente (CNPJ idêntico a uma "
-                    f"loja já cadastrada) — {resultado['linhas_inseridas']} linha(s) de compra "
-                    "importada(s)/atualizada(s). Os CNPJs sem correspondência exata continuam na fila."
-                )
-            else:
-                st.info("Nenhum CNPJ pendente bate exatamente com uma loja cadastrada.")
-            st.rerun()
-
-        st.divider()
-
-        for item in itens:
-            titulo = f"{item.razao_social_observada or 'Razão social não informada'} — CNPJ {item.cnpj}"
-            painel = st.expander(titulo, key=f"exp_fila_cnpj_{item.id}", on_change="rerun")
-            if not painel.open:
-                continue
-            with painel:
-                st.markdown(
-                    f"{ui.formatar_moeda(float(item.valor_total_acumulado))} acumulado · "
-                    f"{item.qtd_ocorrencias} ocorrência(s)"
-                )
-
-                if not opcoes_loja_id_por_nome:
-                    st.caption("Nenhuma loja cadastrada ainda — sincronize a base de lojas antes de vincular.")
-                else:
-                    escolha = st.selectbox(
-                        "Vincular à loja", options=["—"] + list(opcoes_loja_id_por_nome.keys()),
-                        key=f"select_loja_{item.id}",
-                    )
-                    if escolha != "—" and st.button(
-                        "Vincular à loja", key=f"vincular_cnpj_{item.id}", use_container_width=True
-                    ):
-                        with get_session() as s2:
-                            total = gps_integ.resolver_cnpj_orfao(
-                                s2, item.id, opcoes_loja_id_por_nome[escolha], usuario["nome"]
-                            )
-                        st.success(f"{total} compra(s) passada(s) para a loja.")
-                        st.rerun()
-
-                if st.button("Ignorar este CNPJ", key=f"ignorar_cnpj_{item.id}", use_container_width=True):
-                    with get_session() as s2:
-                        gps_integ.ignorar_cnpj_orfao(s2, item.id)
-                    st.rerun()
-
 
 # ---------------------------------------------------------------------------
 # Vínculo de lojas GPS (Pedido)
@@ -1041,6 +759,8 @@ def _vinculo_lojas_gps() -> None:
 
     usuario = auth.usuario_atual()
     st.markdown("##### Vínculo de lojas GPS")
+    if st.session_state.get("vinculo_gps_msg"):
+        st.success(st.session_state.pop("vinculo_gps_msg"))
     _explicacao(
         "qual loja do GPS é qual loja do RMC — é o que liga a aba Pedido às vendas, compras e estoque de cada loja.",
         "a rotina da madrugada grava as lojas do GPS; o sistema casa sozinho pelo CNPJ (quase todas) ou pelo "
@@ -1062,54 +782,160 @@ def _vinculo_lojas_gps() -> None:
                 + (f", {r.decisoes_preservadas} decisão(ões) sua(s) mantida(s)." if r.decisoes_preservadas else ".")
             )
 
+    _codigos_gps(usuario)
+
+    # Reconhecer a loja (08/10/2026): o nome do GPS sozinho não dizia qual era
+    # a loja — agora o código da empresa no GPS (planilha), as pendências
+    # agrupadas por empresa e a loja do RMC com o código da T.I. na frente.
     with get_session() as session:
-        vinculos = session.scalars(select(VinculoLojaGps).order_by(VinculoLojaGps.nome_loja_gps)).all()
-        lojas = session.execute(select(Loja).order_by(Loja.razao_social)).scalars().all()
-        rotulo_loja = {l.id: f"{l.razao_social} — {ui.formatar_cnpj(l.cnpj)}"
-                       + (f" (cód. {l.legacy_id})" if l.legacy_id else "") for l in lojas}
+        vinculos = [{
+            "id": v.id, "empresa": v.id_empresa_gps, "loja": (v.codigo_loja_gps or "").strip(),
+            "nome": v.nome_loja_gps, "cidade": v.cidade_gps, "uf": v.uf_gps, "numero": v.numero_gps,
+            "cnpj": v.cnpj_gps, "situacao": v.situacao, "loja_id": v.loja_id, "motivo": v.motivo,
+        } for v in session.scalars(select(VinculoLojaGps))]
+        lojas = [{"id": l.id, "legacy": l.legacy_id, "razao": l.razao_social, "cnpj": vinculo_rotina.so_digitos(l.cnpj),
+                  "cidade": l.cidade, "uf": l.uf}
+                 for l in session.scalars(select(Loja).where(loja_da_rede()).order_by(Loja.legacy_id, Loja.razao_social))]
+        codigos = gps_vinculo.empresas(session)
 
-        if not vinculos:
-            st.markdown('<p class="rmc-muted">Nenhum vínculo calculado ainda.</p>', unsafe_allow_html=True)
-            return
+    if not vinculos:
+        st.markdown('<p class="rmc-muted">Nenhum vínculo calculado ainda.</p>', unsafe_allow_html=True)
+        return
 
-        por_situacao: dict = {}
-        for v in vinculos:
-            por_situacao.setdefault(v.situacao, []).append(v)
-        st.caption(
-            " · ".join(f"{rotulo}: {len(por_situacao.get(sit, []))}" for sit, rotulo in (
-                (SituacaoVinculoGps.AUTOMATICO, "automáticos"), (SituacaoVinculoGps.CONFIRMADO, "confirmados"),
-                (SituacaoVinculoGps.CONFIRMAR, "para confirmar"), (SituacaoVinculoGps.NAO_CLIENTE, "não são clientes"),
-                (SituacaoVinculoGps.SEM_CANDIDATO, "sem loja parecida"),
-            ))
-        )
-        st.divider()
+    por_id = {l["id"]: l for l in lojas}
+    lojas_por_empresa: dict[str, int] = {}
+    for v in vinculos:
+        lojas_por_empresa[v["empresa"]] = lojas_por_empresa.get(v["empresa"], 0) + 1
 
-        pendentes = por_situacao.get(SituacaoVinculoGps.CONFIRMAR, []) + por_situacao.get(SituacaoVinculoGps.SEM_CANDIDATO, [])
-        if not pendentes:
-            st.markdown('<p class="rmc-muted">Nada para confirmar.</p>', unsafe_allow_html=True)
-        for v in pendentes:
-            local = "/".join(x for x in (v.cidade_gps, v.uf_gps) if x)
-            titulo = f"{v.nome_loja_gps or 'Loja sem nome'} — {local} · nº {v.numero_gps or 's/n'}"
-            painel = st.expander(titulo, key=f"exp_vinc_gps_{v.id}", on_change="rerun")
+    def rotulo_loja(i) -> str:
+        l = por_id[i]
+        local = "/".join(x for x in (l["cidade"], l["uf"]) if x)
+        return (f"{l['legacy']} · " if l["legacy"] else "") + f"{l['razao']}" + (f" — {local}" if local else "")
+
+    def nome_empresa(emp: str) -> str:
+        info = codigos.get(emp)
+        n = lojas_por_empresa.get(emp, 0)
+        lojas_txt = f"{n} loja{'s' if n != 1 else ''} no GPS"
+        if info:
+            return f"{info.codigo} · {info.nome or 'sem nome'} ({lojas_txt})"
+        primeira = next((v["nome"] for v in vinculos if v["empresa"] == emp and v["nome"]), "sem nome")
+        # Empresa que a planilha do GPS não trouxe (46 das 388 da API em 08/10/2026).
+        return f"{primeira} ({lojas_txt}; sem código — fora da planilha do GPS)" if codigos else             f"{primeira} ({lojas_txt}; sem código — envie a planilha do GPS acima)"
+
+    por_situacao: dict = {}
+    for v in vinculos:
+        por_situacao.setdefault(v["situacao"], []).append(v)
+    st.caption(
+        " · ".join(f"{rotulo}: {len(por_situacao.get(sit, []))}" for sit, rotulo in (
+            (SituacaoVinculoGps.AUTOMATICO, "automáticos"), (SituacaoVinculoGps.CONFIRMADO, "confirmados"),
+            (SituacaoVinculoGps.CONFIRMAR, "para confirmar"), (SituacaoVinculoGps.NAO_CLIENTE, "não são clientes"),
+            (SituacaoVinculoGps.SEM_CANDIDATO, "sem loja parecida"),
+        ))
+    )
+    st.divider()
+
+    pendentes = por_situacao.get(SituacaoVinculoGps.CONFIRMAR, []) + por_situacao.get(SituacaoVinculoGps.SEM_CANDIDATO, [])
+    if not pendentes:
+        st.markdown('<p class="rmc-muted">Nada para confirmar.</p>', unsafe_allow_html=True)
+    # Agrupadas por empresa do GPS: as lojas de um grupo (ex.: as 8 da Mega
+    # Farma, as 2 da Farmácia Vida = 793/1880) ficam juntas.
+    grupos: dict[str, list[dict]] = {}
+    for v in pendentes:
+        grupos.setdefault(v["empresa"], []).append(v)
+    for emp in sorted(grupos, key=lambda e: (codigos[e].codigo.zfill(8) if e in codigos else "~", e)):
+        st.markdown(f"**{html.escape(nome_empresa(emp))}**")
+        cnpjs_empresa = codigos[emp].cnpjs if emp in codigos else frozenset()
+        for v in sorted(grupos[emp], key=lambda x: x["loja"]):
+            local = "/".join(x for x in (v["cidade"], v["uf"]) if x)
+            titulo = f"Loja {v['loja']} · {v['nome'] or 'sem nome'}" + (f" — {local}" if local else "") \
+                + f" · nº {v['numero'] or 's/n'}"
+            painel = st.expander(titulo, key=f"exp_vinc_gps_{v['id']}", on_change="rerun")
             if not painel.open:
                 continue
             with painel:
-                st.caption(f"Por que está aqui: {v.motivo or '—'}")
-                opcoes = ["—"] + list(rotulo_loja.keys())
+                st.caption(f"Por que está aqui: {v['motivo'] or '—'}"
+                           + (f" · CNPJ no GPS: {ui.formatar_cnpj(v['cnpj'])}" if v["cnpj"] else ""))
+                # Primeiro as lojas desta empresa segundo a planilha do GPS
+                # (CNPJ), depois as da mesma cidade, depois o resto — pelo
+                # código da T.I. Dá pra digitar o código pra achar.
+                da_empresa = [l["id"] for l in lojas if l["cnpj"] in cnpjs_empresa]
+                mesma_cidade = [l["id"] for l in lojas if l["id"] not in da_empresa and v["uf"] and l["uf"] == v["uf"]
+                                and (l["cidade"] or "").strip().upper() == (v["cidade"] or "").strip().upper()]
+                resto = [l["id"] for l in lojas if l["id"] not in da_empresa and l["id"] not in mesma_cidade]
+                if da_empresa:
+                    st.caption("Lojas desta empresa no GPS (pelo CNPJ): "
+                               + "; ".join(rotulo_loja(i) for i in da_empresa))
+                opcoes = ["—"] + da_empresa + mesma_cidade + resto
                 escolha = st.selectbox(
-                    "Loja do RMC", options=opcoes, index=opcoes.index(v.loja_id) if v.loja_id in rotulo_loja else 0,
-                    format_func=lambda i: "—" if i == "—" else rotulo_loja[i], key=f"vinc_gps_loja_{v.id}",
+                    "Loja do RMC", options=opcoes, index=opcoes.index(v["loja_id"]) if v["loja_id"] in por_id else 0,
+                    format_func=lambda i: "—" if i == "—" else rotulo_loja(i), key=f"vinc_gps_loja_{v['id']}",
                 )
                 c1, c2 = st.columns(2)
-                if c1.button("Confirmar vínculo", key=f"vinc_gps_ok_{v.id}", use_container_width=True,
+                if c1.button("Confirmar vínculo", key=f"vinc_gps_ok_{v['id']}", use_container_width=True,
                              disabled=escolha == "—"):
                     with get_session() as s2:
-                        gps_vinculo.confirmar(s2, v.id, escolha, usuario["nome"])
+                        gps_vinculo.confirmar(s2, v["id"], escolha, usuario["nome"])
                     st.rerun()
-                if c2.button("Não é cliente", key=f"vinc_gps_nao_{v.id}", use_container_width=True):
+                if c2.button("Não é cliente", key=f"vinc_gps_nao_{v['id']}", use_container_width=True):
                     with get_session() as s2:
-                        gps_vinculo.marcar_nao_cliente(s2, v.id, usuario["nome"])
+                        gps_vinculo.marcar_nao_cliente(s2, v["id"], usuario["nome"])
                     st.rerun()
+
+    # Conferência: todos os vínculos, inclusive os automáticos.
+    ligados = [v for v in vinculos if v["loja_id"] in por_id]
+    tudo = st.expander(f"Conferir todos os vínculos ({len(vinculos)})", key="vinc_gps_conferir", on_change="rerun")
+    if tudo.open:
+        with tudo:
+            st.dataframe(pd.DataFrame([{
+                "Código GPS": codigos[v["empresa"]].codigo if v["empresa"] in codigos else "",
+                "Empresa no GPS": (codigos[v["empresa"]].nome if v["empresa"] in codigos else None) or "",
+                "Loja GPS": v["loja"],
+                "Nome no GPS": v["nome"] or "",
+                "Cidade/UF": "/".join(x for x in (v["cidade"], v["uf"]) if x),
+                "Loja do RMC": rotulo_loja(v["loja_id"]) if v["loja_id"] in por_id else "",
+                "Situação": _SITUACAO_ROTULO.get(v["situacao"].name, v["situacao"].name),
+            } for v in sorted(vinculos, key=lambda x: (codigos[x["empresa"]].codigo.zfill(8) if x["empresa"] in codigos
+                                                       else "~", x["empresa"], x["loja"]))]),
+                hide_index=True, use_container_width=True)
+            st.caption(f"{len(ligados)} loja(s) do GPS ligadas a uma loja do RMC.")
+
+
+def _codigos_gps(usuario: dict) -> None:
+    """Planilha do GPS com o código de cada empresa (08/10/2026) — a API não
+    manda esse número. Reenviar quando o GPS tiver clientes novos."""
+    from integrations import gps_vinculo
+
+    with get_session() as session:
+        n = len(gps_vinculo.empresas(session))
+    painel = st.expander(f"Códigos do GPS ({n} empresa(s) com código)" if n else "Códigos do GPS (envie a planilha)",
+                         key="vinc_gps_codigos", on_change="rerun")
+    if not painel.open:
+        return
+    with painel:
+        st.caption("Planilha exportada do GPS com as colunas **Empresa** (\"2089 - Mega Farma\"), **Cnpj** e "
+                   "**idEmp**. O código aparece nas pendências e na conferência abaixo. Reenviar não apaga nada: "
+                   "atualiza quem veio e mantém o resto.")
+        leitor.leitor_planilha(_LEITOR_CODIGOS_GPS, "Selecionar planilha de códigos do GPS (.xlsx)")
+        _mostrar_planilha_recebida(_LEITOR_CODIGOS_GPS)
+        recebida = leitor.planilha_recebida(_LEITOR_CODIGOS_GPS)
+        if recebida is None:
+            return
+        try:
+            lida = gps_vinculo.ler_planilha_codigos(recebida.df)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
+        if lida.ignoradas:
+            st.warning(f"{len(lida.ignoradas)} linha(s) ignorada(s): "
+                       + "; ".join(f"linha {n}: {m}" for n, m in lida.ignoradas[:8])
+                       + (" …" if len(lida.ignoradas) > 8 else ""))
+        st.caption(f"{_milhar(len(lida.empresas))} empresa(s) com código serão gravadas.")
+        if lida.empresas and st.button("Gravar códigos", key=f"{_LEITOR_CODIGOS_GPS}_gravar"):
+            with get_session() as s2:
+                gravadas = gps_vinculo.importar_codigos(s2, lida, usuario["nome"])
+            leitor.consumir(_LEITOR_CODIGOS_GPS)
+            st.session_state["vinculo_gps_msg"] = f"{_milhar(gravadas)} empresa(s) com o código do GPS gravadas."
+            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1151,8 +977,8 @@ def _categorias_importar() -> None:
     _explicacao(
         "a categoria de cada EAN. Decide quantos dias de estoque o Pedido sugere (medicamento, perfumaria — "
         "ver Configurações de Pedidos); produto Sem Classificação não recebe sugestão.",
-        "a lista da FEBRAFAR e a da CMED/ANVISA (já prontas no sistema, é só carregar uma vez) e as planilhas "
-        "enviadas aqui para os produtos que elas não cobrem.",
+        "a lista da FEBRAFAR e a da CMED/ANVISA (já prontas no sistema, é só carregar uma vez), os genéricos do "
+        "catálogo IQVIA que elas não cobrem e as planilhas enviadas aqui.",
         "envie uma planilha com EAN e CATEGORIA (abaixo). O que você enviar vale na hora e nunca é desfeito "
         "por uma nova carga da FEBRAFAR/CMED. A lista do que falta classificar está em Pendências → Sem Classificação.",
     )
@@ -1164,7 +990,8 @@ def _categorias_importar() -> None:
         grupos = " · ".join(f"{categorias.ROTULO_GRUPO[k]} {_milhar(g.get(k, 0))}"
                             for k in (categorias.MEDICAMENTO, categorias.PERFUMARIA, categorias.SEM_CLASSIFICACAO))
         origens = " · ".join(f"{nome} {_milhar(o.get(chave, 0))}"
-                             for chave, nome in (("FEBRAFAR", "FEBRAFAR"), ("CMED", "CMED"), ("MANUAL", "Manual")))
+                             for chave, nome in (("FEBRAFAR", "FEBRAFAR"), ("CMED", "CMED"), ("IQVIA", "IQVIA"),
+                                                 ("MANUAL", "Manual")))
         st.caption(f"Na base: **{_milhar(cont['total'])}** EANs — {grupos}  |  origem: {origens}")
 
     st.markdown("###### Base inicial (FEBRAFAR + CMED)")
@@ -1188,8 +1015,77 @@ def _categorias_importar() -> None:
             )
             st.rerun()
 
+    _catalogo_iqvia(armaz, chaves, usuario)
+    _fontes_classificacao(armaz, chaves)
+
     st.markdown("###### Enviar categorias")
     _envio_categorias(_LEITOR_CATEGORIAS)
+
+
+def _fontes_classificacao(armaz, chaves) -> None:
+    """Fontes da classificação (25/10/2026): o que a FEBRAFAR e a CMED dizem de cada EAN, para a cascata de
+    classificação das Configurações de Pedidos. Mesmo caminho da base inicial: arquivo no Spaces, botão aqui."""
+    from integrations import classificacao
+
+    st.markdown("###### Fontes da classificação (FEBRAFAR e CMED por EAN)")
+    st.caption("Guarda a categoria da FEBRAFAR e o tipo da CMED de cada produto, para a cascata de classificação "
+               "das Configurações de Pedidos. Não muda nenhuma categoria da base nem os dias de estoque.")
+    with get_session() as session:
+        total, _ultima = classificacao.versao(session)
+        tipos = classificacao.contagem_por_cmed(session) if total else {}
+    info = classificacao.disponivel(armaz, chaves)
+    if info is None:
+        st.info("O arquivo ainda não está no armazenamento. Ele é gerado junto com a base inicial, com "
+                "`python -m pedido.carga_categorias --febrafar <planilha> --cmed <planilha> --executar`.")
+        return
+    st.caption(f"Arquivo pronto: {_milhar(int(info.get('eans', 0)))} EANs, gerado em "
+               f"{str(info.get('gerado_em', '?'))[:10]}." + (f" Na base: {_milhar(total)} EANs." if total else ""))
+    if tipos:
+        st.caption("Tipos da CMED na base: " + ", ".join(f"{t} {_milhar(n)}" for t, n in
+                                                        sorted(tipos.items(), key=lambda kv: -kv[1])) + ".")
+    if st.button("Recarregar fontes" if total else "Carregar fontes", key="classificacao_carregar"):
+        with st.spinner("Carregando as fontes da classificação..."):
+            dados = armaz.ler_df(chaves.classificacao_ean())
+            with get_session() as s2:
+                r = classificacao.carregar(s2, dados)
+        from views import pedido as pedido_view
+        pedido_view._versao_catalogo.clear()      # a classificação nova vale já no Assistente e no Dashboard
+        st.session_state["categorias_msg"] = (
+            f"Fontes da classificação: {_milhar(r.eans)} EANs carregados em {r.segundos:.0f}s "
+            f"({_milhar(r.com_febrafar)} com FEBRAFAR, {_milhar(r.com_cmed)} com CMED).")
+        st.rerun()
+
+
+def _catalogo_iqvia(armaz, chaves, usuario: dict) -> None:
+    """Catálogo IQVIA (07/10/2026): linha de compra de cada EAN e genérico
+    pelo GMRS. Mesmo caminho da base inicial: arquivo no Spaces, botão aqui."""
+    from integrations import catalogo
+    from views import pedido as pedido_view
+
+    st.markdown("###### Catálogo IQVIA (linhas de compra)")
+    st.caption("Dá a linha de compra de cada produto (Genérico, Similar, Propagado, Perfumaria) para o "
+               "Comprador no Assistente de pedido, e completa a base com os genéricos que FEBRAFAR e CMED não "
+               "conhecem (nunca troca uma categoria que já existe).")
+    with get_session() as session:
+        total, _ultima = catalogo.versao(session)
+    info = catalogo.disponivel(armaz, chaves)
+    if info is None:
+        st.info("O arquivo do catálogo ainda não está no armazenamento. Ele é gerado uma vez com "
+                "`python -m pedido.carga_catalogo --catalogo <planilha> --executar`.")
+        return
+    st.caption(f"Arquivo pronto: {_milhar(int(info.get('eans', 0)))} EANs, gerado em "
+               f"{str(info.get('gerado_em', '?'))[:10]}." + (f" Na base: {_milhar(total)} EANs." if total else ""))
+    if st.button("Recarregar catálogo" if total else "Carregar catálogo", key="catalogo_carregar"):
+        with st.spinner("Carregando o catálogo..."):
+            dados = armaz.ler_df(chaves.catalogo_iqvia())
+            with get_session() as s2:
+                r = catalogo.carregar(s2, dados, usuario["nome"])
+        _sem_classificacao_calculado.clear()
+        pedido_view._versao_catalogo.clear()
+        st.session_state["categorias_msg"] = (
+            f"Catálogo: {_milhar(r.eans)} EANs carregados em {r.segundos:.0f}s; "
+            f"{_milhar(r.genericos_novos)} genérico(s) novo(s) na base de categorias.")
+        st.rerun()
 
 
 @st.cache_data(ttl=600, show_spinner="Lendo os produtos das lojas...")
@@ -1211,19 +1107,95 @@ def _versao_categorias() -> tuple:
         return categorias_integ.versao(session)
 
 
+@st.cache_data(ttl=600, show_spinner="Lendo as tabelas Gruppy e as compras...")
+def _sem_classificacao_analise_calculado(versao: tuple) -> pd.DataFrame:
+    """Sub-aba da Análise (Q35 de 05/10/2026): EANs das tabelas Gruppy sem
+    categoria, com o que as lojas compraram deles nos últimos 3 meses."""
+    from core.models import ItemTabelaGruppy, StatusCobertura, TabelaGruppy, TabelaGruppyCobertura
+    from integrations import fila_compras
+
+    categorias_integ, cat, armaz, chaves = _categorias_contexto()
+    with get_session() as session:
+        base = categorias_integ.tabela(session, com_origem=False)
+        linhas = session.execute(
+            select(ItemTabelaGruppy.ean, ItemTabelaGruppy.descricao_origem, TabelaGruppy.laboratorio)
+            .join(TabelaGruppy, TabelaGruppy.id == ItemTabelaGruppy.tabela_gruppy_id)
+            .where(select(TabelaGruppyCobertura.id).where(
+                TabelaGruppyCobertura.tabela_gruppy_id == TabelaGruppy.id,
+                TabelaGruppyCobertura.status == StatusCobertura.ATIVA).exists())
+        ).all()
+    itens = pd.DataFrame(linhas, columns=["ean", "descricao", "laboratorio"])
+    itens["ean"] = cat.chaves_ean(itens["ean"])
+    resumo = fila_compras.resumo_dos_meses(armaz, chaves, _meses_compras())
+    return categorias_integ.sem_classificacao_analise(itens, resumo, base)
+
+
+def _meses_compras() -> list[str]:
+    """Os últimos 3 meses fechados com compras da rede (o período da Análise)."""
+    from integrations import fila_compras
+
+    return analise_comum.meses_api(fila_compras.MESES_DO_VALOR)
+
+
 def _sem_classificacao() -> None:
     """Pendências → Sem Classificação: relatório, exportação e envio de volta
-    no mesmo lugar (ciclo fechado, decisão de 27/09/2026)."""
+    no mesmo lugar (ciclo fechado, decisão de 27/09/2026). Duas sub-abas
+    desde 05/10/2026 (Q35): os produtos vendidos nas lojas (Assistente de
+    pedido) e os EANs das tabelas Gruppy (Análise de Oportunidade) — o envio
+    da lista preenchida é um só, embaixo das duas."""
+    st.markdown("##### Produtos Sem Classificação")
+    _mensagem_categorias()
+    vendidos, analise_aba = st.tabs(["Vendidos nas lojas", "Análise de Oportunidade"])
+    with vendidos:
+        _sem_classificacao_vendidos()
+    with analise_aba:
+        _sem_classificacao_analise()
+    st.markdown("###### Enviar a lista preenchida")
+    _envio_categorias(_LEITOR_CATEGORIAS_PENDENCIAS)
+
+
+def _sem_classificacao_analise() -> None:
     from integrations import categorias as categorias_integ
 
-    st.markdown("##### Produtos Sem Classificação")
+    _explicacao(
+        "EANs das tabelas Gruppy que a base de categorias não conhece. Na Análise eles comparam pelo próprio EAN; "
+        "classificados como genérico, passam a somar com os outros EANs do mesmo genérico (pela fila de EAN).",
+        "os itens das tabelas Gruppy ativas, com o que as lojas compraram deles nos últimos 3 meses fechados.",
+        "baixe a lista, preencha a coluna CATEGORIA e envie o arquivo embaixo. Vale na hora.",
+    )
+    try:
+        lista = _sem_classificacao_analise_calculado(_versao_categorias())
+    except Exception as exc:  # noqa: BLE001 — sem Spaces: a sub-aba avisa, o resto da tela segue
+        st.warning(f"Não foi possível ler as tabelas e as compras agora: {exc}")
+        return
+    if lista.empty:
+        st.success("Todos os EANs das tabelas Gruppy estão classificados.")
+        return
+    lista = lista.assign(**{"% ACUMULADO": categorias_integ.pareto_acumulado(lista["LOJAS QUE COMPRARAM"])})
+    st.caption(f"**{_milhar(len(lista))}** EAN(s) das tabelas Gruppy sem classificação (pareto: os comprados por "
+               "mais lojas primeiro; a tela mostra os 200 primeiros, o arquivo tem todos).")
+    st.dataframe(
+        lista.head(200), hide_index=True, use_container_width=True,
+        column_order=["EAN", "PRODUTO", "LOJAS QUE COMPRARAM", "% ACUMULADO", "VALOR COMPRADO", "TABELA GRUPPY",
+                      "SITUACAO"],
+        column_config={"% ACUMULADO": st.column_config.NumberColumn(format="%.1f%%"),
+                       "VALOR COMPRADO": st.column_config.NumberColumn(format="R$ %.2f")},
+    )
+    st.download_button(
+        "Baixar lista (.xlsx)", data=_xlsx(lista), file_name="sem_classificacao_analise.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="categorias_analise_baixar",
+    )
+
+
+def _sem_classificacao_vendidos() -> None:
+    from integrations import categorias as categorias_integ
+
     _explicacao(
         "produtos das lojas sem categoria (ou \"em classificação\" na FEBRAFAR). No Pedido eles aparecem sem "
         "sugestão.",
         "os produtos que a rotina da madrugada traz do estoque de cada loja, comparados com a base de categorias.",
         "baixe a lista, preencha a coluna CATEGORIA e envie o mesmo arquivo aqui embaixo. Vale na hora.",
     )
-    _mensagem_categorias()
     relatorio, total = _sem_classificacao_calculado(_versao_categorias())
     if not total:
         st.info("A rotina do Pedido ainda não gravou os produtos das lojas — ela roda de madrugada.")
@@ -1249,8 +1221,6 @@ def _sem_classificacao() -> None:
             "Baixar lista (.xlsx)", data=_xlsx(lista), file_name="produtos_sem_classificacao.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="categorias_baixar",
         )
-    st.markdown("###### Enviar a lista preenchida")
-    _envio_categorias(_LEITOR_CATEGORIAS_PENDENCIAS)
 
 
 def _envio_categorias(chave_leitor: str) -> None:
@@ -1282,6 +1252,7 @@ def _envio_categorias(chave_leitor: str) -> None:
             gravados = categorias_integ.aplicar_manual(s2, lida.validas, usuario["nome"])
         leitor.consumir(chave_leitor)
         _sem_classificacao_calculado.clear()
+        _sem_classificacao_analise_calculado.clear()
         st.session_state["categorias_msg"] = f"{_milhar(gravados)} categoria(s) gravada(s). Já valem no Pedido."
         st.rerun()
 
@@ -1305,14 +1276,35 @@ def _atualizar_fila_loja() -> str:
             + (f"; {r.em_outra_origem} já estavam na fila vindos do GPS/Gruppy" if r.em_outra_origem else "") + ".")
 
 
+def _atualizar_fila_compras() -> str:
+    """Genéricos comprados fora da Base Genéricos → fila de EAN, e o valor
+    da fila regravado (integrations/fila_compras.py)."""
+    from integrations import fila_compras
+
+    categorias_integ, _cat, armaz, chaves = _categorias_contexto()
+    meses = _meses_compras()
+    if not meses:
+        return "As compras da rede ainda não foram montadas (a rotina da madrugada junta os meses fechados)."
+    resumo = fila_compras.resumo_dos_meses(armaz, chaves, meses)
+    with get_session() as session:
+        base = categorias_integ.tabela(session, com_origem=False)
+        r = fila_compras.atualizar(session, resumo, base)
+    return (f"{_milhar(r.genericos_comprados)} genérico(s) comprado(s) nas lojas; {_milhar(r.ja_na_base)} já na Base "
+            f"Genéricos; {_milhar(r.novos_na_fila)} novo(s) na fila; {_milhar(r.resolvidos_automaticamente)} "
+            f"resolvido(s) automaticamente; valor regravado em {_milhar(r.valores_regravados)} item(ns).")
+
+
 def _fila_loja_automatica() -> None:
     """Uma vez por dia, na primeira abertura da aba Dados (mesmo esquema da
-    sincronização de lojas). Falha não quebra a tela: vira aviso na fila."""
+    sincronização de lojas): os genéricos vendidos (Loja (API)) e, desde
+    05/10/2026, os comprados (origem GPS). Falha não quebra a tela: vira
+    aviso na fila."""
     if st.session_state.get("_fila_loja_ja_verificada"):
         return
     st.session_state["_fila_loja_ja_verificada"] = True
-    with st.spinner("Conferindo os genéricos vendidos nas lojas (primeira abertura do dia)..."):
+    with st.spinner("Conferindo os genéricos vendidos e comprados nas lojas (primeira abertura do dia)..."):
         rotinas.executar_se_necessario(rotinas.ROTINA_FILA_EAN_LOJA_API, _atualizar_fila_loja)
+        rotinas.executar_se_necessario(rotinas.ROTINA_FILA_EAN_COMPRAS, _atualizar_fila_compras)
 
 
 # ---------------------------------------------------------------------------
@@ -1340,10 +1332,16 @@ def _rotina_gps() -> None:
         st.info("A rotina ainda não rodou (ou não gravou relatório).")
         return
     st.caption(f"Última execução: {data[8:10]}/{data[5:7]}/{data[:4]}.")
+    # Execução que caiu antes/fora da coleta (07/10/2026): o motivo aparece
+    # aqui, sem precisar abrir o log do GitHub.
+    for r in relatorios:
+        if r.get("erro_geral"):
+            st.error(f"{r.get('parte')}: a execução caiu — {r['erro_geral']}")
     st.dataframe(pd.DataFrame([{
         "Parte": r.get("parte"),
         "Empresas": f"{r.get('empresas_processadas', 0)}/{r.get('empresas_na_parte', 0)}",
         "Lojas": r.get("lojas", 0),
+        "Sem lista de lojas": r.get("empresas_sem_lista_de_lojas", 0),
         "Consultas ok": r.get("unidades_ok", 0),
         "Falhas": r.get("unidades_com_falha", 0),
         "Pendentes p/ próxima": len(r.get("pendentes_para_proxima", [])),
@@ -1391,9 +1389,10 @@ def _aviso_reorganizacao() -> None:
         return
     with st.container(border=True):
         st.markdown(
-            "**A aba Dados foi reorganizada.** As filas (EAN, CNPJ órfão), o vínculo de lojas GPS e os produtos "
-            "sem classificação estão em **Pendências**. A sincronização de lojas e a rotina do GPS, em "
-            "**Rotinas**. Os envios de planilha continuam em **Importar**."
+            "**A aba Dados foi reorganizada.** A fila de EAN, o vínculo de lojas GPS e os produtos sem "
+            "classificação estão em **Pendências**. A sincronização de lojas e a rotina do GPS, em **Rotinas**. "
+            "Os envios de planilha (Gruppy, Base Genéricos, categorias) continuam em **Importar**; as compras "
+            "agora vêm da API do GPS pela rotina diária — a planilha do GPS e a fila de CNPJ órfão saíram."
         )
         if st.button("Ok, entendi", key="aviso_dados_ok"):
             st.session_state["_aviso_dados_visto"] = True
@@ -1408,8 +1407,6 @@ def _contadores_banco() -> dict:
         return {
             "ean": session.scalar(select(func.count()).select_from(FilaResolucaoEAN)
                                   .where(FilaResolucaoEAN.status == StatusFila.PENDENTE)) or 0,
-            "cnpj": session.scalar(select(func.count()).select_from(FilaCnpjOrfao)
-                                   .where(FilaCnpjOrfao.status == StatusFila.PENDENTE)) or 0,
             "vinculo": session.scalar(select(func.count()).select_from(VinculoLojaGps).where(
                 VinculoLojaGps.situacao.in_([SituacaoVinculoGps.CONFIRMAR, SituacaoVinculoGps.SEM_CANDIDATO]))) or 0,
         }
@@ -1417,7 +1414,6 @@ def _contadores_banco() -> dict:
 
 _PENDENCIAS = {
     "ean": ("Fila de EAN", _fila_ean),
-    "cnpj": ("CNPJ órfão", _fila_cnpj_orfao),
     "vinculo": ("Vínculo de lojas GPS", _vinculo_lojas_gps),
     "sem_classificacao": ("Sem Classificação", _sem_classificacao),
 }
@@ -1448,8 +1444,6 @@ def _importar() -> None:
     _importar_base_genericos(usuario)
     st.divider()
     _importar_gruppy(usuario)
-    st.divider()
-    _importar_gps(usuario)
     st.divider()
     _categorias_importar()
 

@@ -112,6 +112,31 @@ def test_ler_cmed_acha_o_cabecalho_depois_da_apresentacao_e_os_tres_eans(tmp_pat
     assert set(df["tipo"]) == {"Genérico"} and df["descricao"].iloc[0] == "DIPIRONA 500MG"
 
 
+def test_ler_cmed_acha_a_tabela_na_segunda_aba(tmp_path):
+    """Formato de 09/10/2026: aba "Cabeçalho" só com a legenda e aba "Lista PMC" com o cabeçalho na 1ª linha."""
+    legenda = pd.DataFrame([["LISTA DE PREÇOS DE MEDICAMENTOS"], ["TIPOS DE PRODUTO:"]])
+    corpo = pd.DataFrame(
+        [["BAYCUTEN N", "10 MG", "7891106000956", "    -     ", "    -     ", "Similar"],
+         ["ORENCIA", "250 MG", "7896016806469", "    -     ", "    -     ", "Biológico"],
+         ["SEM TIPO", "1 MG", "7890000000001", "    -     ", "    -     ", "    -     "]],
+        columns=["PRODUTO", "APRESENTAÇÃO", "EAN 1", "EAN 2", "EAN 3", "TIPO DE PRODUTO (STATUS DO PRODUTO)"],
+    )
+    caminho = tmp_path / "cmed_duas_abas.xlsx"
+    with pd.ExcelWriter(caminho) as w:
+        legenda.to_excel(w, sheet_name="Cabeçalho", index=False, header=False)
+        corpo.to_excel(w, sheet_name="Lista PMC", index=False)
+    df = cat.ler_cmed(caminho)
+    assert sorted(zip(df["ean"], df["tipo"])) == [("7891106000956", "Similar"), ("7896016806469", "Biológico")]
+
+
+def test_ler_cmed_sem_cabecalho_em_nenhuma_aba_diz_quais_abas_olhou(tmp_path):
+    caminho = tmp_path / "errada.xlsx"
+    with pd.ExcelWriter(caminho) as w:
+        pd.DataFrame([["nada"]]).to_excel(w, sheet_name="Outra", index=False, header=False)
+    with pytest.raises(ValueError, match="Outra"):
+        cat.ler_cmed(caminho)
+
+
 # ---------------------------------------------------------------------------
 # Banco
 # ---------------------------------------------------------------------------
@@ -224,3 +249,16 @@ def test_base_inicial_disponivel_le_os_metadados(tmp_path):
     armaz.salvar_df(chaves.base_categorias(), _base([("1", "HIGIENE", "FEBRAFAR", None)]))
     armaz.salvar_json(chaves.base_categorias_info(), {"eans": 1})
     assert integ.base_inicial_disponivel(armaz, chaves) == {"eans": 1}
+
+
+def test_sem_classificacao_da_analise_so_eans_da_gruppy_sem_categoria():
+    """Sub-aba da Análise (Q35 de 05/10/2026), pareto pelas lojas que compraram."""
+    from integrations import categorias as categorias_integ
+
+    itens = pd.DataFrame([("1", "A", "LAB X"), ("1", "A", "LAB Y"), ("2", "B", "LAB X"), ("3", "C", "LAB X")],
+                         columns=["ean", "descricao", "laboratorio"])
+    base = pd.DataFrame([("3", "HIGIENE")], columns=["ean", "categoria"])
+    compras = pd.DataFrame([("2", 500.0, 4), ("1", 20.0, 1)], columns=["ean", "valor", "lojas"])
+    r = categorias_integ.sem_classificacao_analise(itens, compras, base)
+    assert r["EAN"].tolist() == ["2", "1"]
+    assert r.loc[1, "TABELA GRUPPY"] == "LAB X / LAB Y" and r.loc[0, "VALOR COMPRADO"] == 500

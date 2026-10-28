@@ -71,6 +71,20 @@ falhar, fica para a próxima. As compras da **Drogarias Reis** dão erro 500
 em qualquer consulta (defeito do lado do GPS) e vão aparecer como
 pendentes até o suporte do GPS corrigir.
 
+## 4a. Compras da rede para a Análise de Oportunidade (05/10/2026)
+
+Depois das 4 partes, o job **Compras da rede (Análise)** junta as compras de
+todas as lojas num arquivo por mês fechado (`pedido/analise/compras/`). Ele
+roda mesmo que alguma parte falhe; o que faltar entra no dia seguinte (o
+arquivo do mês é refeito quando muda a lista de lojas ou a data da baixa).
+
+- A rotina guarda **6 meses fechados de compras** (3 para a Análise e 3 para a
+  seta de tendência). Na primeira execução depois desta mudança, ela baixa os
+  3 meses a mais de cada empresa: a execução demora mais uma vez só.
+- O último mês fechado é baixado de novo todo dia até o **dia 6** do mês
+  seguinte (notas lançadas com atraso); só então ele aparece na Análise.
+- As compras dos **últimos 5 dias** são baixadas de novo toda noite.
+
 ## 5. Base de categorias (uma vez)
 
 A categoria de cada produto (medicamento 7 dias, perfumaria 15, Sem

@@ -1,27 +1,30 @@
 # RMC Oportunidades
 
-Sistema de comparativo de preço de compra: mostra, loja a loja e produto a
-produto, quanto cada farmácia da Rede deixou de economizar comprando genéricos
-de outro fornecedor em vez da RMC.
+Sistema de comparativo de preço de compra e de sugestão de pedido das
+farmácias da Rede: mostra, loja a loja e produto a produto, quanto cada uma
+deixou de economizar comprando de outro fornecedor em vez da RMC, e monta a
+sugestão de compra de cada loja.
 
-O cálculo cruza três fontes:
+O sistema cruza quatro fontes:
 
-- **GPS** — o que cada loja comprou e quanto pagou (planilha exportada do BI);
+- **API do GPS** — o que cada loja vendeu, comprou (nota a nota) e tem em
+  estoque, baixado toda madrugada pela rotina do GitHub Actions para o
+  Spaces (pacote `pedido/`);
 - **Gruppy** — as tabelas de preço da RMC, por laboratório e por UF;
 - **Base Genéricos** — qual genérico cada EAN é (EANs diferentes do mesmo
-  genérico somam juntos).
+  genérico somam juntos);
+- **base de categorias** — que tipo de produto cada EAN é (FEBRAFAR + CMED +
+  classificação manual).
 
-Economia perdida, por (loja, genérico), contra **um laboratório Gruppy por vez**
-(escolhido no filtro principal): `(menor preço pago − preço do laboratório) × quantidade da compra vencedora`,
-só quando positiva. Detalhes da regra em `core/analise.py`.
-Sempre calculada na hora (nunca gravada). O preço pago usa o `VlrUnitario` e,
-quando ele destoa mais de ±50% do laboratório, recua para o custo CMV
-(`Fat × %CMV ÷ QTD`) ou o `R$ Custo médio`; bonificações (< R$ 0,10) ficam fora.
+Economia perdida, por loja e produto da tabela Gruppy, contra **um laboratório
+por vez** (escolhido no filtro principal): a soma de `(preço pago − preço do
+laboratório) × quantidade` de cada compra acima da tabela no período (1 a 3
+meses fechados). Regras em `core/analise_api.py`; sempre calculada na hora.
 
-Telas prontas: login, **Análise de Oportunidade** (por Loja e por Produto) e
-**Dados** (só admin: Explorador de Arquivos, importação de planilhas e filas
-de pendência). `Pedido` e `Dashboard` são telas de "próxima fase" — ainda sem
-modelo de dados nem interface.
+Telas: login, **Análise de Oportunidade** (Por Loja e Por Produto),
+**Assistente de pedido**, **Configurações de Pedidos** e **Dados** (só admin:
+pendências, importação de planilhas, rotinas e Explorador de Arquivos).
+`Dashboard` ainda é tela de "próxima fase".
 
 Guia detalhado de funcionamento (passo a passo de cada envio, filas, regras):
 **`CLAUDE.md`**. Pendências e histórico de decisões: **`status_e_pendencias.md`**.
@@ -87,89 +90,80 @@ Alternativa para a tela: `streamlit run app.py --secrets.files=<caminho de um se
   DigitalOcean Spaces. Sem elas, os arquivos ficam em disco local (só dev).
 - **`SISTEMA_INTERNO_BASE_URL`, `SISTEMA_INTERNO_TOKEN`** — API de lojas
   (`GET` na URL, header `X-API-KEY`; só lojas com `active=true` entram).
-- **`GPS_API_BASE_URL`, `GPS_API_KEY`** — API do GPS. O cliente existe
-  (`integrations/gps_api.py`), mas a ingestão de compras ainda é pela planilha.
+- **`GPS_API_BASE_URL`, `GPS_API_KEY`** — API do GPS, usada pela rotina da
+  madrugada (`python -m pedido`, GitHub Actions — passo a passo em
+  `docs/rotina_pedido.md`).
 - Opcionais: limiares da reconciliação (`RECON_LIMIAR_AUTO`, padrão 92;
-  `RECON_LIMIAR_MEDIA`, padrão 75), sinônimos de coluna (`COLUNAS_GPS`,
-  `COLUNAS_GRUPPY`, `COLUNAS_BASE_GENERICOS`) — ver `core/config.py`.
+  `RECON_LIMIAR_MEDIA`, padrão 75), sinônimos de coluna (`COLUNAS_GRUPPY`,
+  `COLUNAS_BASE_GENERICOS`) — ver `core/config.py`.
 
-## Como os dados entram (aba Dados → Importar Planilhas)
+## Como os dados entram
 
-Ordem recomendada: **lojas → Base Genéricos → Gruppy → GPS → filas**. Nenhum
-dado se perde se a ordem mudar; ela só evita trabalho manual nas filas.
+Ordem recomendada: **lojas → Base Genéricos → Gruppy → filas**. Nenhum dado
+se perde se a ordem mudar; ela só evita trabalho manual nas filas.
 
 1. **Lojas** — automático na primeira abertura da aba Dados de cada dia. Botão
    "Forçar sincronização agora" para rodar na hora.
 2. **Base Genéricos** — planilha curada (EAN + nome canônico). A descrição já é
    o nome do genérico; EAN já resolvido nunca é sobrescrito. Depois de subir,
    use **Reprocessar fila contra a base atual** na fila de EAN.
-3. **Gruppy** — uma tabela por laboratório: escolha o laboratório, as UFs que a
-   tabela cobre e se o custo vem pronto ou como preço bruto + % de desconto.
-   Tabela nova do mesmo laboratório substitui só as UFs repetidas.
-4. **GPS** — escolha mês e ano, selecione a planilha exportada do BI, confira o
-   popup e confirme. O processamento roda em segundo plano (pode fechar a aba).
+3. **Gruppy** — uma tabela por laboratório, com qualquer produto: escolha o
+   laboratório, as UFs que a tabela cobre e se o custo vem pronto ou como
+   preço bruto + % de desconto. Tabela nova do mesmo laboratório substitui só
+   as UFs repetidas.
+4. **Vendas, compras e estoque** — automáticos, pela API do GPS (rotina da
+   madrugada). A planilha do GPS saiu em 05/10/2026. Compras pela data de
+   emissão da nota; o mês fechado só aparece na Análise a partir do dia 6 do
+   mês seguinte (notas lançadas com atraso).
 
-Regras do GPS:
-
-- Entra como compra a linha com `VlrUnitario > 0` e `Quantidade > 0`. Custo
-  unitário = `VlrUnitario` (sem ST, comparável à Gruppy). Linhas só de venda,
-  com valor/quantidade ≤ 0 ou sem CNPJ/EAN são ignoradas e contadas.
-- Cada envio **substitui, no mês escolhido, as compras dos CNPJs presentes no
-  arquivo** — os demais CNPJs e os outros meses não são tocados. Para passar do
-  limite de exportação do BI (150 mil linhas), divida por atributo de **loja**
-  (UF, cidade, grupo), nunca por produto.
-- Tudo ou nada: se falhar em qualquer ponto, nada muda.
-- O popup avisa se o rodapé do arquivo indicar outro mês (exige confirmação) e
-  se a exportação foi cortada pelo BI.
-
-A planilha é **lida no navegador** de quem envia (componente em
+As planilhas são **lidas no navegador** de quem envia (componente em
 `views/leitor_planilha.py`): o servidor recebe só os dados compactados, e o
-.xlsx original vai para o Spaces. Isso vale também para Gruppy e Base Genéricos.
+.xlsx original vai para o Spaces.
 
 ## Análise de Oportunidade
 
 - **Filtro Laboratório obrigatório:** a análise é sempre contra uma tabela
   Gruppy por vez, e a coluna de preço leva o nome do laboratório.
-- **Por Produto:** Produto | Laboratório (da compra) | Preço pago | *laboratório* |
-  Diferença un. | Qtd. | Preço médio (3m) | Economia.
-- **Por Loja:** Loja | Time de atendimento | UF | Cidade | Genéricos | Economia;
-  o Detalhes mostra os produtos da loja com as colunas do Por Produto.
+- **Por Loja** (só admin): Loja | Localização | Responsável | Produtos |
+  Economia; o detalhe mostra as compras da loja, uma linha por produto e nota
+  fiscal.
+- **Por Produto:** uma linha por loja e produto — preço médio das notas acima
+  da tabela, Qtd. e Economia dessas notas; filtro de Categoria; o detalhe tem
+  o gráfico de preço por mês e as notas da maior diferença para a menor.
 - Clique no título de qualquer coluna para ordenar; de novo, inverte.
-- Preço "ajustado" = veio do custo CMV ou do Custo médio porque o VlrUnitario
-  destoava; "a revisar" = nenhum preço coerente (provável erro de cadastro),
-  economia não contabilizada. Regras completas no `CLAUDE.md`.
+- "A revisar" = preço com cara de erro (embalagem ou fração), pelas regras de
+  cadastro × nota, preço de venda e mediana; não soma economia. Regras
+  completas no `CLAUDE.md`.
 
-## Filas de pendência (aba Dados)
+## Filas de pendência (aba Dados → Pendências)
 
-- **Fila de CNPJ Órfão** (só GPS): CNPJ de compra que não bate com nenhuma loja.
-  As compras ficam guardadas; **Vincular à loja** passa elas para a loja na hora
-  e o vínculo vale para os próximos envios.
-- **Fila de Resolução de EAN** (uma fila só, para Gruppy e GPS): EAN ainda sem
-  genérico. Item de origem GPS vale o dinheiro de compra em jogo; item de
-  origem Gruppy entra com valor 0 (é catálogo de preço) e ganha valor se o EAN
-  aparecer em compras. Resolver um EAN vale para os dois lados. O fuzzy-match
-  resolve sozinho com score ≥ 92, sugere entre 75 e 92, e deixa manual abaixo de 75.
-
-Os valores das duas filas são **recalculados** a partir dos dados vigentes a
-cada envio — reenviar o mesmo arquivo não infla a prioridade.
+- **Fila de Resolução de EAN:** EAN genérico (pela base de categorias) ainda
+  sem genérico na Base Genéricos — de tabelas Gruppy, compras e vendas das
+  lojas. O fuzzy-match resolve sozinho com score ≥ 92, sugere entre 75 e 92, e
+  deixa manual abaixo de 75 (itens "Loja (API)" sempre pedem confirmação). O
+  valor de cada item é o dinheiro em jogo, regravado uma vez por dia.
+- **Vínculo de lojas GPS:** qual loja do GPS é qual loja da RMC (automático
+  pelo CNPJ quase sempre; o resto, confirmação).
+- **Sem Classificação:** produtos sem categoria, em duas sub-abas (vendidos
+  nas lojas; EANs das tabelas Gruppy).
 
 ## Por que essa arquitetura
 
-- **Postgres para dados, Spaces só para arquivos.** O banco traz, numa única
-  consulta, só as compras do laboratório e do período escolhidos; o cálculo
-  da oportunidade fica guardado em memória por (laboratório, período, versão
-  dos dados), e ordenar pelo cabeçalho, paginar e abrir detalhes não voltam
-  ao banco.
+- **Postgres para cadastros e decisões, Spaces para os dados da API.** A
+  rotina grava vendas, compras e estoque em Parquet; a Análise lê as compras
+  da rede por mês já filtradas pelos EANs do laboratório escolhido, e o
+  resultado fica em memória — ordenar, paginar e abrir detalhes não leem
+  nada de novo.
 - **Nada de consulta ao banco dentro de laço.** O banco fica em Nova York; cada
   ida e volta custa ~140 ms a partir do Brasil. Toda ingestão grava e consulta
   em lote.
-- **Leitura de planilha no navegador, processamento em segundo plano.** O parse
-  de um .xlsx de 150 mil linhas no servidor levava 25 s e centenas de MB, e
-  derrubava o app por falta de memória.
+- **Leitura de planilha no navegador.** O parse de um .xlsx grande no
+  servidor levava dezenas de segundos e centenas de MB, e derrubava o app por
+  falta de memória.
 - **`EanGenerico` é a única junção EAN → genérico.** Resolver um EAN uma vez
   conserta todo o histórico, dos dois lados, sem reprocessar nada.
 - **Explorador de Arquivos nunca exclui de verdade.** "Inativar" move para
-  `_Inativos`; "Excluir definitivamente" só existe para envios da Gruppy e do GPS.
+  `_Inativos`; "Excluir definitivamente" só existe para envios da Gruppy.
 - **Navegação manual na sidebar** (não `pages/`): o login precisa travar toda a
   navegação e o papel decide quais seções aparecem.
 
@@ -181,19 +175,20 @@ core/
   config.py                 # toda configuração (secrets -> env -> default)
   models.py                 # tabelas (SQLAlchemy)
   db.py                     # engine/pool, sessão, migrações no start, usuários fixos
-  queries.py                # cálculo da Análise de Oportunidade (SQL paginado)
+  analise_api.py            # cálculo da Análise de Oportunidade (compras da API)
+  analise.py                # filtros, ordenação, indicadores
+  queries.py                # listas dos filtros
   rotinas.py                # controle de rotinas: diária e trava "um por vez"
   sql.py                    # upsert atômico portátil (Postgres/SQLite)
   auth.py, monitoramento.py, security.py, theme.py, ui.py
 integrations/
-  gps.py                    # regra de compra, substituição por (mês, CNPJ), órfãos, filas
-  gps_processamento.py      # processamento do GPS em segundo plano (trava, tudo ou nada)
-  planilha_navegador.py     # planilha lida no navegador + rodapé do BI
+  planilha_navegador.py     # planilha lida no navegador
+  fila_compras.py, fila_loja.py  # fila de EAN pelas compras e pelas vendas da API
   gruppy.py                 # tabelas de preço, vigência por UF
   base_genericos.py         # importação da planilha curada
   sistema_interno.py        # sincronização de lojas
-  gps_api.py                # cliente da API do GPS (ainda não usado na ingestão)
-  mapeamento.py, base.py, gps_cache_orfaos.py (legado)
+  gps_api.py                # cliente da API do GPS (usado pela rotina)
+  mapeamento.py, base.py, categorias.py, gps_vinculo.py, pedido_*.py
 reconciliation/
   motor.py                  # EAN -> genérico: fuzzy-match, filas, reprocessamento
   normalizador.py
@@ -205,7 +200,8 @@ views/
 alembic/versions/           # migrações do banco
 tests/                      # pytest (SQLite + storage local temporário)
 data/seed.py                # dados de exemplo (só SQLite)
-limpeza_gps_regra_antiga.py # limpeza única dos meses da regra antiga do GPS
+pedido/                     # rotina da madrugada (API do GPS -> Spaces), cálculo do pedido, compras da rede
+limpeza_compras_planilha.py # apaga as compras antigas da planilha do GPS (prévia; --executar aplica)
 ```
 
 ## Testes
@@ -285,10 +281,9 @@ para rodar o app no próprio droplet.
 
 ## Próximas fases
 
-1. Velocidade das telas de análise (cache e tabela resumo pré-agregada).
+1. Conferir a cobertura de lojas da API e os casos "a revisar" com a rede
+   inteira online.
 2. Reconciliação: aceite automático sob confirmação humana e reprocessamento
    incremental da fila (itens 12–14 do plano em `status_e_pendencias.md`).
-3. Ingestão de compras pela API do GPS (depende de casar lojas da API, que não
-   trazem CNPJ, com as lojas da RMC).
-4. **Pedido** (montar pedido a partir da análise e exportar PDF/Excel) e
-   **Dashboard** (KPIs consolidados).
+3. Login individual (os níveis de acesso já existem em `core/acesso.py`).
+4. **Dashboard** (KPIs consolidados).

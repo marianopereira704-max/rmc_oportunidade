@@ -14,6 +14,13 @@ Medido em 25–27/09/2026 (docs/mapa_api_gps.md §6 e §10):
 
 Casar errado = lançar venda de uma farmácia na conta de outra. Na dúvida,
 nunca automático.
+
+CEP (08/10/2026): só quando ele identifica a RUA. CEP terminado em 000 é
+o da cidade inteira (Goianinha = 59173-000) e não diz nada além da cidade
+— 383 das 583 lojas da rede e 76 dos 108 CEPs da API são assim. Medido: a
+API manda CEP em 108 das 409 lojas (as 30 sem CNPJ, todas; 11 específicos).
+CEP específico igual + mesmo número = mesmo endereço → automático; o CEP
+também desempata número repetido na UF e confirma número cujo nome não bate.
 """
 from __future__ import annotations
 
@@ -30,6 +37,7 @@ SEM_CANDIDATO = "sem_candidato"
 POR_CNPJ = "cnpj"
 POR_ENDERECO = "endereco"
 POR_NOME = "nome"
+POR_CEP = "cep"
 
 # Nome que concorda com o número do endereço (0–100). 90, não menos: com 60,
 # "DROGARIA JOSE SIQUEIRA" virava automático em "DROGARIA JOSE DA LUZ" (nota
@@ -67,6 +75,18 @@ def numero_endereco(valor) -> str | None:
     """'170-A' → '170'; '09' → '9'; '265 LJ 0' → '265'; 'S/N' → None."""
     m = re.match(r"\s*0*(\d+)", str(valor or ""))
     return m.group(1) if m and m.group(1) else None
+
+
+def cep(valor) -> str | None:
+    """Só os 8 dígitos ("59173-000" → "59173000"); outro tamanho = sem CEP."""
+    d = so_digitos(valor)
+    return d if len(d) == 8 else None
+
+
+def cep_especifico(valor) -> str | None:
+    """O CEP só se ele for de rua (o terminado em 000 é o da cidade)."""
+    c = cep(valor)
+    return c if c and not c.endswith("000") else None
 
 
 @dataclass
@@ -114,8 +134,8 @@ def _compacto(valor) -> str:
 
 
 def sugerir(lojas_gps: list[dict], lojas_rmc: list[dict]) -> list[Sugestao]:
-    """`lojas_gps`: id_empresa, codigo_loja, nome_loja, cnpj, numero, uf.
-    `lojas_rmc`: cnpj, razao_social, nome_fantasia, numero, bairro, cidade, uf.
+    """`lojas_gps`: id_empresa, codigo_loja, nome_loja, cnpj, numero, uf, cep.
+    `lojas_rmc`: cnpj, razao_social, nome_fantasia, numero, bairro, cidade, uf, cep.
     Uma sugestão por loja do GPS, na mesma ordem."""
     por_cnpj = {so_digitos(l["cnpj"]): l for l in lojas_rmc if so_digitos(l.get("cnpj"))}
     por_uf: dict[str, list[dict]] = {}
@@ -134,6 +154,20 @@ def sugerir(lojas_gps: list[dict], lojas_rmc: list[dict]) -> list[Sugestao]:
         candidatas = por_uf.get(uf, [])
         numero = numero_endereco(g.get("numero"))
         mesmo_numero = [l for l in candidatas if numero and numero_endereco(l.get("numero")) == numero]
+        cep_gps = cep_especifico(g.get("cep"))
+        # CEP de rua igual + mesmo número = o mesmo endereço.
+        mesmo_endereco = [l for l in mesmo_numero if cep_gps and cep(l.get("cep")) == cep_gps]
+        if len(mesmo_endereco) == 1:
+            saida.append(Sugestao(emp, cod, so_digitos(mesmo_endereco[0]["cnpj"]), POR_CEP, AUTOMATICO, 100.0,
+                                  f"CEP {cep_gps[:5]}-{cep_gps[5:]} e número {numero} iguais"))
+            continue
+        # Número repetido na UF: o CEP (o exato, ou a mesma região — 5
+        # primeiros dígitos) separa as lojas de outra cidade/bairro.
+        cep_qualquer = cep(g.get("cep"))
+        if len(mesmo_numero) > 1 and cep_qualquer:
+            perto = [l for l in mesmo_numero if (cep(l.get("cep")) or "")[:5] == cep_qualquer[:5]]
+            if perto:
+                mesmo_numero = perto
         if mesmo_numero:
             notas = sorted(((_nota_nome(nome_gps, l, g.get("nome_loja")), l) for l in mesmo_numero),
                            key=lambda x: -x[0])
@@ -149,7 +183,15 @@ def sugerir(lojas_gps: list[dict], lojas_rmc: list[dict]) -> list[Sugestao]:
             else:
                 motivo = (f"{len(mesmo_numero)} lojas com o número {numero} na UF" if not unica
                           else f"número {numero} bate, mas o nome não (nota {nota:.0f})")
+                if not unica and nota >= _NOME_SOZINHO:
+                    motivo += " — CEP não desempata"
                 saida.append(Sugestao(emp, cod, so_digitos(melhor["cnpj"]), POR_ENDERECO, CONFIRMAR, float(nota), motivo))
+            continue
+        # Sem número batendo: CEP de rua igual em UMA loja = sugestão pra confirmar.
+        mesmo_cep = [l for l in candidatas if cep_gps and cep(l.get("cep")) == cep_gps]
+        if len(mesmo_cep) == 1:
+            saida.append(Sugestao(emp, cod, so_digitos(mesmo_cep[0]["cnpj"]), POR_CEP, CONFIRMAR, 80.0,
+                                  f"mesmo CEP {cep_gps[:5]}-{cep_gps[5:]}, número diferente"))
             continue
         if candidatas and nome_gps:
             nota, melhor = max(((_nota_nome(nome_gps, l, g.get("nome_loja")), l) for l in candidatas),

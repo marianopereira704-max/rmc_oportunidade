@@ -39,6 +39,13 @@ def test_padrao_e_o_combinado_e_valido():
     ({"fator_preco_fora": 1}, "fora do padrão"),
     ({"ruptura_unidades": -1}, "Ruptura (unidades)"),
     ({"dias_sem_classificacao": 0}, "Sem Classificação"),
+    # Dashboard (21/10/2026): o excesso é uma régua própria (não depende do ideal do
+    # Assistente), e a comparação de preço nunca com menos de 2 lojas (identificaria a loja).
+    ({"dias_cobertura_excesso": 5}, "Cobertura do estoque em excesso"),
+    ({"dias_cobertura_excesso": 400}, "Cobertura do estoque em excesso"),
+    ({"minimo_lojas_comparacao": 1}, "Lojas mínimas"),
+    ({"quantidade_comparavel": 0}, "Quantidade comparável"),
+    ({"quantidade_comparavel": 1.5}, "Quantidade comparável"),
 ])
 def test_erros_de_validacao(mudanca, trecho):
     erros = ConfigPedido.de_dict(mudanca).erros()
@@ -48,6 +55,16 @@ def test_erros_de_validacao(mudanca, trecho):
 def test_de_dict_completa_campo_novo_com_o_padrao():
     c = ConfigPedido.de_dict({"dias_medicamento": 10, "campo_que_nao_existe": 1})
     assert c.dias_medicamento == 10 and c.dias_perfumaria == 15
+
+
+def test_parametros_do_dashboard_tem_padrao_e_config_antiga_continua_valendo():
+    c = ConfigPedido.padrao()
+    assert (c.dias_cobertura_excesso, c.quantidade_comparavel, c.minimo_lojas_comparacao) == (60, 0.5, 2)
+    # Config gravada antes dos campos existirem (sem eles no JSON): usa o padrão, não quebra.
+    antiga = {k: v for k, v in c.para_dict().items()
+              if k not in ("dias_cobertura_excesso", "quantidade_comparavel", "minimo_lojas_comparacao")}
+    lida = ConfigPedido.de_dict(antiga)
+    assert lida.dias_cobertura_excesso == 60 and lida.erros() == []
 
 
 def test_gravar_guarda_historico_e_a_ultima_vale(session):
@@ -127,6 +144,25 @@ def test_diferencas_e_aplicar_campo_a_campo():
     assert configuracao.aplicar(padrao_novo, {"meses_fechados": 1}).meses_fechados == padrao_novo.meses_fechados
 
 
+def test_parametros_do_dashboard_sao_personalizaveis_por_loja(session):
+    """21/10/2026: a loja pode ter o seu limite de excesso, e o resto segue o padrão."""
+    (loja,) = _lojas(session, "REIS F1")
+    padrao = integ.vigente(session).config
+    dif = integ.salvar_loja(session, loja, configuracao.aplicar(padrao, {"dias_cobertura_excesso": 90}), "mariano")
+    assert dif == {"dias_cobertura_excesso": 90}
+    efetiva, _ = integ.config_da_loja(session, loja)
+    assert efetiva.dias_cobertura_excesso == 90 and efetiva.minimo_lojas_comparacao == 2
+    # O padrão muda depois: o que a loja não personalizou acompanha.
+    integ.salvar(session, ConfigPedido.de_dict({"quantidade_comparavel": 0.7}), "ana")
+    efetiva, _ = integ.config_da_loja(session, loja)
+    assert efetiva.dias_cobertura_excesso == 90 and efetiva.quantidade_comparavel == 0.7
+    # Valor fora do intervalo é recusado.
+    with pytest.raises(ValueError):
+        integ.salvar_loja(session, loja, configuracao.aplicar(efetiva, {"dias_cobertura_excesso": 3}), "ana")
+    # O excesso NÃO depende dos dias de estoque do Assistente: 30 dias de excesso com 15 de perfumaria vale.
+    assert ConfigPedido.de_dict({"dias_cobertura_excesso": 10}).erros() == []
+
+
 def test_reis_cada_loja_com_seus_dias_e_a_4_no_padrao(session):
     """O exemplo do Mariano: Reis F1 e F2 com dias próprios, F3 com outros,
     F4 no padrão."""
@@ -165,3 +201,20 @@ def test_faixa_de_custo_vai_do_config_para_o_calculo():
     p = c.parametros(0.10)
     assert (p.custo_faixa_min, p.custo_faixa_max, p.fator_cadastro_nota) == (0.2, 0.9, 3)
     assert ConfigPedido.de_dict({"custo_faixa_min": 0.9, "custo_faixa_max": 0.5}).erros()
+
+
+def test_parametros_da_ruptura_padrao_validacao_e_personalizacao():
+    """27/10/2026 (R13 do design da Ruptura): período da perda, risco e nível de serviço, personalizáveis por loja."""
+    import dataclasses
+    from core import dashboard_ruptura as dr
+    from pedido import configuracao as cfg
+
+    padrao = cfg.ConfigPedido()
+    assert (padrao.ruptura_perda_dias, padrao.ruptura_risco_alto, padrao.ruptura_risco_medio) == (30, 0.14, 0.03)
+    assert (padrao.ruptura_sla_vermelho, padrao.ruptura_sla_verde) == (0.65, 0.75) and padrao.erros() == []
+    errada = dataclasses.replace(padrao, ruptura_risco_medio=0.2, ruptura_sla_verde=0.5, ruptura_perda_dias=3)
+    assert len(errada.erros()) == 3
+    loja = cfg.aplicar(padrao, {"ruptura_perda_dias": 15, "ruptura_risco_alto": 0.7})
+    assert cfg.diferencas(padrao, loja) == {"ruptura_perda_dias": 15, "ruptura_risco_alto": 0.7}
+    r = dr.Regras.da_config(loja)
+    assert (r.periodo_perda, r.risco_alto, r.risco_medio, r.sla_verde) == (15, 0.7, 0.03, 0.75)

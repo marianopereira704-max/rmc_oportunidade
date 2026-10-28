@@ -17,7 +17,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from core import auth, theme
+from core import auth, dicas, theme
 from core.config import settings
 from core.db import get_session
 from pedido import categorias as cat
@@ -43,6 +43,20 @@ _ROTULOS = {
     "custo_faixa_max": "Custo coerente (máximo)",
     "fator_cadastro_nota": "Cadastro × nota",
     "venda_pontual": "Venda pontual",
+    "linhas_por_setor": "Classificação de produtos (IQVIA)",
+    "linhas_por_cmed": "Classificação de produtos (CMED)",
+    "dias_cobertura_excesso": "Excesso: cobertura acima de (dias)",
+    "quantidade_comparavel": "Quantidade comparável",
+    "minimo_lojas_comparacao": "Lojas mínimas na comparação",
+    "dias_parado": "Dias sem venda para ser parado",
+    "ruptura_perda_dias": "Ruptura: período da perda (dias)",
+    "ruptura_risco_alto": "Ruptura: risco alto a partir de",
+    "ruptura_risco_medio": "Ruptura: risco médio a partir de",
+    "ruptura_sla_vermelho": "Nível de serviço: vermelho abaixo de",
+    "ruptura_sla_verde": "Nível de serviço: verde a partir de",
+    "compras_dia_fora_pct": "Dia fora da conta: abaixo de (%)",
+    "compras_dia_fora_semanas": "Dia fora da conta: semanas de referência",
+    "compras_sem_demanda_dias": "Sem demanda: sem venda há (dias)",
 }
 _SECOES = {"padrao": "Padrão de todas as lojas", "loja": "Personalização por loja"}
 
@@ -121,12 +135,13 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
                                           step=1, key=f"{chave}_perf")
         dias_sem = a3.number_input(rotulo("Sem Classificação (dias)", p.dias_sem_classificacao), 1, 180,
                                    c.dias_sem_classificacao, step=1, key=f"{chave}_sem",
-                                   help="Dias estimados para produto sem categoria: ele recebe sugestão com a tag "
-                                        "\"Sem Classificação\" até alguém classificar (Dados → Pendências).")
+                                   help=dicas.dica("Dias estimados para produto sem categoria.",
+                                        "Ele recebe sugestão com a tag \"Sem Classificação\" até alguém classificar, "
+                                        "em Dados → Pendências."))
         piso = a4.number_input(rotulo("Piso do ideal (unidades)", p.piso_maximo), 0, 1000, c.piso_maximo, step=1,
                                key=f"{chave}_piso",
-                               help="Menor ideal possível para um produto que vendeu na janela. Com 1, quem "
-                                    "vendeu pelo menos uma vez fica com ao menos 1 unidade na loja.")
+                               help=dicas.dica("Menor ideal possível para um produto que vendeu na janela.",
+                                    "Com 1, quem vendeu pelo menos uma vez fica com ao menos 1 unidade na loja."))
         st.caption("Dias próprios de uma categoria (opcional). Em branco = dias do grupo dela."
                    + (" A coluna Padrão mostra os dias que valem sem personalização." if loja else ""))
         editada = st.data_editor(
@@ -163,9 +178,9 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
             rotulo("Venda pontual: giro baixo de curva A ou B fica na lista, desmarcado",
                    "ligado" if p.venda_pontual else "desligado"),
             value=c.venda_pontual, key=f"{chave}_pontual",
-            help="Produto que vendeu pouco, mas de valor alto (ex.: 1 unidade de um remédio de R$ 1.000). Em vez de "
-                 "\"Giro baixo\", ganha a tag \"Venda pontual\": aparece mesmo com \"Ocultar giro baixo\" ligado, "
-                 "mas vem desmarcado — só vai no pedido se o usuário marcar.")
+            help=dicas.dica("Produto que vendeu pouco, mas de valor alto. Exemplo: 1 unidade de um remédio de R$ 1.000.",
+                            "Em vez de \"Giro baixo\", ganha a tag \"Venda pontual\". Aparece mesmo com \"Ocultar giro "
+                            "baixo\" ligado, mas vem desmarcado: só vai no pedido se o usuário marcar."))
 
         theme.titulo_secao("Curva ABC")
         _explicacao(
@@ -220,6 +235,76 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
         cadastro_nota = f3.number_input(rotulo("Divergência acima de (vezes)", p.fator_cadastro_nota), 1.2, 20.0,
                                         float(c.fator_cadastro_nota), step=0.5, key=f"{chave}_cadnota")
 
+        theme.titulo_secao("Dashboard")
+        _explicacao(
+            "o Dashboard mostra estoque em excesso e parado, compara o preço que a loja pagou com o menor preço da "
+            "rede e mede a perda por ruptura. Estes números definem o que conta como excesso, como parado, quando a "
+            "comparação de preço vale e como a página Ruptura classifica o risco e o nível de serviço.",
+            "excesso = a parte do estoque que passa destes dias de venda (não tem relação com o estoque ideal do "
+            "Assistente de pedido). Ex.: vende 2 por dia, limite de 60 dias, tem 150 → 30 em excesso. Parado = tem "
+            "estoque e não vendeu nenhuma unidade nos últimos dias escolhidos (padrão 90; vale até onde há vendas "
+            "guardadas). Comparação de preço: a melhor "
+            "compra da rede só vale se a quantidade dela for ao menos esta % da que a loja comprou, e só aparece "
+            "se este mínimo de lojas diferentes comprou o produto na UF (para a loja que pagou menos não ser "
+            "identificada).",
+        )
+        d1, d2, d3, d4 = grade(4)
+        dias_excesso = d1.number_input(rotulo("Excesso: cobertura acima de (dias)", p.dias_cobertura_excesso), 7, 365,
+                                       c.dias_cobertura_excesso, step=1, key=f"{chave}_excesso")
+        qtd_comparavel = d2.number_input(rotulo("Quantidade comparável (% da sua compra)",
+                                                round(p.quantidade_comparavel * 100)), 10, 100,
+                                         round(c.quantidade_comparavel * 100), step=5, key=f"{chave}_qtdcomp")
+        minimo_lojas = d3.number_input(rotulo("Lojas mínimas na comparação", p.minimo_lojas_comparacao), 2, 20,
+                                       c.minimo_lojas_comparacao, step=1, key=f"{chave}_minlojas")
+        dias_parado = d4.number_input(rotulo("Parado: sem venda há (dias)", p.dias_parado), 7, 365, c.dias_parado, step=1,
+                                      key=f"{chave}_parado",
+                                      help=dicas.dica("Página Estoque: o produto com estoque que não vendeu nenhuma unidade nestes "
+                                                      "últimos dias é \"parado\".",
+                                                      "Também é a janela de \"Vendidas em N dias\" e do ritmo de venda da "
+                                                      "cobertura e do excesso."))
+        st.markdown("**Ruptura**")
+        r1, r2, r3, r4, r5 = grade(5)
+        perda_dias = r1.number_input(rotulo("Perda: últimos (dias)", p.ruptura_perda_dias), 7, 365, c.ruptura_perda_dias,
+                                     step=1, key=f"{chave}_perda",
+                                     help=dicas.dica("A perda por ruptura soma as faltas destes últimos dias, inclusive as "
+                                                     "que já acabaram.",
+                                                     "Enquanto o histórico do estoque não tem estes dias, a página mostra a "
+                                                     "projeção do que se perde em 30 dias sem repor."))
+        risco_alto = r2.number_input(rotulo("Risco alto: vende em (% dos dias)", round(p.ruptura_risco_alto * 100)), 1, 100,
+                                     round(c.ruptura_risco_alto * 100), step=1, key=f"{chave}_riscoalto",
+                                     help=dicas.dica("Produto em falta que vendeu em pelo menos esta parte dos dias, nos 90 "
+                                                     "dias antes de faltar.",
+                                                     "O padrão, 14%, é vender pelo menos 1 vez por semana."))
+        risco_medio = r3.number_input(rotulo("Risco médio: vende em (% dos dias)", round(p.ruptura_risco_medio * 100)),
+                                      1, 100, round(c.ruptura_risco_medio * 100), step=1, key=f"{chave}_riscomedio",
+                                      help=dicas.dica("Entre este número e o do risco alto. Abaixo dele, risco baixo.",
+                                                      "O padrão, 3%, é vender pelo menos 1 vez por mês."))
+        sla_vermelho = r4.number_input(rotulo("Nível de serviço: vermelho abaixo de (%)",
+                                              round(p.ruptura_sla_vermelho * 100)), 1, 100,
+                                       round(c.ruptura_sla_vermelho * 100), step=5, key=f"{chave}_slavermelho",
+                                       help=dicas.dica("Nível de serviço é a parte do mix que tem estoque.",
+                                                       "Abaixo deste número, o ponto fica vermelho."))
+        sla_verde = r5.number_input(rotulo("Nível de serviço: verde a partir de (%)", round(p.ruptura_sla_verde * 100)),
+                                    1, 100, round(c.ruptura_sla_verde * 100), step=5, key=f"{chave}_slaverde",
+                                    help=dicas.dica("A partir deste número, o ponto fica verde.",
+                                                    "Entre o vermelho e o verde, âmbar."))
+        st.markdown("**Compras**")
+        k1, k2, k3, _, _ = grade(5)
+        fora_pct = k1.number_input(rotulo("Dia fora da conta: abaixo de (%)", round(p.compras_dia_fora_pct * 100)),
+                                   5, 90, round(c.compras_dia_fora_pct * 100), step=5, key=f"{chave}_forapct",
+                                   help=dicas.dica("A dotação acompanha a venda de cada categoria semana a semana, "
+                                                   "contra as mesmas semanas do mês anterior.",
+                                                   "Fica fora da conta o dia em que a loja vendeu menos que esta parte "
+                                                   "do normal daquele dia da semana: dado incompleto ou feriado."))
+        fora_semanas = k2.number_input(rotulo("Dia fora da conta: semanas de referência", p.compras_dia_fora_semanas),
+                                       3, 26, c.compras_dia_fora_semanas, step=1, key=f"{chave}_forasemanas",
+                                       help=dicas.dica("O normal de cada dia da semana é a mediana destas últimas "
+                                                       "semanas."))
+        sem_demanda = k3.number_input(rotulo("Sem demanda: sem venda há (dias)", p.compras_sem_demanda_dias), 7, 365,
+                                      c.compras_sem_demanda_dias, step=1, key=f"{chave}_semdemanda",
+                                      help=dicas.dica("A compra é \"sem demanda\" quando o produto não vendeu nada "
+                                                      "nestes dias antes dela nem depois dela, até o fim do período."))
+
         if loja:
             b1, _ = st.columns([1.4, 4])
             salvar = b1.form_submit_button("Salvar personalização", type="primary", use_container_width=True)
@@ -242,6 +327,15 @@ def _formulario(c: ConfigPedido, chave: str, padrao: ConfigPedido | None = None)
         dias_sem_classificacao=int(dias_sem), fator_preco_fora=float(fator), custo_faixa_min=faixa_min / 100,
         custo_faixa_max=faixa_max / 100, fator_cadastro_nota=float(cadastro_nota),
         venda_pontual=bool(venda_pontual),
+        # A correspondência de linhas não está neste formulário: quem a edita é o pop-up da seção "Classificação
+        # de produtos" (25/10/2026). Aqui ela só passa adiante como está.
+        linhas_por_setor=dict(c.linhas_por_setor), linhas_por_cmed=dict(c.linhas_por_cmed),
+        dias_cobertura_excesso=int(dias_excesso), quantidade_comparavel=qtd_comparavel / 100,
+        minimo_lojas_comparacao=int(minimo_lojas), dias_parado=int(dias_parado),
+        ruptura_perda_dias=int(perda_dias), ruptura_risco_alto=risco_alto / 100, ruptura_risco_medio=risco_medio / 100,
+        ruptura_sla_vermelho=sla_vermelho / 100, ruptura_sla_verde=sla_verde / 100,
+        compras_dia_fora_pct=fora_pct / 100, compras_dia_fora_semanas=int(fora_semanas),
+        compras_sem_demanda_dias=int(sem_demanda),
     )
     erros += nova.erros()
     if erros:
@@ -313,6 +407,9 @@ def _padrao() -> None:
             _salvar(nova, usuario["nome"])
             st.rerun()
 
+    from views import classificacao_produtos
+    classificacao_produtos.secao(c)
+
     if historico:
         theme.titulo_secao("Histórico de alterações")
         st.dataframe(
@@ -335,7 +432,8 @@ def _rotulo_loja(l: dict) -> str:
 
 
 def _descrever(dif: dict) -> str:
-    partes = [f"{_ROTULOS.get(k, k)}: {str(v).replace('.', ',')}" for k, v in dif.items() if k != "dias_por_categoria"]
+    partes = [f"{_ROTULOS.get(k, k)}: {str(v).replace('.', ',')}" for k, v in dif.items()
+              if k not in ("dias_por_categoria", "linhas_por_setor", "linhas_por_cmed")]
     partes += [f"{c_.capitalize()}: {d} dias" for c_, d in dif.get("dias_por_categoria", {}).items()]
     return "; ".join(partes) or "volta ao padrão"
 

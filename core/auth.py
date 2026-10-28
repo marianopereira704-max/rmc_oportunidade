@@ -1,9 +1,14 @@
-"""Login (CNPJ + senha) e persistência de sessão ("lembrar-me").
+"""Login e persistência de sessão ("lembrar-me").
 
-Regra: um único CNPJ de login (30.208.213/0001-74), e a senha diferencia o
-papel — adm123 = admin, consultor = consultor. A única diferença entre os
-dois papéis é que o admin enxerga a aba extra "Dados". O consultor vê a rede
-inteira — não há escopo por loja/consultor.
+Dois jeitos de entrar, no mesmo campo "E-mail ou CNPJ" (07/10/2026):
+- EQUIPE RMC: o CNPJ da rede (30.208.213/0001-74) + senha, e a senha
+  diferencia o papel (ADM ou Consultor). Veem a rede inteira.
+- LOJAS: e-mail + senha (integrations/usuarios.py). Comprador/Proprietário,
+  só das lojas dele (principal + adicionais).
+
+Cookie "lembrar-me": `u|<id>|<assinatura>` — a assinatura leva o hash da
+senha, então trocar a senha derruba os "lembrar-me" antigos. O formato
+anterior (`cnpj|papel|assinatura`) continua aceito.
 """
 from __future__ import annotations
 
@@ -33,10 +38,22 @@ def _token_lembrar(cnpj: str, papel: str) -> str:
     return hashlib.sha256(f"{settings.cookie.segredo}::{cnpj}::{papel}".encode()).hexdigest()
 
 
-def autenticar(cnpj: str, senha: str) -> Usuario | None:
+def _token_usuario(usuario_id: int, senha_hash: str) -> str:
+    return hashlib.sha256(f"{settings.cookie.segredo}::u::{usuario_id}::{senha_hash}".encode()).hexdigest()
+
+
+def autenticar(identificador: str, senha: str) -> Usuario | None:
+    """E-mail (loja) ou CNPJ (equipe RMC) — decide pelo "@"."""
+    from integrations import usuarios
+
     with get_session() as session:
+        if usuarios.parece_email(identificador):
+            u = usuarios.autenticar_email(session, identificador, senha.strip())
+            if u is not None:
+                session.expunge(u)
+            return u
         candidatos = session.execute(
-            select(Usuario).where(Usuario.cnpj_login == cnpj.strip(), Usuario.ativo.is_(True))
+            select(Usuario).where(Usuario.cnpj_login == identificador.strip(), Usuario.ativo.is_(True))
         ).scalars().all()
         for usuario in candidatos:
             if verificar_senha(senha.strip(), usuario.senha_hash):
@@ -46,21 +63,28 @@ def autenticar(cnpj: str, senha: str) -> Usuario | None:
 
 
 def _guardar_acesso(usuario_id: int) -> None:
-    """Nível e lojas do usuário na sessão (core/acesso.py) — lidos uma vez
-    no login, não a cada tela."""
+    """Nível, lojas (principal + adicionais), painéis e linhas de compra na
+    sessão (core/acesso.py) — lidos uma vez no login, não a cada tela."""
     from core import acesso
     from core.models import UsuarioLoja
+    from integrations import usuarios
 
     with get_session() as session:
         u = session.get(Usuario, usuario_id)
         lojas = [ul.loja_id for ul in session.scalars(select(UsuarioLoja).where(UsuarioLoja.usuario_id == usuario_id))]
+        if u.loja_principal_id is not None and u.loja_principal_id not in lojas:
+            lojas.insert(0, u.loja_principal_id)
         st.session_state["usuario_id"] = usuario_id
         st.session_state["usuario_nivel"] = acesso.nivel_do_usuario(u.papel.value, u.nivel)
         st.session_state["usuario_lojas"] = lojas
+        st.session_state["usuario_login"] = u.login
+        st.session_state["usuario_paineis"] = usuarios.codigos(u.paineis)
+        st.session_state["usuario_linhas"] = usuarios.codigos(u.linhas_compra)
 
 
 def iniciar_sessao(usuario: Usuario, lembrar: bool) -> None:
-    st.session_state["usuario_cnpj"] = usuario.cnpj_login
+    # "usuario_cnpj" é a marca de "tem alguém logado" (vazio pra loja).
+    st.session_state["usuario_cnpj"] = usuario.cnpj_login or ""
     st.session_state["usuario_papel"] = usuario.papel.value
     st.session_state["usuario_nome"] = usuario.nome_exibicao
     _guardar_acesso(usuario.id)
@@ -69,7 +93,7 @@ def iniciar_sessao(usuario: Usuario, lembrar: bool) -> None:
         cm = _cookie_manager()
         cm.set(
             _COOKIE_NAME,
-            f"{usuario.cnpj_login}|{usuario.papel.value}|{_token_lembrar(usuario.cnpj_login, usuario.papel.value)}",
+            f"u|{usuario.id}|{_token_usuario(usuario.id, usuario.senha_hash)}",
             expires_at=None,
             max_age=60 * 60 * 24 * 30,  # 30 dias
             key="set_remember_cookie",
@@ -78,7 +102,7 @@ def iniciar_sessao(usuario: Usuario, lembrar: bool) -> None:
 
 def encerrar_sessao() -> None:
     for chave in ("usuario_cnpj", "usuario_papel", "usuario_nome", "usuario_id", "usuario_nivel", "usuario_lojas",
-                  "secao_ativa"):
+                  "usuario_login", "usuario_paineis", "usuario_linhas", "secao_ativa"):
         st.session_state.pop(chave, None)
     cm = _cookie_manager()
     cm.delete(_COOKIE_NAME, key="delete_remember_cookie")
@@ -96,26 +120,33 @@ def tentar_restaurar_sessao() -> bool:
         return False
 
     try:
-        cnpj, papel, token = valor.split("|")
+        a, b, token = valor.split("|")
     except ValueError:
         return False
 
-    if token != _token_lembrar(cnpj, papel):
-        return False
-
     with get_session() as session:
-        usuario = session.execute(
-            select(Usuario).where(
-                Usuario.cnpj_login == cnpj, Usuario.papel == Papel(papel), Usuario.ativo.is_(True)
-            )
-        ).scalar_one_or_none()
-        if usuario is None:
-            return False
-        usuario_id = usuario.id
+        if a == "u":
+            # Formato novo (07/10/2026): id + assinatura com o hash da senha.
+            usuario = session.get(Usuario, int(b)) if b.isdigit() else None
+            if (usuario is None or not usuario.ativo or not usuario.senha_hash
+                    or token != _token_usuario(usuario.id, usuario.senha_hash)):
+                return False
+        else:
+            cnpj, papel = a, b
+            if token != _token_lembrar(cnpj, papel):
+                return False
+            usuario = session.execute(
+                select(Usuario).where(
+                    Usuario.cnpj_login == cnpj, Usuario.papel == Papel(papel), Usuario.ativo.is_(True)
+                )
+            ).scalar_one_or_none()
+            if usuario is None:
+                return False
+        usuario_id, nome, cnpj_login, papel_valor = usuario.id, usuario.nome_exibicao, usuario.cnpj_login, usuario.papel.value
 
-    st.session_state["usuario_cnpj"] = cnpj
-    st.session_state["usuario_papel"] = papel
-    st.session_state["usuario_nome"] = usuario.nome_exibicao
+    st.session_state["usuario_cnpj"] = cnpj_login or ""
+    st.session_state["usuario_papel"] = papel_valor
+    st.session_state["usuario_nome"] = nome
     _guardar_acesso(usuario_id)
     return True
 
@@ -134,6 +165,9 @@ def usuario_atual() -> dict | None:
         "nivel": st.session_state.get("usuario_nivel")
                  or acesso.nivel_do_usuario(st.session_state["usuario_papel"], None),
         "lojas": st.session_state.get("usuario_lojas", []),
+        "login": st.session_state.get("usuario_login"),
+        "paineis": st.session_state.get("usuario_paineis", []),
+        "linhas": st.session_state.get("usuario_linhas", []),
     }
 
 

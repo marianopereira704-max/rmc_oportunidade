@@ -11,4 +11,4 @@ def test_periodo_se_explica_sem_rotulo():
 def test_opcoes_de_periodo_padrao(monkeypatch):
     monkeypatch.delenv("PERIODOS_MESES_OPCOES", raising=False)
     monkeypatch.setenv("RMC_IGNORAR_SECRETS", "1")
-    assert AppConfig().periodos_meses_opcoes == [1, 2, 3, 6]
+    assert AppConfig().periodos_meses_opcoes == [1, 2, 3]  # até 3 meses fechados (05/10/2026)

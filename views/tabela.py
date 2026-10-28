@@ -20,7 +20,10 @@ se diferirem mais de 2 px ou se um título quebrar linha.
 O componente só desenha e avisa cliques — ordenar e paginar continuam em
 Python sobre o resultado em memória (core/analise.py), como antes:
 - clique no título → gatilho `ordenar` com o campo da coluna;
-- clique no botão da linha → gatilho `acao` com o id da linha.
+- clique no botão da linha → gatilho `acao` com o id da linha;
+- linhas selecionáveis (opcional, 22/10/2026 — Dashboard · Estoque): clique na linha → gatilho `linha`
+  com o id e se o Ctrl/⌘ estava apertado. A tela decide o que é a seleção (substitui, soma, tira) e
+  devolve a lista; o componente deixa as não selecionadas apagadas, como no BI.
 
 Os textos vêm do banco (razão social, nomes): o JS monta tudo com
 `textContent`, nunca `innerHTML` — nome de loja com "<" não vira HTML.
@@ -36,6 +39,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 import streamlit as st
+
+from core import theme
 
 # ---------------------------------------------------------------------------
 # Montagem das células (Python → dados do componente)
@@ -237,6 +242,8 @@ button.titulo:focus-visible { outline: 2px solid var(--navy, #17375E); outline-o
 .txt-vermelho { color: #B3261E; font-weight: 600; }
 .txt-laranja { color: #C2410C; font-weight: 600; }
 .txt-ambar { color: #B45309; font-weight: 600; }
+/* Verde do "bom" (nível de serviço da Ruptura, 27/10/2026): o mesmo do selo de sucesso. */
+.txt-verde { color: #27500A; font-weight: 600; }
 /* Tags empilhadas: com mais de 2, uma embaixo da outra (pedido de 29/09). */
 .pilha > span { display: table; }
 .pilha > span + span { margin-top: 3px; }
@@ -279,27 +286,35 @@ button.titulo:focus-visible { outline: 2px solid var(--navy, #17375E); outline-o
 .acao svg { width: 16px; height: 16px; }
 .cel.botao { justify-self: end; }
 
-/* Dica no estilo do BI: caixa escura, aparece ao passar o mouse. Posições
-   escolhidas pra nunca sair da área do componente: abaixo do "?" do
-   cabeçalho, à esquerda do botão da última coluna. */
-[data-dica] { position: relative; }
-[data-dica]:hover::after, [data-dica]:focus-visible::after {
-  content: attr(data-dica);
-  position: absolute; z-index: 20; pointer-events: none;
-  /* pre-line: "
+/* Dica: o balão único do app (theme.CSS_DICA, regra em core/dicas.py). Posições escolhidas pra nunca sair da
+   área do componente: abaixo do "?" do cabeçalho, à esquerda do botão da última coluna. */
+""" + theme.CSS_DICA + """
 
-" no texto vira parágrafo (dicas de 02/10/2026). */
-  width: max-content; max-width: 300px; white-space: pre-line; text-align: left;
-  background: #1F2A37; color: #FFFFFF;
-  font-size: var(--fs-min, 12px); font-weight: 400; line-height: 1.4;
-  padding: 6px 10px; border-radius: var(--raio-sm, 6px);
-  box-shadow: 0 4px 12px rgba(0, 0, 0, .18);
+/* Linhas selecionáveis (Dashboard · Estoque, 22/10/2026): clicar filtra a página. A linha escolhida ganha o
+   azul claro de "selecionado" e, havendo seleção, as outras ficam apagadas (como no BI). A linha de total
+   (classe "total", e "selecionavel": false) nunca é selecionável nem apaga. */
+.linha.corpo.clicavel { cursor: pointer; user-select: none; }
+.linha.corpo.clicavel:focus-visible { outline: 2px solid var(--navy-claro, #4A6E90); outline-offset: -2px; }
+.linha.corpo.clicavel > .cel { transition: opacity .15s; }
+.linha.corpo.apagada > .cel { opacity: .35; }
+.linha.corpo.selecionada { background: #EEF4FB; box-shadow: inset 3px 0 0 var(--navy, #17375E); }
+.linha.corpo.selecionada:hover { background: #E4EDF8; }
+.linha.corpo.total { font-weight: 700; background: var(--fundo-card, #F7F8FA); border-top: 2px solid var(--borda, #E4E7EB); }
+
+/* Linhas que abrem (26/10/2026, Dashboard · Estoque): a setinha no FIM da linha abre as de dentro (`pai`), que
+   ficam recuadas pelo `nivel` e em texto auxiliar. Abrir e fechar é só do navegador: não roda o script. */
+.linha.corpo.oculta { display: none; }
+.linha.corpo.sub > .cel { font-size: var(--fs-aux, 13px); color: var(--texto-suporte, #3F4750); }
+.linha.corpo.sub { background: #FBFCFD; }
+.abrir {
+  display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; padding: 0;
+  border: 0; border-radius: var(--raio-sm, 6px); background: transparent; color: var(--navy, #17375E); cursor: pointer;
 }
-[data-dica].dica-abaixo:hover::after { top: calc(100% + 6px); left: 50%; transform: translateX(-50%); }
-[data-dica].dica-esquerda:hover::after, [data-dica].dica-esquerda:focus-visible::after {
-  right: calc(100% + 8px); top: 50%; transform: translateY(-50%);
-}
-[data-dica].dica-acima:hover::after { bottom: calc(100% + 4px); left: 0; }
+.abrir:hover { background: var(--fundo-card, #F7F8FA); }
+.abrir:focus-visible { outline: 2px solid var(--navy, #17375E); outline-offset: 1px; }
+.abrir svg { width: 16px; height: 16px; transition: transform .15s ease; }
+.abrir[aria-expanded="true"] svg { transform: rotate(180deg); }
+@media (prefers-reduced-motion: reduce) { .linha.corpo.clicavel > .cel { transition: none; } }
 
 /* Estado vazio */
 .vazio { padding: var(--esp-6, 32px) var(--esp-4, 16px); text-align: center; }
@@ -387,11 +402,27 @@ export default function (component) {
   // margem das colunas das pontas — com 32px fixos, o botão (32px) invadia o
   // vão de Economia em 16px (medido pela checagem de vãos em 25/09/2026).
   if (data.acao) trilhas.push("auto");
+  // Linhas que abrem: uma coluna a mais, no fim, para a setinha. O que está aberto fica guardado no próprio
+  // elemento (sobrevive ao redesenho de um clique em outra parte da tela).
+  const comArvore = linhas.some(l => l.filhos);
+  if (comArvore) trilhas.push("auto");
+  const abertos = raiz.__abertos || (raiz.__abertos = new Set());
+  const paiDe = new Map(linhas.map(l => [String(l.id), l.pai != null ? String(l.pai) : null]));
+  const visivel = (id) => {
+    for (let p = paiDe.get(id); p; p = paiDe.get(p)) if (!abertos.has(p)) return false;
+    return true;
+  };
   raiz.style.setProperty("--colunas", trilhas.join(" "));
   raiz.classList.toggle("densa", !!data.densa);
 
   const quadro = el("div", "quadro");
   quadro.setAttribute("role", "table");
+  // Linhas selecionáveis: a tela inteira é redesenhada a cada clique (o Python devolve a seleção nova); quem
+  // navega por teclado perderia o foco. Guarda qual linha o tinha e devolve depois.
+  const selecionaveis = !!data.linhas_selecionaveis;
+  const marcadas = new Set((data.linhas_selecionadas || []).map(String));
+  const comFoco = raiz.__foco || null;
+  raiz.__reconstruindo = true;
 
   if (!linhas.length) {
     const vazio = el("div", "vazio");
@@ -400,6 +431,7 @@ export default function (component) {
     if (data.vazio_texto) vazio.appendChild(el("div", "s", data.vazio_texto));
     quadro.appendChild(vazio);
     raiz.replaceChildren(quadro);
+    raiz.__reconstruindo = false;
     return;
   }
 
@@ -446,11 +478,37 @@ export default function (component) {
     cab.appendChild(cel);
   }
   if (data.acao) cab.appendChild(el("div", "cel"));
+  if (comArvore) cab.appendChild(el("div", "cel"));
   quadro.appendChild(cab);
+  const elementos = new Map();
 
   for (const l of linhas) {
     const linha = el("div", "linha corpo" + (l.classe ? " " + l.classe : ""));
     linha.setAttribute("role", "row");
+    elementos.set(String(l.id), linha);
+    if (l.pai != null) {
+      linha.classList.add("sub");
+      if (!visivel(String(l.id))) linha.classList.add("oculta");
+      // As de dentro apagam junto com a categoria de cima quando ela não está entre as escolhidas.
+      if (marcadas.size && l.grupo != null && !marcadas.has(String(l.grupo))) linha.classList.add("apagada");
+    }
+    if (selecionaveis && l.selecionavel !== false) {
+      const escolhida = marcadas.has(String(l.id));
+      linha.classList.add("clicavel");
+      if (escolhida) linha.classList.add("selecionada");
+      else if (marcadas.size) linha.classList.add("apagada");
+      linha.dataset.id = String(l.id);
+      linha.tabIndex = 0;
+      linha.setAttribute("aria-selected", escolhida ? "true" : "false");
+      const clicar = (soma) => setTriggerValue("linha", { id: l.id, soma, t: Date.now() });
+      linha.onclick = (ev) => { if (!ev.target.closest("button, input, a")) clicar(!!(ev.ctrlKey || ev.metaKey)); };
+      // Linha não é botão: Enter/Espaço (com Ctrl/⌘ soma) precisam do tratamento do teclado.
+      linha.onkeydown = (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); clicar(!!(ev.ctrlKey || ev.metaKey)); }
+      };
+      linha.onfocus = () => { raiz.__foco = String(l.id); };
+      linha.onblur = () => { if (!raiz.__reconstruindo) raiz.__foco = null; };
+    }
     if (selecao) {
       const cel = el("div", "cel sel");
       const caixa = el("input", "marca");
@@ -461,9 +519,10 @@ export default function (component) {
       cel.appendChild(caixa);
       linha.appendChild(cel);
     }
-    for (const c of colunas) {
+    colunas.forEach((c, ic) => {
       const cel = el("div", "cel" + (c.direita ? " direita" : "") + (c.centro ? " centro" : ""));
       cel.setAttribute("role", "cell");
+      if (ic === 0 && l.nivel) cel.style.paddingLeft = (l.nivel * 20) + "px";
       if (c.icone && ICONES_CEL[c.icone]) {
         cel.classList.add("com-icone");
         cel.appendChild(svg(ICONES_CEL[c.icone], "icone-cel"));
@@ -474,7 +533,7 @@ export default function (component) {
         cel.appendChild(montarCelula(l.celulas[c.id], (valor) => setTriggerValue("editar", { id: l.id, valor })));
       }
       linha.appendChild(cel);
-    }
+    });
     if (data.acao) {
       const cel = el("div", "cel botao");
       const botao = el("button", "acao dica-esquerda");
@@ -486,9 +545,34 @@ export default function (component) {
       cel.appendChild(botao);
       linha.appendChild(cel);
     }
+    if (comArvore) {
+      const cel = el("div", "cel botao");
+      if (l.filhos) {
+        const id = String(l.id);
+        const botao = el("button", "abrir");
+        botao.type = "button";
+        botao.setAttribute("aria-expanded", abertos.has(id) ? "true" : "false");
+        botao.setAttribute("aria-label", abertos.has(id) ? "Fechar detalhamento" : "Abrir detalhamento");
+        botao.appendChild(svg(SETA_BAIXO));
+        botao.onclick = (ev) => {
+          ev.stopPropagation();   // abrir não seleciona a linha
+          if (abertos.has(id)) abertos.delete(id); else abertos.add(id);
+          botao.setAttribute("aria-expanded", abertos.has(id) ? "true" : "false");
+          botao.setAttribute("aria-label", abertos.has(id) ? "Fechar detalhamento" : "Abrir detalhamento");
+          for (const [outro, elem] of elementos) if (paiDe.get(outro)) elem.classList.toggle("oculta", !visivel(outro));
+        };
+        cel.appendChild(botao);
+      }
+      linha.appendChild(cel);
+    }
     quadro.appendChild(linha);
   }
   raiz.replaceChildren(quadro);
+  raiz.__reconstruindo = false;
+  if (comFoco) {
+    const alvo = Array.from(raiz.querySelectorAll(".linha.clicavel")).find((x) => x.dataset.id === comFoco);
+    if (alvo) alvo.focus({ preventScroll: true });
+  }
 }
 """
 
@@ -514,6 +598,8 @@ def tabela(
     ao_editar: Callable[[str, str], None] | None = None,
     selecao: dict[str, bool] | None = None,
     ao_marcar: Callable[[dict[str, bool]], None] | None = None,
+    selecao_linhas: list[str] | None = None,
+    ao_clicar_linha: Callable[[str, bool], None] | None = None,
 ) -> None:
     """Desenha a tabela.
 
@@ -527,7 +613,14 @@ def tabela(
     muda, antes do rerun.
     `selecao`: {id da linha: marcada?} — com ele, a 1ª coluna é um checkbox
     por linha e o do cabeçalho marca/desmarca a PÁGINA. `ao_marcar({id:
-    valor})`: chamado no clique, antes do rerun."""
+    valor})`: chamado no clique, antes do rerun.
+    `selecao_linhas`: LIGA as linhas selecionáveis (22/10/2026): a lista de ids selecionados (vazia = nenhuma,
+    mas as linhas já são clicáveis; None = recurso desligado, a tabela é a de sempre). `ao_clicar_linha(id,
+    soma)`: chamado no clique numa linha, antes do rerun; `soma` é o Ctrl/⌘. Linha com `"selecionavel":
+    False` (o total) não clica nem apaga; `"classe": "total"` a deixa em negrito.
+    Linhas que abrem (26/10/2026): `"filhos": True` põe a setinha no fim da linha; a linha com `"pai": id` fica
+    escondida até o pai (e os avós) estarem abertos, recuada `"nivel"` × 20 px; com `"grupo": id`, ela apaga junto
+    quando há seleção e o grupo não está nela. Abrir e fechar não roda o script."""
     por_campo = {c.campo: c for c in colunas if c.campo}
 
     def _ordenar() -> None:
@@ -550,6 +643,11 @@ def tabela(
         if linha_id is not None:
             st.session_state[_chave_acao(key)] = linha_id
 
+    def _linha() -> None:
+        valor = st.session_state[key].linha
+        if ao_clicar_linha and isinstance(valor, dict) and valor.get("id") is not None:
+            ao_clicar_linha(str(valor["id"]), bool(valor.get("soma")))
+
     _COMPONENTE(
         key=key,
         data={
@@ -565,11 +663,14 @@ def tabela(
             "vazio_texto": vazio[1],
             "densa": densa,
             "selecao": selecao,
+            "linhas_selecionaveis": selecao_linhas is not None,
+            "linhas_selecionadas": list(selecao_linhas or []),
         },
         on_ordenar_change=_ordenar,
         on_acao_change=_acao,
         on_editar_change=_editar,
         on_marcar_change=_marcar,
+        on_linha_change=_linha,
     )
 
 

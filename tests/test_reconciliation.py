@@ -12,11 +12,9 @@ from core.models import (
     EanGenerico,
     FilaResolucaoEAN,
     ItemTabelaGruppy,
-    Loja,
     ModoCustoGruppy,
     OrigemFila,
     OrigemResolucao,
-    RegistroCompraGPS,
     StatusFila,
     TabelaGruppy,
 )
@@ -335,24 +333,6 @@ def test_importar_base_genericos_ignora_linha_com_ean_ou_descricao_vazios(sessio
 # limpar_eans_sujos
 # ---------------------------------------------------------------------------
 
-def _criar_loja(session, cnpj="30.208.213/0001-74", uf="SP") -> Loja:
-    loja = Loja(cnpj=cnpj, razao_social="Farmácia Teste", uf=uf, cidade="São Paulo")
-    session.add(loja)
-    session.flush()
-    return loja
-
-
-def _criar_registro_gps(session, loja_id, ean, ano_mes="2026-08", **kwargs) -> RegistroCompraGPS:
-    registro = RegistroCompraGPS(
-        loja_id=loja_id, ean=ean, descricao_origem=kwargs.pop("descricao_origem", "Produto"),
-        ano_mes=ano_mes, quantidade=kwargs.pop("quantidade", 1), fat_liquido=kwargs.pop("fat_liquido", 10.0),
-        pct_cmv=kwargs.pop("pct_cmv", 0.5), custo_unitario=kwargs.pop("custo_unitario", 5.0),
-        estoque=kwargs.pop("estoque", 0),
-    )
-    session.add(registro)
-    session.flush()
-    return registro
-
 
 def _criar_tabela_gruppy(session) -> TabelaGruppy:
     tabela = TabelaGruppy(
@@ -361,17 +341,6 @@ def _criar_tabela_gruppy(session) -> TabelaGruppy:
     session.add(tabela)
     session.flush()
     return tabela
-
-
-def test_limpar_eans_sujos_corrige_registro_compra_gps(session):
-    loja = _criar_loja(session)
-    _criar_registro_gps(session, loja.id, "7896422507295.0")
-
-    resultado = motor.limpar_eans_sujos(session)
-
-    assert resultado.registros_compra_gps_corrigidos == 1
-    registro = session.query(RegistroCompraGPS).one()
-    assert registro.ean == "7896422507295"
 
 
 def test_limpar_eans_sujos_corrige_item_tabela_gruppy(session):
@@ -398,21 +367,6 @@ def test_limpar_eans_sujos_corrige_fila_resolucao_ean(session):
     assert resultado.fila_resolucao_ean_corrigidos == 1
     fila = session.query(FilaResolucaoEAN).one()
     assert fila.ean == "7896422507295"
-
-
-def test_limpar_eans_sujos_pula_colisao_em_registro_compra_gps(session):
-    # mesma loja+mês, um EAN já limpo e um sujo que normalizaria pro MESMO
-    # valor — nunca sobrescrever/mesclar dado financeiro real às cegas.
-    loja = _criar_loja(session)
-    _criar_registro_gps(session, loja.id, "999", quantidade=1)
-    _criar_registro_gps(session, loja.id, "999.0", quantidade=2)
-
-    resultado = motor.limpar_eans_sujos(session)
-
-    assert resultado.registros_compra_gps_corrigidos == 0
-    assert resultado.registros_compra_gps_colisoes_puladas == 1
-    eans = sorted(r.ean for r in session.query(RegistroCompraGPS).all())
-    assert eans == ["999", "999.0"]  # nenhuma linha apagada ou sobrescrita
 
 
 def test_limpar_eans_sujos_mescla_colisao_em_fila_resolucao_ean(session):

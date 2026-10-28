@@ -13,7 +13,6 @@ from core.models import (
     Base,
     BaseGenerico,
     EanGenerico,
-    FilaCnpjOrfao,
     FilaResolucaoEAN,
     FSNode,
     ItemTabelaGruppy,
@@ -22,19 +21,14 @@ from core.models import (
     OrigemFila,
     OrigemResolucao,
     Papel,
-    RegistroCompraGPS,
     StatusCobertura,
     StatusFila,
     TabelaGruppy,
     TabelaGruppyCobertura,
     UltimoMapeamentoColuna,
-    UploadGPS,
     Usuario,
 )
 from integrations import base_genericos as base_genericos_integ
-from integrations import gps as gps_integ
-from integrations import gps_processamento
-from integrations.planilha_navegador import PlanilhaRecebida
 from integrations import gruppy as gruppy_integ
 from integrations import mapeamento as mapeamento_integ
 from storage import filesystem as fs
@@ -160,7 +154,13 @@ def test_gruppy_desconto_caso_limite_em_1_e_100_por_cento(session, pasta_raiz_id
 
 
 def test_gruppy_ean_sem_generico_vai_pra_fila_sem_acumular_valor(session, pasta_raiz_id):
-    conteudo = _xlsx_bytes([{"ean": "444", "descricao": "Produto Desconhecido XYZ", "custo": 55.0}])
+    from core.models import CategoriaEan, OrigemCategoria
+
+    # Só genérico (pela base de categorias) vai pra fila — 05/10/2026.
+    session.add(CategoriaEan(ean="444", categoria="PRESCRIÇÃO GENÉRICO", origem=OrigemCategoria.CMED))
+    session.flush()
+    conteudo = _xlsx_bytes([{"ean": "444", "descricao": "Produto Desconhecido XYZ", "custo": 55.0},
+                            {"ean": "446", "descricao": "Fralda XYZ", "custo": 30.0}])
     gruppy_integ.processar_planilha_gruppy(
         session, conteudo, "t.xlsx", "admin", pasta_raiz_id,
         laboratorio="Lab W", ufs=["SP"], modo_custo=ModoCustoGruppy.PRONTO,
@@ -168,6 +168,9 @@ def test_gruppy_ean_sem_generico_vai_pra_fila_sem_acumular_valor(session, pasta_
     fila = session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "444")).scalar_one()
     # Gruppy é catálogo de preço unitário, não valor transacionado -> não conta pro Pareto da fila
     assert float(fila.valor_total_acumulado) == 0
+    # Não genérico (ou sem categoria): compara pelo próprio EAN, não entra na fila — mas o preço é gravado.
+    assert session.execute(select(FilaResolucaoEAN).where(FilaResolucaoEAN.ean == "446")).scalar_one_or_none() is None
+    assert session.execute(select(ItemTabelaGruppy).where(ItemTabelaGruppy.ean == "446")).scalar_one() is not None
 
 
 def test_gruppy_coluna_com_pontuacao_e_reconhecida(session, pasta_raiz_id):
@@ -204,25 +207,8 @@ def test_gruppy_planilha_real_com_celula_vazia_nao_gruda_sufixo_no_ean(session, 
 
 
 # ---------------------------------------------------------------------------
-# GPS
+# Apoio (a planilha do GPS saiu em 05/10/2026: compras vêm da API)
 # ---------------------------------------------------------------------------
-
-def _enviar_gps(session, pasta_raiz_id, linhas: list[dict], ano_mes: str = "2026-07", nome: str = "gps.xlsx"):
-    """Envio GPS pelo MESMO caminho da tela (gps_processamento.iniciar),
-    rodando na própria chamada e dentro da sessão do teste."""
-    from contextlib import nullcontext
-
-    df = pd.DataFrame(linhas)
-    mapa = gps_integ.mapear_colunas(df)
-    planilha = PlanilhaRecebida(nome=nome, tamanho_bytes=3, df=df, storage_key=None, conteudo=b"xls")
-    iniciou, motivo = gps_processamento.iniciar(
-        planilha, gps_integ.preparar_compras(df, mapa), mapa, ano_mes, pasta_raiz_id, "admin",
-        fabrica_sessao=lambda: nullcontext(session), em_segundo_plano=False,
-    )
-    assert iniciou, motivo
-    estado = gps_processamento.estado_atual()
-    assert estado.sucesso, estado.erro
-    return estado
 
 
 def _criar_loja(session, cnpj, uf="SP") -> Loja:
@@ -458,23 +444,14 @@ def test_excluir_tabela_gruppy_nao_afeta_outras_tabelas_do_sistema(session, past
     session.add(FilaResolucaoEAN(
         ean="888888", descricao_observada="Pendente", origem=OrigemFila.GPS, status=StatusFila.PENDENTE,
     ))
-    session.add(FilaCnpjOrfao(cnpj="11111111000100", status=StatusFila.PENDENTE))
-
-    _enviar_gps(session, pasta_raiz_id, [{
-        "cnpj": "30.208.213/0001-74", "ean": "777777", "descricao": "Produto GPS",
-        "Quantidade": 1, "VlrUnitario": 10.0,
-    }])
 
     fs_node_id, _tabela_id = _criar_upload_gruppy(session, pasta_raiz_id, "Lab Isolado", "333")
 
     def contagens():
         return {
-            "registros_compra_gps": session.execute(select(func.count()).select_from(RegistroCompraGPS)).scalar_one(),
-            "uploads_gps": session.execute(select(func.count()).select_from(UploadGPS)).scalar_one(),
             "base_genericos": session.execute(select(func.count()).select_from(BaseGenerico)).scalar_one(),
             "ean_genericos": session.execute(select(func.count()).select_from(EanGenerico)).scalar_one(),
             "fila_resolucao_ean": session.execute(select(func.count()).select_from(FilaResolucaoEAN)).scalar_one(),
-            "fila_cnpj_orfao": session.execute(select(func.count()).select_from(FilaCnpjOrfao)).scalar_one(),
             "lojas": session.execute(select(func.count()).select_from(Loja)).scalar_one(),
             "usuarios": session.execute(select(func.count()).select_from(Usuario)).scalar_one(),
         }
@@ -484,21 +461,15 @@ def test_excluir_tabela_gruppy_nao_afeta_outras_tabelas_do_sistema(session, past
     depois = contagens()
 
     assert depois == antes
-    assert antes["registros_compra_gps"] == 1  # confirma que a baseline tinha dado de verdade, não só zero
+    assert antes["fila_resolucao_ean"] == 1  # confirma que a baseline tinha dado de verdade, não só zero
     assert antes["usuarios"] == 1
 
 
 def test_buscar_tabela_por_fs_node_so_acha_arquivo_gruppy(session, pasta_raiz_id):
     # É essa função que decide se "Excluir definitivamente" aparece no menu
-    # do Explorador (views/dados.py::_explorador) — GPS e Base Genéricos não
-    # têm elo de volta pro FSNode (só TabelaGruppy.upload_fs_node_id existe),
-    # então nunca devem "achar" uma tabela pra esse botão aparecer.
-    _criar_loja(session, "30.208.213/0001-74")
-    _enviar_gps(session, pasta_raiz_id, [{
-        "cnpj": "30.208.213/0001-74", "ean": "555555", "descricao": "Produto GPS",
-        "Quantidade": 1, "VlrUnitario": 10.0,
-    }])
-    upload_gps = session.execute(select(UploadGPS)).scalar_one()
+    # do Explorador (views/dados.py::_explorador) — Base Genéricos não tem
+    # elo de volta pro FSNode (só TabelaGruppy.upload_fs_node_id existe),
+    # então nunca deve "achar" uma tabela pra esse botão aparecer.
 
     conteudo_base = _xlsx_bytes([{"FCC": "F001", "EAN": 666666, "DESCRIÇÃO MARCOS": "Produto Base"}])
     base_genericos_integ.processar_planilha_base_genericos(
@@ -508,7 +479,6 @@ def test_buscar_tabela_por_fs_node_so_acha_arquivo_gruppy(session, pasta_raiz_id
 
     fs_node_id_gruppy, tabela_id = _criar_upload_gruppy(session, pasta_raiz_id, "Lab Visivel", "777")
 
-    assert gruppy_integ.buscar_tabela_por_fs_node(session, upload_gps.fs_node_id) is None
     assert gruppy_integ.buscar_tabela_por_fs_node(session, fs_node_base.id) is None
     tabela_encontrada = gruppy_integ.buscar_tabela_por_fs_node(session, fs_node_id_gruppy)
     assert tabela_encontrada is not None
@@ -550,16 +520,3 @@ def test_gruppy_recusa_planilha_de_compras_gps():
     gruppy_integ.validar_planilha(pd.DataFrame(columns=_CABECALHO_GRUPPY_REAL))
 
 
-def test_gps_recusa_planilha_sem_nenhuma_compra(session, pasta_raiz_id):
-    from contextlib import nullcontext
-
-    df = pd.DataFrame([{"cnpj": "30.208.213/0001-74", "EAN": "7891", "Produto": "X", "Quantidade": None,
-                        "VlrUnitario": None}])
-    mapa = gps_integ.mapear_colunas(df)
-    iniciou, motivo = gps_processamento.iniciar(
-        PlanilhaRecebida("x.xlsx", 1, df, None, b"x"), gps_integ.preparar_compras(df, mapa), mapa, "2026-08",
-        pasta_raiz_id, "admin", fabrica_sessao=lambda: nullcontext(session), em_segundo_plano=False,
-    )
-    assert not iniciou
-    assert "Nenhuma compra" in motivo
-    assert session.execute(select(func.count()).select_from(UploadGPS)).scalar_one() == 0
