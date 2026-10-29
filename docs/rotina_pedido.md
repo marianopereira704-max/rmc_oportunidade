@@ -1,8 +1,12 @@
 # Rotina de dados do Pedido — passo a passo
 
 A rotina baixa da API do GPS as **vendas, compras e estoque** de cada loja
-ativa do RMC e grava no Spaces, em `pedido/`. Roda sozinha à **meia-noite**
-(horário de Brasília), no GitHub Actions, dividida em 4 partes paralelas.
+ativa do RMC e grava no Spaces, em `pedido/`. Roda sozinha às **00:47**
+(horário de Brasília), no GitHub Actions, dividida em 8 partes paralelas. O
+GitHub não garante o horário do agendamento: em 29/10/2026 a marcada para
+00:00 só começou às 06:03 (o minuto quebrado costuma atrasar menos). Cada parte
+para sozinha aos 310 min (`PEDIDO_ORCAMENTO_MINUTOS`), com folga até o corte
+do GitHub aos 355; parte cortada vira alerta por e-mail.
 A **carga inicial** (3 meses fechados + o mês corrente) é o mesmo comando:
 na primeira vez falta tudo, e ela baixa tudo; depois, só o dia anterior e o
 estoque.

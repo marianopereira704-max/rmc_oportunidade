@@ -371,3 +371,14 @@ def test_venda_pontual_giro_baixo_de_curva_a_ou_b():
     desligado = calculo.calcular(_pronto(vendas, estoque), base, SEM_GENERICOS, calculo.Parametros(venda_pontual=False))
     assert _linha(desligado, "CARO")["giro_baixo"] and not _linha(desligado, "CARO")["venda_pontual"]
 
+
+
+def test_acima_da_venda_sem_nenhuma_nota_paga():
+    """29/10/2026: preço acima do preço de venda e só nota bonificada — nada a trocar. No pandas 3.1 o `.map` da série
+    vazia devolvia texto e a conta quebrava (55 lojas no cálculo de madrugada)."""
+    vendas = [("5", "2026-09-20", 10, 1)]
+    estoque = [("5", "205", "P5", "L", 0, 50.00, 20.00)]
+    compras = [("5", "205", "2026-09-01", 0.05, 0, 1, "LAB", "F")]
+    base = pd.DataFrame([("205", "MIP/OTC")], columns=["ean", "categoria"])
+    df = calculo.calcular(_pronto(vendas, estoque, compras), base, SEM_GENERICOS)
+    assert _linha(df, "P5")["preco"] == pytest.approx(50.00)

@@ -2,16 +2,21 @@
 # core/theme.py, SELETORES_STREAMLIT). Atualizar = decisão consciente: subir
 # aqui, rodar `python -m tests.visual.rodar` e conferir o contrato.
 streamlit==1.62.0
-sqlalchemy>=2.0
+# Também FIXAS (29/10/2026): o GitHub e o Streamlit Cloud instalam do zero e pegavam a mais nova. O pandas 3.1
+# saiu e quebrou o cálculo do Assistente (`.map` de série vazia de texto devolve texto; 55 lojas no cálculo de
+# madrugada e 19 testes). Atualizar = decisão consciente: instalar a nova num ambiente à parte, rodar o pytest e o
+# teste visual, e só então subir aqui.
+sqlalchemy==2.0.52
 alembic>=1.13
 psycopg2-binary>=2.9
 boto3>=1.34
 requests>=2.31
-pandas>=2.0
+pandas==3.0.5
+numpy==2.5.2
 # Parquet (arquivos da rotina do Pedido no Spaces — pedido/armazenamento.py)
-pyarrow>=15
+pyarrow==25.0.1
 openpyxl>=3.1
-plotly>=5.20
+plotly==7.0.0
 extra-streamlit-components>=0.1.71
 python-dotenv>=1.0
 bcrypt>=4.1

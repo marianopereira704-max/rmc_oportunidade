@@ -156,3 +156,17 @@ def test_so_precalculo_nao_confere_a_coleta_nem_regrava_o_resumo(tmp_path):
                           "--so-precalculo"], enviar_email=lambda d, a, t: enviados.append(t))
     assert (codigo, enviados) == (0, [])
     assert not armaz.existe("pedido/controle/alerta/2026-10-29.json")
+
+
+def test_parte_cortada_pelo_github_vira_problema(tmp_path):
+    """29/10/2026: 4 partes cortadas aos 355 min sem relatório; o último delas no dia era o da carga."""
+    armaz = ArmazenamentoLocal(tmp_path)
+    _backups(armaz, "2026-10-29")
+    for p in ("parte1de2", "parte2de2"):
+        _relatorio(armaz, "2026-10-29", p)
+    enviados = []
+    base = ["--destino", f"local:{tmp_path}", "--partes", "2", "--hoje", "2026-10-29"]
+    assert alerta.main(base + ["--coleta", "success"], enviar_email=lambda d, a, t: enviados.append(t)) == 0
+    assert enviados == []
+    alerta.main(base + ["--coleta", "cancelled"], enviar_email=lambda d, a, t: enviados.append(t))
+    assert len(enviados) == 1 and "'cancelled'" in enviados[0]

@@ -10,9 +10,13 @@ name: Rotina Pedido (API do GPS)
 
 on:
   schedule:
-    # 03:00 UTC = 00:00 em Brasília. O GPS atualiza os dados do dia por volta
-    # das 11h–12h; rodando à meia-noite, o dia anterior já está completo.
-    - cron: "0 3 * * *"
+    # 03:47 UTC = 00:47 em Brasília. O GPS atualiza os dados do dia por volta
+    # das 11h–12h; rodando depois da meia-noite, o dia anterior já está completo.
+    # Minuto quebrado (29/10/2026): o GitHub atrasa mais o que é agendado na
+    # hora cheia — a de 29/10 marcada para 00:00 só começou às 06:03. Depois da
+    # meia-noite de propósito: o "hoje" da rotina decide o mês que fecha e as
+    # compras dos últimos dias.
+    - cron: "47 3 * * *"
   workflow_dispatch:  # botão "Run workflow" (carga inicial, reprocessar)
     inputs:
       modo:
@@ -54,7 +58,10 @@ jobs:
         run: python -m pedido --parte ${{ matrix.parte }} --partes 8
         env:
           RMC_IGNORAR_SECRETS: "1"
-          PEDIDO_ORCAMENTO_MINUTOS: "330"
+          # 310 de 355 (29/10/2026): uma consulta ao GPS pode levar até 8 min e
+          # a parte ainda grava o relatório; com 330, 4 das 8 partes foram
+          # cortadas pelo GitHub aos 355 min, sem relatório.
+          PEDIDO_ORCAMENTO_MINUTOS: "310"
           GPS_API_BASE_URL: ${{ secrets.GPS_API_BASE_URL }}
           GPS_API_KEY: ${{ secrets.GPS_API_KEY }}
           DO_SPACES_ENDPOINT: ${{ secrets.DO_SPACES_ENDPOINT }}
@@ -146,7 +153,7 @@ jobs:
       - run: pip install -r requirements.txt
       - name: Alerta
         run: >-
-          python -m pedido.alerta --partes 8
+          python -m pedido.alerta --partes 8 --coleta ${{ needs.coleta.result }}
           ${{ inputs.modo == 'so_precalculo' && '--so-precalculo' || '' }}
           ${{ inputs.modo != 'so_precalculo' && needs.precalculo.result != 'skipped' && '--precalculo' || '' }}
         env:

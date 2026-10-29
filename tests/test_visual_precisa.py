@@ -12,5 +12,6 @@ def test_so_o_que_aparece_na_tela_pede_o_teste_visual():
 
 def test_requirements_so_com_o_streamlit():
     assert arquivos_da_tela(["requirements.txt"], "+pandas==2.3.0") == []
+    assert arquivos_da_tela(["requirements.txt"], "+# o GitHub e o Streamlit Cloud instalam do zero") == []
     assert arquivos_da_tela(["requirements.txt"], "-streamlit==1.62.0\n+streamlit==1.63.0") == [
         "requirements.txt (versão do Streamlit)"]

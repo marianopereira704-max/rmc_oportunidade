@@ -410,6 +410,11 @@ def _corrigir_acima_da_venda(df: pd.DataFrame, c: pd.DataFrame, p: Parametros) -
     if not acima.any() or c.empty:
         return
     pagas = c[~c["bonificado"] & c["linha"].isin(df.index[acima])]
+    # Sem nota paga: nada a trocar. Também por causa do pandas 3.1 (29/10/2026): o `.map` de uma série VAZIA de
+    # texto devolve texto, e `v * fator` quebrava ("Can only string multiply by an integer") — 55 lojas no
+    # cálculo de madrugada, que instala a versão mais nova.
+    if pagas.empty:
+        return
     v = pagas["linha"].map(venda)
     boas = (pagas[(pagas["preco"] <= v * p.custo_faixa_max) & (pagas["preco"] >= v * p.custo_faixa_min)]
             .sort_values(["linha", "data"], ascending=[True, False], kind="stable")

@@ -27,8 +27,11 @@ def _git(*args: str) -> list[str]:
 
 def arquivos_da_tela(alterados: list[str], requirements_diff: str = "") -> list[str]:
     da_tela = [a for a in alterados if any(fnmatch.fnmatch(a, p) for p in DA_TELA)
-               and not a.startswith("tests/visual/referencia/") and not a.startswith("tests/visual/resultado/")]
-    if "requirements.txt" in alterados and "streamlit" in requirements_diff.lower():
+               and not a.startswith(("tests/visual/referencia/", "tests/visual/resultado/"))
+               and a != "tests/visual/precisa.py"]
+    # Só a linha da versão (`streamlit==…`): um comentário que fala do "Streamlit Cloud" não conta.
+    versao = [l for l in requirements_diff.splitlines() if l[1:].strip().lower().startswith("streamlit")]
+    if "requirements.txt" in alterados and versao:
         da_tela.append("requirements.txt (versão do Streamlit)")
     return da_tela
 

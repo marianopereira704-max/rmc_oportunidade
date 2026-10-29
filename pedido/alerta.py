@@ -176,6 +176,8 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
     p.add_argument("--partes", type=int, default=8)
     p.add_argument("--destino", default="spaces", help="'spaces' ou 'local:<pasta>'")
     p.add_argument("--hoje", help="AAAA-MM-DD (padrão: hoje no fuso do Brasil)")
+    p.add_argument("--coleta", default="",
+                   help="resultado do job da coleta no GitHub (success, failure, cancelled, skipped)")
     p.add_argument("--precalculo", action="store_true", help="confere também o cálculo de madrugada")
     p.add_argument("--so-precalculo", action="store_true",
                    help="confere SÓ o cálculo de madrugada (disparo manual 'só o pré-cálculo': a coleta da noite já "
@@ -206,6 +208,11 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
         atual = resumo(armaz, chaves, data, a.partes)
         ant = anterior(armaz, chaves, data)
         lista = problemas(atual, ant)
+    # Parte cortada pelo GitHub (29/10/2026): morre sem relatório, e o último do dia dela pode ser um anterior (o da
+    # carga, ou o de outro disparo) — pelos relatórios, a noite parecia completa. O GitHub diz.
+    if a.coleta in ("failure", "cancelled"):
+        lista.append(f"Alguma parte da coleta terminou como '{a.coleta}' no GitHub (cortada pelo limite de tempo ou "
+                     "com erro): os números acima podem ser de um relatório anterior dela. Veja a aba Actions.")
     try:
         lista += problemas_backup(armaz, hoje)
     except Exception as exc:  # noqa: BLE001 — não conseguir conferir também é problema

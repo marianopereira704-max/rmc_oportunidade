@@ -206,3 +206,14 @@ def test_tres_meses_soma_as_dotacoes_de_cada_mes():
     meses = dc.por_mes(d, ctx)
     assert [m["dotacao"] for m in meses] == pytest.approx([1000, 2000, 3000])
     assert [m["consumido"] for m in meses] == pytest.approx([2000, 3000, 500])
+
+
+def test_loja_sem_nenhuma_compra_baixada():
+    """29/10/2026: sem nenhuma compra, a coluna `bonificado` vem vazia e sem tipo, e a página dava KeyError 'linha'
+    (3 lojas do banco dev, inclusive ao abrir no app)."""
+    vazias = _compras([("2026-10-05", "1", 1, 1.0)]).iloc[:0].astype(object)
+    vendas = _vendas([("2026-10-06", "1", 8, 160.0)])
+    info = pd.DataFrame({"categoria": ["Similar"], "custo": [10.0], "ideal": [5.0]}, index=["P1"])
+    periodo = dc.periodos(D(2026, 10, 26), D(2026, 7, 1))[dc.ATUAL]
+    d, it, _ = _quadro(vazias, vendas, info, periodo)
+    assert it.empty and d.loc["P1", "comprado_un"] == 0

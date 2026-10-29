@@ -191,9 +191,11 @@ def preparar(itens_: pd.DataFrame, vendas: pd.DataFrame, info: pd.DataFrame, per
     cp = _entre(itens_, periodo.inicio, periodo.fim)
     vp = _entre(vendas, periodo.inicio, periodo.fim)
     g = cp.groupby("linha")
+    # `.eq(True)` e não a coluna crua (29/10/2026): loja sem NENHUMA compra baixada tem a coluna vazia sem tipo
+    # (object), e `cp[coluna]` virava escolha de colunas — KeyError 'linha' ao abrir a página (3 lojas no banco dev).
     d = pd.DataFrame({
         "comprado_un": g["unidades"].sum(),
-        "bonif_un": cp[cp["bonificado"]].groupby("linha")["unidades"].sum(),
+        "bonif_un": cp[cp["bonificado"].eq(True)].groupby("linha")["unidades"].sum(),
         "consumido": g["valor"].sum(),
         "primeira_compra": g["data"].min(),
     })
