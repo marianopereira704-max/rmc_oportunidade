@@ -91,6 +91,8 @@ def _ambiente() -> dict:
         # Por Loja (compras da rede, 05/10/2026): "hoje" fixo — "Último mês"
         # é sempre agosto/2026 (tests/visual/compras_rede.py).
         "RMC_HOJE": "2026-10-06",
+        # Pop-up Listas (29/10/2026): a prévia do "Salvar como lista" mostra a hora de agora.
+        "RMC_AGORA": "2026-09-27T09:00",
         "PYTHONIOENCODING": "utf-8",
     })
     return env
@@ -468,14 +470,10 @@ def _telas(page, url):
     page.mouse.move(1, 1)
     yield "dashboard_compras_tres_meses", []
 
-    # Aba Dados reorganizada em 29/09/2026: Pendências / Importar / Rotinas /
-    # Explorador. O aviso "foi reorganizada" sai antes das fotos (senão elas
-    # mudariam sozinhas quando ele deixar de aparecer, em 31/10/2026).
+    # Aba Dados reorganizada em 29/09/2026: Pendências / Importar / Rotinas / Explorador (o aviso "foi
+    # reorganizada" saiu em 29/10/2026).
     page.locator('[class*="st-key-nav_dados"] button').click()
     page.get_by_role("tab", name="Pendências").wait_for(timeout=120_000)
-    aviso = page.get_by_role("button", name="Ok, entendi")
-    if aviso.count():
-        aviso.click()
     page.get_by_text("Fila de Resolução de EAN").first.wait_for(timeout=60_000)
     yield "dados_fila_ean", []
     # A fila de CNPJ órfão saiu em 05/10/2026 (compras pela API).

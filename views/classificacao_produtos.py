@@ -114,7 +114,7 @@ def mudancas(antes: ConfigPedido, depois: ConfigPedido, tipos: list[str]) -> lis
 def secao(config: ConfigPedido) -> None:
     """A seção inteira, na página Padrão das Configurações. `config` = a vigente."""
     from views import config_pedido
-    from views import pedido as pedido_view
+    from views.pedido import dados_loja as dados_pedido
 
     theme.titulo_secao("Classificação de produtos")
     config_pedido._explicacao(
@@ -125,7 +125,7 @@ def secao(config: ConfigPedido) -> None:
         "Clique na setinha de uma barra para ver o que a compõe.",
     )
     with st.container(key=f"{_KEY}-cascata"):
-        arvore = _cascata(pedido_view._versao_catalogo(), tuple(sorted(config.linhas_por_setor.items())),
+        arvore = _cascata(dados_pedido._versao_catalogo(), tuple(sorted(config.linhas_por_setor.items())),
                           tuple(sorted(config.linhas_por_cmed.items())))
         if not any(n["eans"] for n in arvore):
             st.info("Nenhuma fonte carregada ainda. Carregue o catálogo IQVIA e as fontes da classificação em "

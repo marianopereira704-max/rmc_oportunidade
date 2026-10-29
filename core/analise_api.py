@@ -148,7 +148,7 @@ def calcular(compras: pd.DataFrame, vinculos: pd.DataFrame, lojas: pd.DataFrame,
     analise.COLUNAS_LOJA; `precos`: `precos_por_chave`; `genericos`: ean,
     base_generico_id, nome_canonico; `categorias`: ean, categoria.
 
-    Devolve (uma linha por loja × produto × nota no período — `COLUNAS`,
+    Devolve (uma linha por loja × produto × nota × fabricante × situação no período — `COLUNAS`,
     bonificações por loja_id)."""
     vazio = pd.DataFrame(columns=COLUNAS), pd.Series(dtype="int64")
     if compras.empty or precos.empty:
@@ -174,14 +174,20 @@ def calcular(compras: pd.DataFrame, vinculos: pd.DataFrame, lojas: pd.DataFrame,
         _valor=c["preco_usado"] * c["quantidade"], _valor_nota=c["preco"] * c["quantidade"],
         _economia=np.where(acima, (c["preco_usado"] - c["preco_laboratorio"]) * c["quantidade"], 0.0),
         nro_nf=c["nro_nf"].fillna(""), fornecedor=c["fornecedor"].fillna(""),
+        _situacao=np.select([c["a_revisar"], acima], ["revisar", "acima"], default="abaixo"),
     )
-    chave = ["loja_id", "chave", "nro_nf", "fornecedor", "data"]
+    # Uma linha por loja × produto × nota × FABRICANTE (EAN) × situação (29/10/2026): juntar na mesma linha os
+    # EANs de um genérico de fabricantes diferentes mostrava o preço MÉDIO e contava a economia só do item acima
+    # — Fexofenadina da nota 343497 a 6,11, 7,84 e 5,89 contra 6,73 aparecia "pago 6,61, diferença −0,12, 18 un.,
+    # economia R$ 6,66" (24 notas de 19,7 mil na Ranbaxy, jul–set). Separando, Diferença × Qtd. = Economia em toda
+    # linha, a tela mostra qual fabricante saiu caro, e nota "a revisar" nunca carrega a economia de outro item.
+    chave = ["loja_id", "chave", "nro_nf", "fornecedor", "data", "ean", "_situacao"]
     g = c.groupby(chave, sort=False, dropna=False)
     linhas = g.agg(
         quantidade=("quantidade", "sum"), _valor=("_valor", "sum"), _valor_nota=("_valor_nota", "sum"),
         economia=("_economia", "sum"), a_revisar=("a_revisar", "any"), ajustado=("ajustado", "any"),
         revisar_motivo=("revisar_motivo", "first"), preco_laboratorio=("preco_laboratorio", "first"),
-        base_generico_id=("base_generico_id", "first"), ean=("ean", "first"), descricao=("nome", "first"),
+        base_generico_id=("base_generico_id", "first"), descricao=("nome", "first"),
         custo_cadastro=("custo_cadastro", "first"), preco_venda=("preco_venda", "first"), ano_mes=("ano_mes", "first"),
     ).reset_index()
     labs = (c[c["laboratorio"].fillna("") != ""].drop_duplicates([*chave, "laboratorio"])
@@ -377,8 +383,15 @@ def por_produto(linhas: pd.DataFrame) -> pd.DataFrame:
     conta = df[df["_entra"]].assign(_valor=lambda d: d["preco_pago"] * d["quantidade"])
     soma = conta.groupby(chave).agg(_valor=("_valor", "sum"), quantidade=("quantidade", "sum"),
                                     economia=("economia", "sum"))
-    contagem = df.assign(_acima=acima, _revisar=revisar).groupby(chave).agg(
-        notas=("nro_nf", "size"), notas_acima=("_acima", "sum"), notas_revisar=("_revisar", "sum"))
+    # Notas de verdade (número, fornecedor e data), não linhas: desde 29/10/2026 a mesma nota pode ter uma linha por
+    # fabricante e situação, e "2 de 3 notas acima" contaria a nota duas vezes.
+    nota = df["nro_nf"].astype(str) + "|" + df["fornecedor"].astype(str) + "|" + df["data"].astype(str)
+    contagem = pd.DataFrame({
+        "notas": nota.groupby([df[c] for c in chave]).nunique(),
+        "notas_acima": nota.where(acima).groupby([df[c] for c in chave]).nunique(),
+        "notas_revisar": nota.where(revisar).groupby([df[c] for c in chave]).nunique(),
+        "_todas_revisar": revisar.groupby([df[c] for c in chave]).all(),
+    })
     fixos = df.drop_duplicates(chave).set_index(chave)[[
         *analise.COLUNAS_LOJA[1:], "base_generico_id", "ean", "nome_canonico", "descricao", "categoria",
         "preco_laboratorio"]]
@@ -386,7 +399,7 @@ def por_produto(linhas: pd.DataFrame) -> pd.DataFrame:
     saida["preco_pago"] = saida["_valor"] / saida["quantidade"].replace(0, np.nan)
     saida["diferenca"] = saida["preco_pago"] - saida["preco_laboratorio"]
     saida["economia"] = saida["economia"].where(saida["notas_acima"] > 0, 0.0)
-    saida["so_revisar"] = saida["notas_revisar"] == saida["notas"]
+    saida["so_revisar"] = saida["_todas_revisar"].astype(bool)
     for c in ("notas", "notas_acima", "notas_revisar"):
         saida[c] = saida[c].astype(int)
     saida = analise._texto_ausente_como_none(

@@ -14,12 +14,13 @@ from dataclasses import dataclass
 import pandas as pd
 import streamlit as st
 
+from core import limite
 from core.db import get_session
 from pedido import classificacao
 from pedido import configuracao as cfg
 from pedido.configuracao import ConfigPedido
 from views import loja_barra
-from views import pedido as pedido_view
+from views.pedido import dados_loja as dados_pedido
 
 _ESTADO = "dashboard_estado"
 _ESTADO_SEGUNDOS = 30
@@ -103,6 +104,7 @@ def _ler_personalizacao(loja_id: int) -> dict:
 
 
 @st.cache_data(ttl=3600, max_entries=8, show_spinner="Preparando o estoque da loja...")
+@limite.pesado
 def _estoque_preparado(empresa: str, loja_gps: str, meses: int, foto: str, versao_categorias: tuple,
                        versao_catalogo: tuple, config: ConfigPedido):
     """O quadro da página (modelo de madrugada + categoria + linha + parâmetros da loja), guardado por loja.
@@ -118,11 +120,11 @@ def _estoque_preparado(empresa: str, loja_gps: str, meses: int, foto: str, versa
     modelo = estoque_modelo.obter(do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja_gps, meses)
     if modelo is None:
         return None
-    base = pedido_view._base_categorias(versao_categorias)
+    base = dados_pedido._base_categorias(versao_categorias)
     categorias = base.drop_duplicates("ean").set_index("ean")["categoria"]
     eans = set(modelo.skus["ean"].dropna()) if not modelo.skus.empty else set()
     # A linha de compra: a categoria fixa da cascata de classificação (25/10/2026), só dos EANs desta loja.
-    tabela = pedido_view._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
+    tabela = dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
                                         tuple(sorted(config.linhas_por_cmed.items())))
     classes = classificacao.mapa_da_loja(tabela, eans) if eans else {}
     caminhos = classificacao.caminhos_da_loja(tabela, eans) if eans else None
@@ -134,11 +136,11 @@ def carregar_estoque(usuario: dict) -> DadosEstoque | str:
     loja = _loja_ou_aviso(usuario)
     if isinstance(loja, str):
         return loja
-    config = cfg.aplicar(pedido_view.configuracao(), _ler_personalizacao(loja["id"]))
+    config = cfg.aplicar(dados_pedido.configuracao(), _ler_personalizacao(loja["id"]))
     marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
     resultado = _estoque_preparado(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados,
-                                   f"{marcador.get('data')}|{marcador.get('gerado_em')}", pedido_view._versoes()[0],
-                                   pedido_view._versao_catalogo(), config)
+                                   f"{marcador.get('data')}|{marcador.get('gerado_em')}", dados_pedido._versoes()[0],
+                                   dados_pedido._versao_catalogo(), config)
     if resultado is None:
         return ("Os dados desta loja ainda não foram coletados. A rotina da madrugada traz as vendas, as compras "
                 "e o estoque; a loja aparece aqui no dia seguinte à primeira coleta.")
@@ -198,6 +200,7 @@ def _caminhos_por_linha(todas: pd.DataFrame, caminhos: pd.DataFrame) -> pd.DataF
 
 
 @st.cache_data(ttl=3600, max_entries=8, show_spinner="Preparando a ruptura da loja...")
+@limite.pesado
 def _ruptura_preparada(empresa: str, loja_gps: str, meses: int, foto: str, versoes: tuple, versao_catalogo: tuple,
                        config: ConfigPedido, correcoes: tuple):
     """O quadro da página, guardado por loja: `foto`, as versões, a `config` e as correções só entram na chave do
@@ -209,7 +212,7 @@ def _ruptura_preparada(empresa: str, loja_gps: str, meses: int, foto: str, verso
     from pedido.armazenamento import do_ambiente
     from pedido.plano import Chaves
 
-    calc = pedido_view._calcular(empresa, loja_gps, meses, versoes, pedido_view.parametros(config), correcoes, foto=foto)
+    calc = dados_pedido._calcular(empresa, loja_gps, meses, versoes, dados_pedido.parametros(config), correcoes, foto=foto)
     if calc is None:
         return None
     todas, meta = calc
@@ -224,7 +227,7 @@ def _ruptura_preparada(empresa: str, loja_gps: str, meses: int, foto: str, verso
     # mesmo resultado do relógio em produção, e fixo no teste visual, que tem as datas de setembro de 2026.
     ate = dt.date.fromisoformat(meta["fim"]) + dt.timedelta(days=1)
     historico, fotos = historico_estoque.ler(armaz, chaves, empresa, loja_gps, ate - dt.timedelta(days=_DIAS_HISTORICO), ate)
-    tabela = pedido_view._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
+    tabela = dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
                                         tuple(sorted(config.linhas_por_cmed.items())))
     eans = classificacao.eans_da_tabela(todas)
     linha = pd.Series(classificacao.coluna(todas, classificacao.mapa_da_loja(tabela, eans)).to_numpy(),
@@ -242,11 +245,11 @@ def carregar_ruptura(usuario: dict) -> DadosRuptura | str:
     if isinstance(loja, str):
         return loja
     correcoes, personalizacao = _ler_estado(loja["id"])
-    config = cfg.aplicar(pedido_view.configuracao(), personalizacao)
+    config = cfg.aplicar(dados_pedido.configuracao(), personalizacao)
     marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
     resultado = _ruptura_preparada(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados,
-                                   f"{marcador.get('data')}|{marcador.get('gerado_em')}", pedido_view._versoes(),
-                                   pedido_view._versao_catalogo(), config,
+                                   f"{marcador.get('data')}|{marcador.get('gerado_em')}", dados_pedido._versoes(),
+                                   dados_pedido._versao_catalogo(), config,
                                    tuple(sorted((l, c.estoque) for l, c in correcoes.items())))
     if resultado is None:
         return ("Os dados desta loja ainda não foram coletados. A rotina da madrugada traz as vendas, as compras "
@@ -318,6 +321,7 @@ def _info_das_linhas(produtos: pd.DataFrame, todas: pd.DataFrame) -> pd.DataFram
 
 
 @st.cache_data(ttl=3600, max_entries=8, show_spinner="Preparando as compras da loja...")
+@limite.pesado
 def _compras_preparadas(empresa: str, loja_gps: str, meses: int, foto: str, versoes: tuple, versao_catalogo: tuple,
                         config: ConfigPedido):
     """Os quadros dos 3 períodos, guardados por loja (`foto`, as versões e a `config` só entram na chave). Reaproveita
@@ -333,18 +337,18 @@ def _compras_preparadas(empresa: str, loja_gps: str, meses: int, foto: str, vers
     p = pronto.atualizar(do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja_gps, meses)
     if p is None:
         return None
-    calc = pedido_view._calcular(empresa, loja_gps, meses, versoes, pedido_view.parametros(config), (), foto=foto)
+    calc = dados_pedido._calcular(empresa, loja_gps, meses, versoes, dados_pedido.parametros(config), (), foto=foto)
     todas = calc[0] if calc is not None else pd.DataFrame()
     est = p.estoque.assign(ean=cat.chaves_ean(p.estoque["ean"]))
     compras = p.compras.assign(ean=cat.chaves_ean(p.compras["ean"]))
-    produtos = calculo.produtos_da_loja(est, compras, p.vendas, pedido_view._genericos(versoes[1]))
+    produtos = calculo.produtos_da_loja(est, compras, p.vendas, dados_pedido._genericos(versoes[1]))
     linha_do_codigo = dict(zip(produtos["codigo_produto"].astype(str), produtos["linha"]))
     regras = dc.Regras.da_config(config, settings.analise.limite_bonificacao)
     itens = dc.itens(p.compras, linha_do_codigo, regras.limite_bonificacao)
     vendas = dc.vendas_por_linha(p.vendas, linha_do_codigo)
 
     info = _info_das_linhas(produtos[produtos["linha"].isin(set(itens["linha"]) | set(vendas["linha"]))], todas)
-    tabela = pedido_view._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
+    tabela = dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
                                         tuple(sorted(config.linhas_por_cmed.items())))
     linhas_df = info.reset_index()[["linha", "ean_principal", "eans"]]
     eans = classificacao.eans_da_tabela(linhas_df)
@@ -362,11 +366,11 @@ def carregar_compras(usuario: dict) -> DadosCompras | str:
     loja = _loja_ou_aviso(usuario)
     if isinstance(loja, str):
         return loja
-    config = cfg.aplicar(pedido_view.configuracao(), _ler_personalizacao(loja["id"]))
+    config = cfg.aplicar(dados_pedido.configuracao(), _ler_personalizacao(loja["id"]))
     marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
     resultado = _compras_preparadas(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados,
-                                    f"{marcador.get('data')}|{marcador.get('gerado_em')}", pedido_view._versoes(),
-                                    pedido_view._versao_catalogo(), config)
+                                    f"{marcador.get('data')}|{marcador.get('gerado_em')}", dados_pedido._versoes(),
+                                    dados_pedido._versao_catalogo(), config)
     if resultado is None:
         return ("Os dados desta loja ainda não foram coletados. A rotina da madrugada traz as vendas, as compras "
                 "e o estoque; a loja aparece aqui no dia seguinte à primeira coleta.")

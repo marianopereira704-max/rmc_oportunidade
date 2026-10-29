@@ -66,6 +66,25 @@ def test_economia_soma_cada_compra_acima_da_tabela_por_nota():
     assert (i.produtos_com_oportunidade, i.produtos_analisados, i.lojas_com_oportunidade) == (2, 2, 1)
 
 
+def test_mesmo_generico_de_fabricantes_diferentes_na_nota_vira_uma_linha_por_fabricante():
+    """29/10/2026, Fexofenadina da nota 343497: itens a 6,11, 7,84 e 5,89 contra 6,73 viravam UMA linha com o preço
+    médio (6,61, diferença negativa) e economia R$ 6,66 — a conta da tela não fechava."""
+    linhas, _ = _cenario([
+        _compra("1", "111", "NF1", 9.0, 6, lab="MEDLEY"),     # abaixo da tabela (10)
+        _compra("1", "222", "NF1", 12.0, 6, lab="EMS"),       # acima: a economia é toda daqui
+        _compra("1", "222", "NF2", 11.0, 2, lab="EMS"),
+    ])
+    nf1 = linhas[linhas["nro_nf"] == "NF1"].set_index("laboratorio")
+    assert len(nf1) == 2 and nf1.loc["EMS", "economia"] == pytest.approx(12)
+    assert nf1.loc["MEDLEY", "economia"] == 0 and nf1.loc["MEDLEY", "diferenca"] == pytest.approx(-1)
+    for _, r in linhas.iterrows():                         # Diferença × Qtd. = Economia em toda linha acima
+        if r["economia"] > 0:
+            assert r["diferenca"] * r["quantidade"] == pytest.approx(r["economia"])
+    p = aa.por_produto(linhas).set_index("produto_id").loc["G5"]
+    assert (p["notas"], p["notas_acima"]) == (2, 2)          # a NF1 conta uma vez, não duas
+    assert p["economia"] == pytest.approx(14) and p["quantidade"] == 8
+
+
 def test_regras_de_preco_na_ordem_cadastro_nota_venda_mediana():
     linhas, _ = _cenario([
         # 1. Nota pela caixa (R$ 50) e cadastro coerente com a venda (R$ 5,50 de R$ 9): vale o cadastro.

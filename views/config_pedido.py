@@ -349,11 +349,11 @@ def _salvar(config: ConfigPedido, usuario: str) -> None:
     from integrations import configuracao_pedido
     from pedido.armazenamento import do_ambiente
     from pedido.plano import Chaves
-    from views import pedido as pedido_view
+    from views.pedido import dados_loja as dados_pedido
 
     with get_session() as session:
         configuracao_pedido.salvar(session, config, usuario)
-    pedido_view.invalidar()
+    dados_pedido.invalidar()
     try:
         configuracao_pedido.publicar_para_rotina(do_ambiente(), Chaves(settings.pedido.prefixo), config, usuario)
         st.session_state["config_pedido_msg"] = (
@@ -440,7 +440,7 @@ def _descrever(dif: dict) -> str:
 
 def _personalizacao() -> None:
     from integrations import configuracao_pedido, pedido_tela
-    from views import pedido as pedido_view
+    from views.pedido import dados_loja as dados_pedido
 
     usuario = auth.usuario_atual()
     _explicacao(
@@ -507,7 +507,7 @@ def _personalizacao() -> None:
         with get_session() as session:
             gravada = configuracao_pedido.salvar_loja(session, loja_id, nova, usuario["nome"])
         st.session_state.pop(f"config_pedido_copia_{loja_id}", None)
-        pedido_view.invalidar()
+        dados_pedido.invalidar()
         st.session_state["config_pedido_msg"] = (
             ("success", f"Personalização salva ({cfg.quantos_campos(gravada)} campo(s) diferentes do padrão).")
             if gravada else ("info", "Tudo igual ao padrão: a loja segue o padrão."))
@@ -521,7 +521,7 @@ def _personalizacao() -> None:
                 with get_session() as session:
                     configuracao_pedido.remover_loja(session, loja_id, usuario["nome"])
                 st.session_state.pop("config_pedido_remover", None)
-                pedido_view.invalidar()
+                dados_pedido.invalidar()
                 st.session_state["config_pedido_msg"] = ("success", "Personalização removida: a loja segue o padrão.")
             else:
                 st.session_state["config_pedido_remover"] = loja_id

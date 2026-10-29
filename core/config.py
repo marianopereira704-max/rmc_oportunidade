@@ -393,6 +393,10 @@ class StreamlitCloudConfig:
     intervalo_verificacao_horas: int = field(
         default_factory=lambda: int(_get("STREAMLIT_CLOUD_IPS_INTERVALO_HORAS", "24"))
     )
+    # Cálculos pesados (montar o Assistente, o Dashboard, a Análise ou as bases compartilhadas) ao mesmo tempo no
+    # processo (core/limite.py, 28/10/2026): cada um tem pico de 50–100 MB ao montar, e o Community Cloud tem teto
+    # de ~2,7 GB e de 0,078 a 2 núcleos. Os outros esperam com o aviso de "carregando".
+    calculos_simultaneos: int = field(default_factory=lambda: int(_get("APP_CALCULOS_SIMULTANEOS", "2")))
 
 
 @dataclass

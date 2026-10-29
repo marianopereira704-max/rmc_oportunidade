@@ -1,6 +1,28 @@
 # RMC Oportunidades — status e pendências
 
-Registro consolidado para retomar o trabalho sem precisar refazer a análise. Atualizado em 26/10/2026.
+Registro consolidado para retomar o trabalho sem precisar refazer a análise. Atualizado em 29/10/2026.
+
+## Em aberto hoje (29/10/2026)
+
+O plano em andamento é `docs/specs/2026-10-29-plano-de-acao.md` (ordem e motivo de cada etapa); o anterior,
+com o que foi feito de 28/10 (ramos, rotina no GitHub, alerta, reorganização do código, escala), é
+`docs/specs/2026-10-28-plano-publicacao-e-melhorias.md`. Tudo o que vem DEPOIS desta seção é histórico das
+rodadas antigas: serve para entender por que algo é como é, não é lista de tarefas.
+
+| # | Pendência | Quem | Situação |
+|---|---|---|---|
+| 1 | Instalar o backup no droplet (`docs/backup.md`) | M | Código pronto; até instalar, o alerta avisa todo dia |
+| 2 | **Dados de lojas no GitHub público:** a pasta `Claude outputs/` (versionada desde o commit `59eb9a9`) tem HTMLs da Análise com ~420 CNPJs e nomes de drogarias, e capturas de tela | M decide | Ver as opções no fim da etapa 3 do plano |
+| 3 | Conferir a rotina por 2–3 noites (relatórios, fotos, histórico do estoque, alerta) | C | 1ª conferência feita em 29/10 (plano, etapa 2) |
+| 4 | Etapas 4 a 9 do plano (Assistente mais simples, cálculo de madrugada, celular, e-mails, dívidas, evolução mensal) | C | Na ordem do plano |
+| 5 | Publicar (Fase 8 do plano de 28/10) e depois `limpeza_compras_planilha.py --executar` | M | Espera a API do GPS estar 100% confiável |
+| 6 | Trocar as credenciais (Spaces, Postgres, Gmail; também no droplet e nos Secrets do GitHub) | M | Última etapa, por decisão do M |
+| 7 | Base inicial de categorias com a CMED nova; MIP/OTC da FEBRAFAR à parte | M decide | Sem data |
+| 8 | CORS do bucket; arquivos de teste antigos no bucket (~159 de 23/09) | M | Opcional |
+
+---
+
+# Histórico (até 28/10/2026)
 
 ## Dashboard · Ruptura e histórico do estoque (27/10/2026, sem commit)
 

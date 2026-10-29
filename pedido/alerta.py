@@ -29,6 +29,25 @@ from pedido.plano import Chaves
 # Queda de lojas com foto do dia, contra a noite anterior, que vira alerta. 5%: numa rede de ~400 lojas da API,
 # 20 lojas sem estoque novo já é o bastante pra alguém olhar.
 QUEDA_MAXIMA = 0.05
+# Backup dos bancos (scripts/backup_banco.sh, cron do droplet às 02:00, 29/10/2026): mesma pasta e mesmos bancos do
+# script. O backup roda fora do GitHub; sem este aviso, um cron parado só seria notado no dia de precisar dele.
+PASTA_BACKUP = "backups/rmc_oportunidades/"
+BANCOS_BACKUP = ("rmc_oportunidades", "rmc_oportunidades_dev")
+
+
+def problemas_backup(armaz, hoje: dt.date) -> list[str]:
+    """Falta o backup de hoje ou de ontem de algum banco (de ontem também vale: o alerta de um disparo manual de
+    madrugada pode rodar antes das 02:00)."""
+    chaves = [c for c in armaz.listar(PASTA_BACKUP) if c.endswith(".sql.gz")]
+    recentes = {(hoje - dt.timedelta(days=d)).isoformat() for d in (0, 1)}
+    faltam = [b for b in BANCOS_BACKUP
+              if not any(c == f"{PASTA_BACKUP}{dia}/{b}.sql.gz" for dia in recentes for c in chaves)]
+    if not faltam:
+        return []
+    datas = sorted({c[len(PASTA_BACKUP):].split("/")[0] for c in chaves})
+    desde = f" O mais recente é de {dt.date.fromisoformat(datas[-1]):%d/%m/%Y}." if datas else " Nenhum backup encontrado."
+    return [f"Sem backup de hoje nem de ontem do banco {', '.join(faltam)}.{desde} Confira o cron do droplet "
+            "(docs/backup.md)."]
 
 
 def _prefixo_alerta(chaves: Chaves) -> str:
@@ -144,6 +163,10 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
         atual = resumo(armaz, chaves, data, a.partes)
         ant = anterior(armaz, chaves, data)
         lista = problemas(atual, ant)
+    try:
+        lista += problemas_backup(armaz, hoje)
+    except Exception as exc:  # noqa: BLE001 — não conseguir conferir também é problema
+        lista.append(f"Não deu para conferir o backup dos bancos ({type(exc).__name__}).")
     armaz.salvar_json(f"{_prefixo_alerta(chaves)}{atual['data']}.json", {**atual, "problemas": lista})
     if not lista:
         print("Alerta: nada a avisar.", flush=True)

@@ -145,7 +145,7 @@ def test_exportacao_produto_quantidade_e_eans_em_colunas(session):
 
 
 def test_arquivo_csv_abre_no_excel_em_portugues():
-    from views.pedido import _arquivo_exportacao
+    from views.pedido.dialogos import _arquivo_exportacao
 
     t = pd.DataFrame({"PRODUTO": ["AÇÚCAR"], "QUANTIDADE": [3], "EAN 1": ["789"]})
     csv = _arquivo_exportacao(t, "CSV")

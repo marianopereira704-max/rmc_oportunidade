@@ -1,0 +1,146 @@
+"""Assistente de pedido: configuração, versões das bases e o cálculo da loja, com cache. O Dashboard, as
+Configurações de Pedidos e a aba Dados também usam (e limpam) o que está aqui."""
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+
+from core import copia_spaces, limite
+from core.config import settings
+from core.db import get_session
+from pedido import calculo
+from pedido.configuracao import ConfigPedido
+from views import loja_barra
+from views.pedido.estado import _invalidar_estado
+
+@st.cache_data(ttl=30, show_spinner=False)
+def configuracao() -> ConfigPedido:
+    """A vigente (Configurações de Pedidos), conferida no banco no máximo a
+    cada 30 s; gravar na tela de configurações limpa este cache na hora."""
+    from integrations import configuracao_pedido
+
+    with get_session() as session:
+        return configuracao_pedido.vigente(session).config
+
+
+def parametros(config: ConfigPedido) -> calculo.Parametros:
+    return config.parametros(settings.analise.limite_bonificacao)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _versoes() -> tuple:
+    from integrations import categorias as categorias_integ
+    from integrations import pedido_tela
+
+    with get_session() as session:
+        return categorias_integ.versao(session), pedido_tela.versao_genericos(session)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _versao_catalogo() -> tuple:
+    """Versão das fontes da classificação de produtos (catálogo IQVIA, FEBRAFAR/CMED por EAN e as categorias
+    manuais), conferida no máximo a cada 5 min: uma consulta a mais a cada clique (~140 ms até NY) seria cara.
+    O nome ficou o de antes (07/10/2026), quando só o catálogo IQVIA dava a linha de compra."""
+    from integrations import catalogo, classificacao
+    from integrations import categorias as categorias_integ
+
+    with get_session() as session:
+        return catalogo.versao(session), classificacao.versao(session), categorias_integ.versao(session)
+
+
+@st.cache_data(max_entries=2, show_spinner=False)
+@limite.pesado
+def _classificacao(versao: tuple, por_setor: tuple, por_cmed: tuple) -> pd.DataFrame:
+    """EAN → (categoria, origem) de todos os EANs classificados (cascata de classificação, 25/10/2026: manual,
+    IQVIA, CMED — pedido/classificacao.py). Lido e classificado uma vez por versão das fontes e por mapa de
+    correspondência, e compartilhado por todas as sessões: ~6 s para ler as três fontes do banco em NY, 0,5 s
+    para classificar (medido em 26/10/2026, 273 mil EANs). Guarda só os classificados, como categorias do pandas.
+    As fontes vêm da cópia no Spaces quando há (core/copia_spaces.py): 16 s do banco em 28/10/2026."""
+    from integrations import classificacao as dados
+    from pedido import classificacao as cl
+
+    def do_banco():
+        with get_session() as session:
+            return dados.universo(session)
+    universo = copia_spaces.ler_ou_montar("classificacao_universo", versao, do_banco)
+    return cl.tabela_por_ean(cl.classificar(universo, dict(por_setor), dict(por_cmed)), dict(por_cmed))
+
+
+def _categorias_da_loja(todas: pd.DataFrame, config: ConfigPedido) -> dict:
+    """EAN → (categoria, origem) só dos EANs desta loja (a busca por produto é por EAN). As correspondências são
+    as do PADRÃO: a classificação é do produto, igual em todas as lojas (`linhas_*` não se personalizam)."""
+    from pedido import classificacao as cl
+
+    if todas.empty:
+        return {}
+    tabela = _classificacao(_versao_catalogo(), tuple(sorted(config.linhas_por_setor.items())),
+                            tuple(sorted(config.linhas_por_cmed.items())))
+    return cl.mapa_da_loja(tabela, cl.eans_da_tabela(todas))
+
+
+def categorias_da_loja(todas: pd.DataFrame, config: ConfigPedido) -> dict:
+    """EAN → (categoria, origem) só dos produtos desta loja: o Dashboard usa para dar a linha de compra (a
+    categoria fixa) de cada produto."""
+    return _categorias_da_loja(todas, config)
+
+
+@st.cache_data(max_entries=2, show_spinner=False)
+@limite.pesado
+def _base_categorias(versao: tuple) -> pd.DataFrame:
+    """Da cópia no Spaces quando há (core/copia_spaces.py): 6,9 s do banco em 28/10/2026."""
+    from integrations import categorias as categorias_integ
+
+    def do_banco():
+        with get_session() as session:
+            return categorias_integ.tabela(session, com_origem=False)   # o cálculo só usa ean + categoria
+    return copia_spaces.ler_ou_montar("base_categorias", versao, do_banco)
+
+
+@st.cache_data(max_entries=2, show_spinner=False)
+def _genericos(versao: tuple) -> pd.DataFrame:
+    from integrations import pedido_tela
+
+    with get_session() as session:
+        return pedido_tela.genericos(session)
+
+
+@st.cache_data(ttl=3600, max_entries=30, show_spinner="Calculando o pedido da loja...")
+@limite.pesado
+def _calcular(empresa: str, loja: str, meses: int, versoes: tuple, params: calculo.Parametros,
+              correcoes: tuple = (), foto: str | None = None) -> tuple[pd.DataFrame, dict] | None:
+    """`versoes`, `params` e `foto` só entram na chave do cache. `foto` = o
+    marcador do estoque da empresa (data + hora em que a rotina o gravou,
+    conferido a cada 5 min): foto nova → recalcula na hora. Antes o cache
+    expirava a cada 5 min e recalculava sem dado novo (~0,7 s, medido em
+    02/10/2026); a 1 h fica só de garantia pra dias de venda que a rotina
+    completa depois da foto."""
+    from pedido import pronto
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    p = pronto.atualizar(do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja, meses)
+    if p is None:
+        return None
+    linhas = calculo.calcular(p, _base_categorias(versoes[0]), _genericos(versoes[1]), params, dict(correcoes))
+    return linhas, p.meta
+
+
+def calculo_da_loja(loja: dict, config: ConfigPedido, correcoes: dict) -> tuple[pd.DataFrame, dict] | None:
+    """O MESMO cálculo e o MESMO cache da tela do Assistente, para outras
+    telas (Dashboard, 21/10/2026): quem abre o Dashboard e depois o Assistente
+    da mesma loja não calcula duas vezes. `correcoes`: o que
+    `pedido_rascunho.correcoes` devolve (linha → Correcao). None = a rotina
+    ainda não coletou nenhuma foto de estoque desta empresa."""
+    marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
+    return _calcular(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados, _versoes(), parametros(config),
+                     tuple(sorted((l, c.estoque) for l, c in correcoes.items())),
+                     foto=f"{marcador.get('data')}|{marcador.get('gerado_em')}")
+
+
+def invalidar() -> None:
+    """Chamar depois de mudar categorias ou genéricos (aba Dados)."""
+    _versoes.clear()
+    _versao_catalogo.clear()   # categoria manual muda a classificação de produtos (cascata, 25/10/2026)
+    _calcular.clear()
+    configuracao.clear()
+    _invalidar_estado()   # personalização salva em Configurações: vale já, nesta sessão

@@ -19,7 +19,7 @@ import datetime as dt
 import pandas as pd
 import streamlit as st
 
-from core import analise, analise_api, dicas, revisar, theme, ui
+from core import analise, analise_api, dicas, limite, revisar, theme, ui
 from core.config import settings
 from core.db import get_session
 from core.queries import (PaginaResultado, lista_atendentes, lista_grupos_economicos, lista_lojas, lista_ufs,
@@ -89,6 +89,7 @@ def _versao_banco_api() -> tuple:
 
 
 @st.cache_data(max_entries=settings.analise.cache_combinacoes, show_spinner="Calculando a análise...")
+@limite.pesado
 def _calculo_api(laboratorio: str, meses: tuple, versao: tuple, meses_rede: tuple,
                  params: analise_api.Parametros) -> tuple[pd.DataFrame, pd.Series]:
     """`versao`, `meses_rede` e `params` só entram na chave do cache."""

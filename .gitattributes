@@ -1,0 +1,3 @@
+# Scripts que rodam no Linux (droplet, GitHub Actions) sempre com fim de linha LF, mesmo no Windows com
+# core.autocrlf=true: com CRLF o bash do droplet falha ("bad interpreter" / "$'\r': command not found").
+*.sh text eol=lf

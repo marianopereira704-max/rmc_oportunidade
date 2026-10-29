@@ -8,3 +8,7 @@ data/local_storage/*
 
 # Teste visual: saídas locais (as referências em tests/visual/referencia/ SÃO versionadas)
 tests/visual/resultado/
+
+# Saídas de trabalho (capturas, HTMLs de análise com dados reais de lojas): nunca no repositório, que é público
+# (29/10/2026 — os HTMLs desta pasta tinham ~420 CNPJs e nomes de drogarias).
+Claude outputs/

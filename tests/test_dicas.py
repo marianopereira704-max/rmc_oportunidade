@@ -74,7 +74,7 @@ def _candidatos(no):
 def _dicas_do_codigo():
     achados = []
     for pasta in PASTAS:
-        for arquivo in sorted((RAIZ / pasta).glob("*.py")):
+        for arquivo in sorted((RAIZ / pasta).rglob("*.py")):
             arvore = ast.parse(arquivo.read_text(encoding="utf-8"))
             for no in ast.walk(arvore):
                 alvos = []
@@ -119,7 +119,7 @@ def test_ninguem_usa_title_do_navegador_como_dica():
     """O `title="..."` do HTML abre um balão do navegador (tarde, sem parágrafos): a dica é `data-dica`."""
     usos = []
     for pasta in PASTAS:
-        for arquivo in sorted((RAIZ / pasta).glob("*.py")):
+        for arquivo in sorted((RAIZ / pasta).rglob("*.py")):
             for no in ast.walk(ast.parse(arquivo.read_text(encoding="utf-8"))):
                 if isinstance(no, (ast.Constant, ast.JoinedStr)):
                     texto = _texto(no, chamadas=False) or ""
@@ -139,7 +139,7 @@ def _linha_pedido(**extra):
 
 def test_dicas_de_preco_do_assistente_seguem_a_regra():
     from pedido import calculo
-    from views import pedido as v
+    from views.pedido import tabela_pedido as v
     motivos = [calculo.MOTIVO_DIVERGENCIA, calculo.MOTIVO_ACIMA_VENDA, calculo.MOTIVO_CADASTRO, calculo.MOTIVO_COMPRA, None]
     textos = [v._dica_revisar(_linha_pedido(revisar_motivo=m)) for m in motivos]
     textos += [v._dica_revisar(_linha_pedido(revisar_motivo=None, compra_ignorada_preco=float("nan")))]
@@ -150,7 +150,7 @@ def test_dicas_de_preco_do_assistente_seguem_a_regra():
 
 def test_dicas_de_status_do_assistente_seguem_a_regra():
     from pedido import calculo
-    from views import pedido as v
+    from views.pedido import tabela_pedido as v
     p = calculo.Parametros()
     tags = [calculo.A_REVISAR, calculo.NEGATIVO, calculo.RUPTURA, calculo.RUPTURA_PROXIMA, calculo.CORRIGIDO,
             calculo.SEM_CLASSIFICACAO, calculo.GIRO_BAIXO, calculo.VENDA_PONTUAL]
