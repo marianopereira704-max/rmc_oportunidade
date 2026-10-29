@@ -1,6 +1,7 @@
 """Alerta por e-mail no fim da rotina do Pedido (28/10/2026).
 
     python -m pedido.alerta --partes 8            # job `alerta` do workflow, depois das partes e do `rede`
+    python -m pedido.alerta --partes 8 --precalculo     # + o cálculo de madrugada, quando o job dele rodou
 
 O aviso de falha do GitHub cobre a execução que QUEBRA. Este cobre a que
 termina "verde" mas trouxe menos do que devia — foi o que aconteceu de 25 a
@@ -48,6 +49,34 @@ def problemas_backup(armaz, hoje: dt.date) -> list[str]:
     desde = f" O mais recente é de {dt.date.fromisoformat(datas[-1]):%d/%m/%Y}." if datas else " Nenhum backup encontrado."
     return [f"Sem backup de hoje nem de ontem do banco {', '.join(faltam)}.{desde} Confira o cron do droplet "
             "(docs/backup.md)."]
+
+
+def problemas_precalculo(armaz, chaves: Chaves, hoje: dt.date, partes: int) -> list[str]:
+    """Cálculo de madrugada (pedido/precalculo.py, 29/10/2026): parte sem relatório (inclusive a que parou por falta
+    da PRECALCULO_CHAVE) ou mais de 10% das lojas com falha. Nada disso quebra o app — a loja calcula na hora —, mas
+    ela volta a demorar a abrir e ninguém saberia por quê."""
+    from pedido import precalculo
+
+    bancos = precalculo.bancos_publicados(armaz, chaves)
+    if not bancos:
+        return ["O cálculo de madrugada não achou as fotos dos insumos de nenhum banco: abra o app uma vez para "
+                "publicar."]
+    dia, por_banco = precalculo.ultima_execucao(armaz, chaves)
+    if dia is None or dt.date.fromisoformat(dia) < hoje - dt.timedelta(days=1):
+        return [f"Nenhum relatório do cálculo de madrugada desde {dt.date.fromisoformat(dia):%d/%m/%Y}." if dia
+                else "Nenhum relatório do cálculo de madrugada."]
+    saida = []
+    esperadas = [f"parte{i + 1}de{partes}" for i in range(partes)]
+    for banco in bancos:
+        r = precalculo.resumo(por_banco.get(banco, []))
+        faltam = [p for p in esperadas if p not in r["partes"]]
+        if faltam:
+            saida.append(f"Cálculo de madrugada do banco {banco}: {len(faltam)} de {partes} partes sem relatório "
+                         f"({', '.join(faltam)}). Sem a PRECALCULO_CHAVE nos Secrets do GitHub nenhuma parte grava.")
+        if r["lojas"] and r["com_falha"] > r["lojas"] * 0.10:
+            saida.append(f"Cálculo de madrugada do banco {banco}: {r['com_falha']} de {r['lojas']} lojas com falha "
+                         "(o erro de cada uma está no relatório no Spaces).")
+    return saida
 
 
 def _prefixo_alerta(chaves: Chaves) -> str:
@@ -147,10 +176,24 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
     p.add_argument("--partes", type=int, default=8)
     p.add_argument("--destino", default="spaces", help="'spaces' ou 'local:<pasta>'")
     p.add_argument("--hoje", help="AAAA-MM-DD (padrão: hoje no fuso do Brasil)")
+    p.add_argument("--precalculo", action="store_true", help="confere também o cálculo de madrugada")
+    p.add_argument("--so-precalculo", action="store_true",
+                   help="confere SÓ o cálculo de madrugada (disparo manual 'só o pré-cálculo': a coleta da noite já "
+                        "foi conferida, e conferir de novo reenviaria o mesmo e-mail)")
     a = p.parse_args(argv)
     hoje = dt.date.fromisoformat(a.hoje) if a.hoje else dt.datetime.now(ZoneInfo(settings.pedido.fuso)).date()
     armaz = ArmazenamentoLocal(a.destino.split(":", 1)[1]) if a.destino.startswith("local:") else do_ambiente()
     chaves = Chaves(settings.pedido.prefixo)
+
+    if a.so_precalculo:
+        lista = problemas_precalculo(armaz, chaves, hoje, a.partes)
+        if not lista:
+            print("Alerta: nada a avisar.", flush=True)
+            return 0
+        assunto = f"Cálculo de madrugada — {len(lista)} problema(s) em {hoje:%d/%m/%Y}"
+        texto = "\n".join(["O cálculo de madrugada terminou com problema:", ""] + [f"- {p}" for p in lista]
+                          + ["", "Enquanto isso as lojas calculam na hora, como antes. Detalhes em Dados → Rotinas."])
+        return _enviar(enviar_email, lista, assunto, texto)
 
     # A execução é a do dia mais recente com relatório, não necessariamente "hoje": um disparo manual às 23h50
     # termina no dia seguinte, e o alerta procuraria relatórios que estão no dia anterior.
@@ -167,12 +210,21 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
         lista += problemas_backup(armaz, hoje)
     except Exception as exc:  # noqa: BLE001 — não conseguir conferir também é problema
         lista.append(f"Não deu para conferir o backup dos bancos ({type(exc).__name__}).")
+    if a.precalculo:
+        try:
+            lista += problemas_precalculo(armaz, chaves, hoje, a.partes)
+        except Exception as exc:  # noqa: BLE001
+            lista.append(f"Não deu para conferir o cálculo de madrugada ({type(exc).__name__}).")
     armaz.salvar_json(f"{_prefixo_alerta(chaves)}{atual['data']}.json", {**atual, "problemas": lista})
     if not lista:
         print("Alerta: nada a avisar.", flush=True)
         return 0
+    return _enviar(enviar_email, lista, *mensagem(atual, ant, lista))
+
+
+def _enviar(enviar_email, lista: list[str], assunto: str, texto: str) -> int:
     try:
-        enviar_email(settings.email.destinatarios_alerta, *mensagem(atual, ant, lista))
+        enviar_email(settings.email.destinatarios_alerta, assunto, texto)
     except Exception as exc:  # noqa: BLE001 — falha o job: o GitHub avisa do mesmo jeito
         print(f"ERRO: alerta com {len(lista)} problema(s) não foi enviado ({type(exc).__name__}).", flush=True)
         return 1

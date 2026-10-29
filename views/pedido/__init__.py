@@ -11,9 +11,10 @@ Fluxo ao abrir a loja (grill-me de 01/10/2026), nesta ordem:
 2. pop-up "Produtos sem classificação" — informativo, "Entendi";
    os dois aparecem UMA vez por foto do GPS, por usuário + loja
    (`pedido_avisos_vistos`);
-3. loja com personalização (Configurações de Pedidos): pílulas
-   "Personalizado desta loja" / "Padrão", nenhuma marcada — a lista só
-   aparece depois da escolha. Loja sem personalização: direto, com o padrão.
+3. loja com personalização (Configurações de Pedidos): valem as regras dela,
+   sempre; sem personalização, o padrão. Um texto discreto no topo diz qual
+   ("Regras desta loja" / "Regras padrão"). Até 29/10/2026 eram pílulas
+   Personalizado × Padrão, e a lista só aparecia depois da escolha.
 
 Layout (02/10/2026): a loja vem da BARRA LATERAL (views/loja_barra.py),
 que vale pra todas as telas; aqui, o título "Assistente de pedido" (a data
@@ -39,7 +40,7 @@ Arquivos (28/10/2026 — o pedido.py único tinha 1.130 linhas):
   notificações;
 - `formato.py`: números, moeda, datas e a identificação da loja;
 - `tabela_pedido.py`: colunas, células, dicas e os 4 cards;
-- `avisos.py`: pop-ups ao abrir a loja e a escolha dos parâmetros;
+- `avisos.py`: pop-ups ao abrir a loja e o rótulo de quais regras valem;
 - `filtros.py`: a linha de filtros acima da tabela;
 - `dialogos.py`: Estoque negativo, Listas, Descartar e Exportar;
 - este arquivo: a tela (título, fluxo ao abrir a loja, rodapé).
@@ -59,7 +60,7 @@ from pedido import configuracao as cfg
 from views import analise_comum as comum
 from views import loja_barra
 from views import tabela as tb
-from views.pedido.avisos import _alerta_negativos, _alerta_sem_classificacao, _escolher_parametros
+from views.pedido.avisos import _alerta_negativos, _alerta_sem_classificacao, _regras_usadas
 from views.pedido.dados_loja import _calcular, _categorias_da_loja, _versoes, configuracao, parametros
 from views.pedido.dialogos import _dialog_descartar, _dialog_exportar, _dialog_listas, _dialog_negativos
 from views.pedido.estado import (
@@ -128,10 +129,8 @@ def _render() -> None:
     correcoes, area, listas = estado.correcoes, estado.area, estado.listas
     avisos, vistos, personalizacao = estado.avisos, estado.vistos, estado.personalizacao
     padrao = configuracao()
-    # Loja com personalização: vale a pílula escolhida; enquanto nenhuma for
-    # escolhida, os pop-ups contam pelo padrão (a lista ainda não aparece).
-    escolha = st.session_state.get(f"{_KEY}_param_{loja['id']}") if personalizacao else None
-    config = cfg.aplicar(padrao, personalizacao) if escolha == "loja" else padrao
+    # Loja com personalização: valem as regras dela, sempre (29/10/2026 — antes, pílulas Personalizado × Padrão).
+    config = cfg.aplicar(padrao, personalizacao) if personalizacao else padrao
     p = parametros(config)
     marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
     resultado = _calcular(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados, _versoes(), p,
@@ -175,10 +174,7 @@ def _render() -> None:
     elif n_sem and vistos.get(pedido_area.AVISO_SEM_CLASSIFICACAO) != foto:
         _alerta_sem_classificacao(uid, loja["id"], foto, n_sem, p.dias_sem_classificacao)
 
-    if personalizacao and _escolher_parametros(loja["id"], cfg.aplicar(padrao, personalizacao), padrao) is None:
-        _avisar_uma_vez(loja["id"], "info", "Esta loja tem parâmetros personalizados. Escolha acima com quais "
-                                            "parâmetros ver a sugestão.")
-        return
+    _regras_usadas(config if personalizacao else None, padrao)
 
     for aviso in avisos:
         _avisar_uma_vez(loja["id"], "warning", aviso)
@@ -196,7 +192,7 @@ def _render() -> None:
                              fabricantes=fabricantes, status=status)
 
     ui.resetar_pagina_se_filtro_mudou(
-        _KEY, f"{loja['id']}|{busca}|{categorias}|{fabricantes}|{status}|{ocultar}|{escolha}")
+        _KEY, f"{loja['id']}|{busca}|{categorias}|{fabricantes}|{status}|{ocultar}")
     ordem = st.session_state.get(f"{_KEY}_ordem")
     if ordem is None:
         # Padrão (Q14 de 01/10/2026): os "a revisar" primeiro, depois o que

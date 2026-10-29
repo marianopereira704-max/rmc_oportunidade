@@ -161,6 +161,10 @@ class PedidoConfig:
     tentativas_por_unidade: int = field(default_factory=lambda: int(_get("PEDIDO_TENTATIVAS_POR_UNIDADE", "3")))
     orcamento_minutos: int = field(default_factory=lambda: int(_get("PEDIDO_ORCAMENTO_MINUTOS", "330")))
     fuso: str = field(default_factory=lambda: _get("PEDIDO_FUSO", "America/Sao_Paulo"))
+    # Cálculo de madrugada (pedido/precalculo.py, 29/10/2026): chave do selo dos resultados prontos, a MESMA nos
+    # Secrets do GitHub (a rotina sela) e do Streamlit (o app confere). Sem ela, a rotina não grava e o app ignora
+    # os prontos e calcula na hora.
+    precalculo_chave: str | None = field(default_factory=lambda: _get("PRECALCULO_CHAVE"))
 
     # Regras da sugestão (pedido/calculo.py). Padrões do resumo de 27/09/2026;
     # a tela Configurações de Pedidos (Fase 4) passa a editá-los no banco.

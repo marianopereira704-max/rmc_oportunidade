@@ -173,7 +173,8 @@ SELETORES_STREAMLIT: dict[str, tuple[str, str]] = {
     # pílula não tem data-testid, só data-variant (marcada = aria-checked na
     # escolha única, aria-pressed na múltipla). Os seletores do pop-up de
     # filtros (diálogo, campo de texto, caixa do multiselect) saíram com ele.
-    "pilula": ('button[data-variant="pills"]', "pedido_parametros"),
+    # Desde 29/10/2026 conferido no Dashboard · Compras (as pílulas do Assistente saíram).
+    "pilula": ('button[data-variant="pills"]', "dashboard_compras"),
     # Texto digitado/de exemplo dos campos (01/10/2026): o Streamlit usa
     # 0,875 × a base = 12,25px, fora da escala e MENOR que o rótulo.
     "campo_entrada": ('[data-testid="stTextInputField"], [data-testid="stNumberInputField"], '
@@ -956,19 +957,10 @@ div[class*="st-key-dash-pag"] {_sel("botao_secundario")}:disabled {{ opacity: .4
 .rmc-pedido-linhas {{ font-size: var(--fs-aux); line-height: 1; color: var(--texto-muted); cursor: help; }}
 .rmc-pedido-rotulo {{ font-size: var(--fs-min); font-weight: 700; color: var(--navy); text-transform: uppercase;
     letter-spacing: .03em; display: inline-block; line-height: 28px; }}
-/* O <p> do Markdown tem margem embaixo: o rótulo ficava 7px acima do centro
-   das pílulas (01/10/2026). */
+/* "Regras desta loja" / "Regras padrão" (29/10/2026, no lugar das pílulas Personalizado × Padrão): o <p> do
+   Markdown tem margem embaixo. Cursor de ajuda: a dica diz quais regras são e quem muda. */
 div[class*="st-key-pedido-parametros"] {_sel("markdown")} p {{ margin: 0; }}
-/* Pílula de parâmetros escolhida: fundo levemente verde (pedido de 01/10/2026).
-   Escolha única = role "radio" + aria-checked (a múltipla usa aria-pressed). */
-/* :hover/:focus junto: com o mouse em cima, o realce do Streamlit vencia o
-   verde (teste visual de 01/10/2026). */
-div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"],
-div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"]:hover,
-div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"]:focus {{
-    background: {STATUS['sucesso']['bg']}; border-color: var(--verde-escuro); color: {STATUS['sucesso']['fg']};
-}}
-div[class*="st-key-pedido-parametros"] {_sel("pilula")}[aria-checked="true"] p {{ color: {STATUS['sucesso']['fg']}; }}
+div[class*="st-key-pedido-parametros"] .rmc-pedido-rotulo {{ cursor: help; }}
 /* Cards em colunas (um por coluna): mesmo vão de 12px do grid de cards. */
 div[class*="st-key-pedido-cards"] {_sel("bloco_horizontal")} {{ gap: var(--esp-3); }}
 /* 4º card ("Sem classificação"): o botão "Saiba mais" cobre o card inteiro,

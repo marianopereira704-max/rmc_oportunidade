@@ -7,7 +7,6 @@ A configuração é a DA LOJA, aplicada automaticamente: personalização gravad
 """
 from __future__ import annotations
 
-import datetime as dt
 import time
 from dataclasses import dataclass
 
@@ -16,7 +15,6 @@ import streamlit as st
 
 from core import limite
 from core.db import get_session
-from pedido import classificacao
 from pedido import configuracao as cfg
 from pedido.configuracao import ConfigPedido
 from views import loja_barra
@@ -110,25 +108,22 @@ def _estoque_preparado(empresa: str, loja_gps: str, meses: int, foto: str, versa
     """O quadro da página (modelo de madrugada + categoria + linha + parâmetros da loja), guardado por loja.
     `foto`, as versões e a `config` só entram na chave do cache: foto nova, categorias novas ou parâmetro
     novo → recalcula. A 1ª abertura de uma loja leva alguns segundos (monta o modelo se a rotina ainda não
-    montou); depois, cada clique só reagrega. None = a rotina ainda não tirou foto de estoque."""
+    montou); depois, cada clique só reagrega. None = a rotina ainda não tirou foto de estoque.
+    A conta mora em pedido/telas_loja.py (29/10/2026): a rotina da madrugada usa a mesma."""
     from core.config import settings
-    from core import dashboard_estoque as de
-    from pedido import estoque_modelo
+    from pedido import precalculo, telas_loja
     from pedido.armazenamento import do_ambiente
     from pedido.plano import Chaves
 
-    modelo = estoque_modelo.obter(do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja_gps, meses)
-    if modelo is None:
-        return None
-    base = dados_pedido._base_categorias(versao_categorias)
-    categorias = base.drop_duplicates("ean").set_index("ean")["categoria"]
-    eans = set(modelo.skus["ean"].dropna()) if not modelo.skus.empty else set()
-    # A linha de compra: a categoria fixa da cascata de classificação (25/10/2026), só dos EANs desta loja.
-    tabela = dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
-                                        tuple(sorted(config.linhas_por_cmed.items())))
-    classes = classificacao.mapa_da_loja(tabela, eans) if eans else {}
-    caminhos = classificacao.caminhos_da_loja(tabela, eans) if eans else None
-    return de.preparar(modelo, config, categorias, classes, caminhos), modelo.meta
+    pronto = dados_pedido._pronto("estoque", empresa, loja_gps, precalculo.assinatura_estoque(
+        foto, versao_categorias, versao_catalogo, config, settings.analise.limite_bonificacao))
+    if pronto is not None:
+        return pronto
+    return telas_loja.estoque(
+        do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja_gps, meses, config,
+        dados_pedido._base_categorias(versao_categorias),
+        dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
+                                    tuple(sorted(config.linhas_por_cmed.items()))))
 
 
 def carregar_estoque(usuario: dict) -> DadosEstoque | str:
@@ -159,8 +154,6 @@ RUP_CATEGORIAS = "dashboard_ruptura_filtro_categorias"
 RUP_CURVAS = "dashboard_ruptura_filtro_curvas"
 RUP_RISCOS = "dashboard_ruptura_filtro_riscos"
 _RUP_LOJA = "dashboard_ruptura_filtro_loja"
-# Quanto do histórico ler: 90 dias da base da venda esperada + o período da perda + folga para o início da falta.
-_DIAS_HISTORICO = 160
 
 
 @dataclass
@@ -183,59 +176,28 @@ def filtros_ruptura(loja_id: int) -> tuple[list[str], list[str], list[str]]:
     return tuple(list(st.session_state.get(c, [])) for c in (RUP_CATEGORIAS, RUP_CURVAS, RUP_RISCOS))
 
 
-def _caminhos_por_linha(todas: pd.DataFrame, caminhos: pd.DataFrame) -> pd.DataFrame:
-    """O caminho na cascata (setor da IQVIA, FEBRAFAR, CMED) de cada produto do Assistente: o do 1º EAN que alguma
-    fonte conhece, começando pelo principal (o genérico tem vários EANs)."""
-    vazio = {"fonte_setor": None, "fonte_febrafar": None, "fonte_cmed": None}
-    saida = {}
-    for linha, principal, eans in zip(todas["linha"], todas["ean_principal"], todas["eans"]):
-        candidatos = ([principal] if isinstance(principal, str) else []) + list(eans if isinstance(eans, list) else [])
-        achado = next((e for e in candidatos if e in caminhos.index), None)
-        if achado is None:
-            saida[str(linha)] = vazio
-        else:
-            r = caminhos.loc[achado]
-            saida[str(linha)] = {"fonte_setor": r["setor"], "fonte_febrafar": r["febrafar"], "fonte_cmed": r["cmed"]}
-    return pd.DataFrame.from_dict(saida, orient="index")
-
-
 @st.cache_data(ttl=3600, max_entries=8, show_spinner="Preparando a ruptura da loja...")
 @limite.pesado
 def _ruptura_preparada(empresa: str, loja_gps: str, meses: int, foto: str, versoes: tuple, versao_catalogo: tuple,
                        config: ConfigPedido, correcoes: tuple):
     """O quadro da página, guardado por loja: `foto`, as versões, a `config` e as correções só entram na chave do
     cache (foto nova, categoria nova, parâmetro novo → recalcula). Reaproveita o cálculo e o cache do Assistente e
-    as vendas por dia do modelo de estoque; lê só os últimos ~5 meses do histórico. None = sem foto de estoque."""
-    from core import dashboard_ruptura as dr
+    as vendas por dia do modelo de estoque; lê só os últimos ~5 meses do histórico. None = sem foto de estoque.
+    A conta mora em pedido/telas_loja.py (29/10/2026): a rotina da madrugada usa a mesma."""
     from core.config import settings
-    from pedido import estoque_modelo, historico_estoque
+    from pedido import precalculo, telas_loja
     from pedido.armazenamento import do_ambiente
     from pedido.plano import Chaves
 
+    pronto = dados_pedido._pronto("ruptura", empresa, loja_gps, precalculo.assinatura_ruptura(
+        foto, versoes, versao_catalogo, config, correcoes, settings.analise.limite_bonificacao))
+    if pronto is not None:
+        return pronto
     calc = dados_pedido._calcular(empresa, loja_gps, meses, versoes, dados_pedido.parametros(config), correcoes, foto=foto)
-    if calc is None:
-        return None
-    todas, meta = calc
-    regras = dr.Regras.da_config(config)
-    if todas.empty:
-        return dr.preparar(todas, pd.DataFrame(), pd.DataFrame(), [], regras, meta), meta
-    armaz, chaves = do_ambiente(), Chaves(settings.pedido.prefixo)
-    modelo = estoque_modelo.obter(armaz, chaves, empresa, loja_gps, meses)
-    vendas = (modelo.vendas_dia[["codigo_produto", "data", "unidades"]] if modelo is not None
-              else pd.DataFrame(columns=["codigo_produto", "data", "unidades"]))
-    # Até o dia seguinte ao último dia de venda do cálculo (a foto da noite é de hoje; as vendas, até ontem): o
-    # mesmo resultado do relógio em produção, e fixo no teste visual, que tem as datas de setembro de 2026.
-    ate = dt.date.fromisoformat(meta["fim"]) + dt.timedelta(days=1)
-    historico, fotos = historico_estoque.ler(armaz, chaves, empresa, loja_gps, ate - dt.timedelta(days=_DIAS_HISTORICO), ate)
-    tabela = dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
-                                        tuple(sorted(config.linhas_por_cmed.items())))
-    eans = classificacao.eans_da_tabela(todas)
-    linha = pd.Series(classificacao.coluna(todas, classificacao.mapa_da_loja(tabela, eans)).to_numpy(),
-                      index=todas["linha"].astype(str).to_numpy())
-    d, resumo = dr.preparar(todas, vendas, historico, fotos, regras, meta, linha)
-    fontes = _caminhos_por_linha(todas, classificacao.caminhos_da_loja(tabela, eans))
-    d = d.join(fontes)
-    return (d, resumo), meta
+    return telas_loja.ruptura(
+        do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja_gps, meses, config, calc,
+        lambda: dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
+                                            tuple(sorted(config.linhas_por_cmed.items()))))
 
 
 def carregar_ruptura(usuario: dict) -> DadosRuptura | str:
@@ -297,68 +259,31 @@ def filtros_compras(loja_id: int) -> tuple[str, list[str], str]:
             st.session_state.get(COM_CLASSE, "todos"))
 
 
-def _info_das_linhas(produtos: pd.DataFrame, todas: pd.DataFrame) -> pd.DataFrame:
-    """Uma linha do Assistente por linha: nome, EANs e o que vem do cálculo (custo, estoque ideal, estoque, demanda).
-    Produto comprado que nunca vendeu não está no cálculo: nome e EANs vêm do cadastro (`produtos_da_loja`)."""
-    com_ean = produtos.dropna(subset=["ean"]).drop_duplicates(["linha", "ean"])
-    base = pd.DataFrame({
-        "nome": produtos.drop_duplicates("linha").set_index("linha")["nome_linha"],
-        "eans": com_ean.groupby("linha")["ean"].agg(list),
-        "ean_principal": com_ean.drop_duplicates("linha").set_index("linha")["ean"],
-    })
-    base["eans"] = [e if isinstance(e, list) else [] for e in base["eans"]]
-    if not todas.empty:
-        t = todas.set_index(todas["linha"].astype(str))
-        base.loc[t.index.intersection(base.index), ["nome", "ean_principal"]] = t[["nome", "ean_principal"]]
-        base["eans"] = [t.at[l, "eans"] if l in t.index and isinstance(t.at[l, "eans"], list) else e
-                        for l, e in zip(base.index, base["eans"])]
-        base["custo"] = pd.to_numeric(t["preco"], errors="coerce").reindex(base.index)
-        base["ideal"] = pd.to_numeric(t["estoque_max"], errors="coerce").reindex(base.index)
-        base["estoque"] = pd.to_numeric(t["estoque"], errors="coerce").reindex(base.index)
-        base["demanda_dia"] = pd.to_numeric(t["demanda_dia"], errors="coerce").reindex(base.index)
-    base.index.name = "linha"
-    return base
-
-
 @st.cache_data(ttl=3600, max_entries=8, show_spinner="Preparando as compras da loja...")
 @limite.pesado
 def _compras_preparadas(empresa: str, loja_gps: str, meses: int, foto: str, versoes: tuple, versao_catalogo: tuple,
                         config: ConfigPedido):
     """Os quadros dos 3 períodos, guardados por loja (`foto`, as versões e a `config` só entram na chave). Reaproveita
     o pronto e o cálculo do Assistente (custo e estoque ideal), sem as correções de estoque negativo — aqui o
-    estoque só entra na sugestão "cerca de N dias". None = sem foto de estoque."""
-    from core import dashboard_compras as dc
+    estoque só entra na sugestão "cerca de N dias". None = sem foto de estoque.
+    A conta mora em pedido/telas_loja.py (29/10/2026): a rotina da madrugada usa a mesma."""
     from core.config import settings
-    from pedido import calculo, pronto
-    from pedido import categorias as cat
+    from pedido import precalculo, telas_loja
     from pedido.armazenamento import do_ambiente
     from pedido.plano import Chaves
 
-    p = pronto.atualizar(do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja_gps, meses)
-    if p is None:
-        return None
-    calc = dados_pedido._calcular(empresa, loja_gps, meses, versoes, dados_pedido.parametros(config), (), foto=foto)
-    todas = calc[0] if calc is not None else pd.DataFrame()
-    est = p.estoque.assign(ean=cat.chaves_ean(p.estoque["ean"]))
-    compras = p.compras.assign(ean=cat.chaves_ean(p.compras["ean"]))
-    produtos = calculo.produtos_da_loja(est, compras, p.vendas, dados_pedido._genericos(versoes[1]))
-    linha_do_codigo = dict(zip(produtos["codigo_produto"].astype(str), produtos["linha"]))
-    regras = dc.Regras.da_config(config, settings.analise.limite_bonificacao)
-    itens = dc.itens(p.compras, linha_do_codigo, regras.limite_bonificacao)
-    vendas = dc.vendas_por_linha(p.vendas, linha_do_codigo)
-
-    info = _info_das_linhas(produtos[produtos["linha"].isin(set(itens["linha"]) | set(vendas["linha"]))], todas)
-    tabela = dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
-                                        tuple(sorted(config.linhas_por_cmed.items())))
-    linhas_df = info.reset_index()[["linha", "ean_principal", "eans"]]
-    eans = classificacao.eans_da_tabela(linhas_df)
-    info["categoria"] = classificacao.coluna(linhas_df, classificacao.mapa_da_loja(tabela, eans)).to_numpy()
-    info = info.join(_caminhos_por_linha(linhas_df, classificacao.caminhos_da_loja(tabela, eans)))
-
-    fim, inicio = dt.date.fromisoformat(p.meta["fim"]), dt.date.fromisoformat(p.meta["inicio"])
-    periodos = dc.periodos(fim, inicio)
-    quadros = {k: dc.preparar(itens, vendas, info, per, regras) for k, per in periodos.items()}
-    return quadros, periodos, itens, vendas, regras, p.meta
+    pronto = dados_pedido._pronto("compras", empresa, loja_gps, precalculo.assinatura_compras(
+        foto, versoes, versao_catalogo, config, settings.analise.limite_bonificacao))
+    if pronto is not None:
+        return pronto
+    return telas_loja.compras(
+        do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja_gps, meses, config,
+        lambda: dados_pedido._calcular(empresa, loja_gps, meses, versoes, dados_pedido.parametros(config), (),
+                                       foto=foto),
+        dados_pedido._genericos(versoes[1]),
+        dados_pedido._classificacao(versao_catalogo, tuple(sorted(config.linhas_por_setor.items())),
+                                    tuple(sorted(config.linhas_por_cmed.items()))),
+        settings.analise.limite_bonificacao)
 
 
 def carregar_compras(usuario: dict) -> DadosCompras | str:

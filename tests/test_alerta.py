@@ -106,3 +106,53 @@ def test_backup_de_ontem_basta(tmp_path):
     assert alerta.problemas_backup(armaz, dt.date(2026, 10, 29))          # nenhum backup: problema
     _backups(armaz, "2026-10-28")
     assert alerta.problemas_backup(armaz, dt.date(2026, 10, 29)) == []
+
+
+# ---------------------------------------------------------------------------
+# Cálculo de madrugada (pedido/precalculo.py, 29/10/2026)
+# ---------------------------------------------------------------------------
+
+def _precalculo(armaz, dia, partes, banco="rmc", lojas=10, falhas=0):
+    armaz.salvar_json(f"pedido/insumos/{banco}/manifesto.json", {})
+    for p in partes:
+        armaz.salvar_json(f"pedido/controle/precalculo/{dia}/{banco}/{p}.json",
+                          {"parte": p, "inicio": f"{dia}T03:10:00-03:00", "lojas_na_parte": lojas,
+                           "lojas_prontas": lojas - falhas, "lojas_com_falha": falhas})
+
+
+def test_precalculo_em_dia_nao_e_problema(tmp_path):
+    armaz = ArmazenamentoLocal(tmp_path)
+    _precalculo(armaz, "2026-10-29", ("parte1de2", "parte2de2"), falhas=1)       # 2 de 20: 10%, no limite
+    assert alerta.problemas_precalculo(armaz, CH, dt.date(2026, 10, 29), 2) == []
+
+
+def test_precalculo_parte_sem_relatorio_falhas_e_dias_sem_rodar(tmp_path):
+    armaz = ArmazenamentoLocal(tmp_path)
+    assert "nenhum banco" in alerta.problemas_precalculo(armaz, CH, dt.date(2026, 10, 29), 2)[0]
+    _precalculo(armaz, "2026-10-29", ("parte1de2",), falhas=2)
+    lista = alerta.problemas_precalculo(armaz, CH, dt.date(2026, 10, 29), 2)
+    assert len(lista) == 2 and "parte2de2" in lista[0] and "PRECALCULO_CHAVE" in lista[0] and "2 de 10" in lista[1]
+    assert "desde 29/10/2026" in alerta.problemas_precalculo(armaz, CH, dt.date(2026, 11, 2), 2)[0]
+
+
+def test_precalculo_so_entra_no_alerta_com_a_opcao(tmp_path):
+    armaz = ArmazenamentoLocal(tmp_path)
+    for p in ("parte1de2", "parte2de2"):
+        _relatorio(armaz, "2026-10-29", p)
+    _precalculo(armaz, "2026-10-29", ("parte1de2",))
+    assert _rodar(tmp_path, "2026-10-29") == (0, [])                       # job do pré-cálculo não rodou
+    enviados = []
+    alerta.main(["--destino", f"local:{tmp_path}", "--partes", "2", "--hoje", "2026-10-29", "--precalculo"],
+                enviar_email=lambda d, a, t: enviados.append(t))
+    assert len(enviados) == 1 and "parte2de2" in enviados[0]
+
+
+def test_so_precalculo_nao_confere_a_coleta_nem_regrava_o_resumo(tmp_path):
+    armaz = ArmazenamentoLocal(tmp_path)
+    _relatorio(armaz, "2026-10-29", "parte1de2", historicos_gravados=0)    # coleta com problema: já avisada
+    _precalculo(armaz, "2026-10-29", ("parte1de2", "parte2de2"))
+    enviados = []
+    codigo = alerta.main(["--destino", f"local:{tmp_path}", "--partes", "2", "--hoje", "2026-10-29",
+                          "--so-precalculo"], enviar_email=lambda d, a, t: enviados.append(t))
+    assert (codigo, enviados) == (0, [])
+    assert not armaz.existe("pedido/controle/alerta/2026-10-29.json")

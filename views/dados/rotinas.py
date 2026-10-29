@@ -112,7 +112,7 @@ def _rotina_gps() -> None:
     st.markdown("##### Rotina do GPS (dados do Pedido)")
     _explicacao(
         "a coleta de vendas, compras e estoque de cada loja na API do GPS, que alimenta o Pedido.",
-        "roda sozinha à meia-noite no GitHub Actions, em 4 partes (passo a passo em docs/rotina_pedido.md).",
+        "roda sozinha à meia-noite no GitHub Actions, em 8 partes (passo a passo em docs/rotina_pedido.md).",
         "nada a fazer aqui: o que falhar é tentado de novo na mesma execução e na seguinte. Para rodar na hora: "
         "GitHub → Actions → Rotina Pedido → Run workflow.",
     )
@@ -147,6 +147,38 @@ def _rotina_gps() -> None:
         with st.expander(f"{len(falhas)} falha(s) nesta execução"):
             st.dataframe(pd.DataFrame(falhas).rename(columns={"unidade": "Consulta", "erro": "Erro"}),
                          hide_index=True, use_container_width=True)
+
+
+def _texto_precalculo(dia: str | None, resumo: dict | None, com_chave: bool) -> str:
+    """A linha do cálculo de madrugada (pedido/precalculo.py, 29/10/2026), do banco deste app."""
+    if not dia or not resumo or not resumo["lojas"]:
+        texto = "Cálculo de madrugada: ainda não rodou para este banco (as lojas calculam na hora, ao abrir)."
+    else:
+        inicio = resumo["inicio"] or dia
+        quando = f"{inicio[8:10]}/{inicio[5:7]}" + (f" às {inicio[11:16]}" if len(inicio) >= 16 else "")
+        texto = f"Cálculo de madrugada: {_milhar(resumo['prontas'])} de {_milhar(resumo['lojas'])} lojas prontas"
+        if resumo["com_falha"]:
+            texto += f", {_milhar(resumo['com_falha'])} com falha"
+        texto += f" · última execução {quando}."
+    if not com_chave:
+        texto += " Sem a PRECALCULO_CHAVE nos Secrets deste app, ele não lê os resultados prontos."
+    return texto
+
+
+def _precalculo() -> None:
+    from core import copia_spaces
+    from pedido import precalculo
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    try:
+        dia, por_banco = precalculo.ultima_execucao(do_ambiente(), Chaves(settings.pedido.prefixo))
+    except Exception as exc:  # noqa: BLE001
+        st.caption(f"Cálculo de madrugada: não consegui ler os relatórios ({type(exc).__name__}).")
+        return
+    rels = por_banco.get(copia_spaces.nome_do_banco())
+    st.caption(_texto_precalculo(dia, precalculo.resumo(rels) if rels else None,
+                                 bool(settings.pedido.precalculo_chave)))
 
 
 def _fontes_categorias() -> None:

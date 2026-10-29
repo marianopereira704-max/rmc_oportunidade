@@ -11,8 +11,9 @@ LOCAL_STORAGE_DIR do ambiente — nunca produção):
   estoque baixo (Ruptura próxima), um negativo, uma bonificação depois da
   última compra, uma compra fora do padrão (a revisar), produtos sem
   compra e sem categoria;
-- uma personalização dos parâmetros (medicamento 10 dias), pra tela mostrar
-  as pílulas "Personalizado desta loja" / "Padrão" (01/10/2026).
+- uma personalização dos parâmetros (medicamento 10 dias): a tela usa as regras
+  desta loja e mostra o rótulo "Regras desta loja" (até 29/10/2026, as pílulas
+  "Personalizado desta loja" / "Padrão").
 
 Data fixa (foto de estoque de 27/09/2026): as capturas não mudam com o dia.
 

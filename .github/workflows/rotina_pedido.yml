@@ -13,7 +13,15 @@ on:
     # 03:00 UTC = 00:00 em Brasília. O GPS atualiza os dados do dia por volta
     # das 11h–12h; rodando à meia-noite, o dia anterior já está completo.
     - cron: "0 3 * * *"
-  workflow_dispatch: {}  # botão "Run workflow" (carga inicial, reprocessar)
+  workflow_dispatch:  # botão "Run workflow" (carga inicial, reprocessar)
+    inputs:
+      modo:
+        description: "O que rodar"
+        type: choice
+        default: completa
+        options:
+          - completa
+          - so_precalculo
 
 # Nunca duas rodadas ao mesmo tempo: a segunda espera a primeira terminar.
 concurrency:
@@ -23,6 +31,7 @@ concurrency:
 jobs:
   coleta:
     name: Parte ${{ matrix.parte }} de 8
+    if: inputs.modo != 'so_precalculo'
     runs-on: ubuntu-latest
     # O GitHub corta em 6 h; a rotina para sozinha antes (PEDIDO_ORCAMENTO_MINUTOS)
     # e a próxima execução continua de onde ela parou.
@@ -62,7 +71,7 @@ jobs:
   rede:
     name: Compras da rede (Análise)
     needs: coleta
-    if: always()
+    if: always() && inputs.modo != 'so_precalculo'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -82,12 +91,49 @@ jobs:
           DO_SPACES_ACCESS_KEY: ${{ secrets.DO_SPACES_ACCESS_KEY }}
           DO_SPACES_SECRET_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
 
+  # Cálculo de madrugada (pedido/precalculo.py, 29/10/2026): as 4 telas de
+  # cada loja (Assistente e Dashboard) prontas no Spaces, com as fotos de
+  # estoque que a coleta acabou de gravar; em paralelo com o `rede`. Não
+  # alcança o banco: usa as fotos dos insumos que o app publica.
+  # No agendamento, só com a variável do repositório PRECALCULO_AGENDADO = 1
+  # (Settings → Secrets and variables → Actions → Variables): ligada depois
+  # da conferência das lojas reais. No botão, "so_precalculo" roda sempre.
+  precalculo:
+    name: Pré-cálculo ${{ matrix.parte }} de 8
+    needs: coleta
+    if: always() && (inputs.modo == 'so_precalculo' || vars.PRECALCULO_AGENDADO == '1')
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        parte: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Pré-cálculo
+        run: python -m pedido.precalculo --parte ${{ matrix.parte }} --partes 8
+        env:
+          RMC_IGNORAR_SECRETS: "1"
+          PRECALCULO_CHAVE: ${{ secrets.PRECALCULO_CHAVE }}
+          DO_SPACES_ENDPOINT: ${{ secrets.DO_SPACES_ENDPOINT }}
+          DO_SPACES_REGION: ${{ secrets.DO_SPACES_REGION }}
+          DO_SPACES_BUCKET: ${{ secrets.DO_SPACES_BUCKET }}
+          DO_SPACES_ACCESS_KEY: ${{ secrets.DO_SPACES_ACCESS_KEY }}
+          DO_SPACES_SECRET_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+
   # Alerta por e-mail (pedido/alerta.py, 28/10/2026): só quando a execução
   # trouxe menos do que devia (parte sem relatório, erro, nenhuma foto de
-  # estoque, queda de lojas). Falha da rotina inteira o GitHub já avisa.
+  # estoque, queda de lojas; e, quando o job rodou, o cálculo de madrugada).
+  # Falha da rotina inteira o GitHub já avisa. No "so_precalculo" confere só
+  # o cálculo (conferir a coleta de novo reenviaria o e-mail da noite).
   alerta:
     name: Alerta por e-mail
-    needs: [coleta, rede]
+    needs: [coleta, rede, precalculo]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -99,7 +145,10 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt
       - name: Alerta
-        run: python -m pedido.alerta --partes 8
+        run: >-
+          python -m pedido.alerta --partes 8
+          ${{ inputs.modo == 'so_precalculo' && '--so-precalculo' || '' }}
+          ${{ inputs.modo != 'so_precalculo' && needs.precalculo.result != 'skipped' && '--precalculo' || '' }}
         env:
           RMC_IGNORAR_SECRETS: "1"
           DO_SPACES_ENDPOINT: ${{ secrets.DO_SPACES_ENDPOINT }}

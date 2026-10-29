@@ -99,4 +99,4 @@ def _avisar_uma_vez(loja_id: int, tipo: str, texto: str) -> None:
     vistos = st.session_state.setdefault(_AVISADOS, set())
     if (loja_id, texto) not in vistos:
         vistos.add((loja_id, texto))
-        _notificar(tipo, texto)   # "Corrigir manualmente" → abre a lista no rerun seguinte
+        _notificar(tipo, texto)   # "Digitar o estoque certo" → abre a lista no rerun seguinte

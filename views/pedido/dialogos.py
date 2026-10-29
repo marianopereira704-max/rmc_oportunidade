@@ -64,6 +64,10 @@ def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: 
         with get_session() as session:
             gravadas, removidas = pedido_rascunho.salvar_correcoes(session, loja["id"], valores, gps,
                                                                    meta.get("data_foto"), usuario["nome"])
+        # Correção nova muda a assinatura desta loja: a foto dos insumos vai na hora (cálculo de madrugada, 29/10).
+        from integrations import insumos
+
+        insumos.publicar_em_segundo_plano(forcar=True)
         partes = [f"{gravadas} correção(ões) salva(s)"] + ([f"{removidas} removida(s)"] if removidas else [])
         _concluir("success", "Estoque negativo: " + ", ".join(partes) + ".")
         st.rerun()

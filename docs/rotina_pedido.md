@@ -37,6 +37,12 @@ As chaves **nunca** vão no código (o repositório é público). No GitHub:
 | `EMAIL_REMETENTE` | `EMAIL_REMETENTE` (alerta por e-mail, 28/10/2026) |
 | `EMAIL_SENHA_APP` | `EMAIL_SENHA_APP` |
 | `ALERTA_DESTINATARIOS` | não está no secrets.toml: os e-mails que recebem o alerta, separados por vírgula |
+| `PRECALCULO_CHAVE` | `PRECALCULO_CHAVE` (cálculo de madrugada, 29/10/2026): uma frase longa qualquer, a MESMA no GitHub, no secrets.toml local e — na publicação — nos Secrets do Streamlit Cloud |
+
+E uma **variável** (Settings → Secrets and variables → Actions → aba
+**Variables** → New repository variable; não é segredo e não tem custo):
+`PRECALCULO_AGENDADO` = `1` liga o cálculo de madrugada na execução da
+meia-noite. Sem ela, o job só roda pelo botão (ver 4c).
 
 Quando trocar uma chave (a da API do GPS e a do Spaces estão pendentes de
 troca), atualize aqui também.
@@ -50,7 +56,8 @@ push como de costume.
 ## 3. Disparar a carga inicial (sem esperar a meia-noite)
 
 GitHub → aba **Actions** → **Rotina Pedido (API do GPS)** → **Run
-workflow** → **Run workflow**.
+workflow** → **Run workflow** (com "O que rodar" em `completa`, o padrão;
+`so_precalculo` é o do item 4c).
 
 Cada execução dura no máximo ~5,5 h por parte (limite do GitHub: 6 h). Se a
 carga não terminar numa execução, dispare de novo (ou espere a da
@@ -105,6 +112,33 @@ mesma execução, para a manutenção (estoque, histórico, mês corrente). Moti
 a API passou a listar 150 "empresas" sem cadastro (lojas "derivada de
 tb_estoque", sem nome nem CNPJ, nenhuma da rede) e, de 25 a 28/10, nenhuma
 loja ganhou foto de estoque.
+
+## 4c. Cálculo de madrugada (29/10/2026)
+
+Job **Pré-cálculo i de 8** (`python -m pedido.precalculo`), depois da coleta e
+ao mesmo tempo que as compras da rede: monta, para cada loja, o resultado do
+Assistente de pedido e das 3 páginas do Dashboard e grava no Spaces
+(`pedido/resultados/<banco>/…`, selado com a `PRECALCULO_CHAVE`). O app lê o
+pronto em vez de calcular; se algo mudou depois da madrugada (personalização,
+correção de estoque negativo, base nova), aquela loja calcula na hora, como
+antes. Desenho completo: `docs/specs/2026-10-29-calculo-madrugada-design.md`.
+
+- A rotina **não alcança o banco**: usa as fotos dos insumos que o app publica
+  em `pedido/insumos/<banco>/manifesto.json` (ao gravar Configurações ou uma
+  correção, e no máximo a cada 10 min). Sem nenhuma foto publicada, o job não
+  tem o que fazer: abra o app uma vez.
+- **Rodar à mão:** Run workflow com "O que rodar" = `so_precalculo` — pula a
+  coleta e as compras da rede e calcula com as fotos de estoque que já existem.
+- **Agendado:** só com a variável `PRECALCULO_AGENDADO = 1` (item 1).
+- **Acompanhar:** Dados → Rotinas, linha "Cálculo de madrugada: N de M lojas
+  prontas · última execução …"; relatórios em
+  `pedido/controle/precalculo/<data>/<banco>/<parte>.json` (com o erro de cada
+  loja que falhou). O alerta por e-mail avisa parte sem relatório (inclusive
+  por falta da chave) e mais de 10% das lojas com falha. No `so_precalculo` o
+  alerta confere só o cálculo (conferir a coleta de novo reenviaria o e-mail da
+  noite).
+- Na própria máquina: `python -m pedido.precalculo --lojas 60,64` (com a chave
+  no secrets.toml; grava no Spaces real, na pasta do banco dev).
 
 ## 5. Base de categorias (uma vez)
 

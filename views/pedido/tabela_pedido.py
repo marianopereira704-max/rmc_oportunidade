@@ -24,6 +24,9 @@ def _colunas(p: calculo.Parametros) -> list[tb.ColunaTabela]:
         # coluna ficava ~30 px mais larga que o texto e o vão visível até a
         # Curva saía desigual no teste visual (29/09/2026).
         tb.ColunaTabela(None, "Status", id="status"),
+        # Curva sem "?" no título (29/10/2026, de novo): o "?" alargava a coluna ~20 px e, em 1280 px, a tabela
+        # deixava de caber (o nome do produto quebrava em 2 linhas; teste visual). A explicação fica na própria
+        # letra de cada linha (`_DICA_CURVA`).
         tb.ColunaTabela("curva", "Curva"),
         # Dicas (02/10/2026): frases curtas, um parágrafo por ideia ("\n\n"),
         # e "sistema de vendas" no lugar de "GPS" — é lá que a loja corrige.
@@ -37,10 +40,12 @@ def _colunas(p: calculo.Parametros) -> list[tb.ColunaTabela]:
                         dica="Unidades vendidas nos últimos 90 dias.\n\nA sugestão usa a média por dia de todo "
                              "o período de vendas."),
         # "Ideal" no lugar de "Máx." (02/10/2026): é onde o estoque deve chegar.
+        # "Mínimo / Ideal" por extenso (29/10/2026) passava ~30 px e a tabela deixava de caber em 1280 px (teste
+        # visual): o título fica "Mín./Ideal"; a dica, por extenso.
         tb.ColunaTabela("estoque_max", "Mín./Ideal", centro=True, numerica=True,
-                        dica=f"Mín.: estoque para {p.dias_ruptura} dias de venda; abaixo disso, ruptura próxima."
-                             "\n\nIdeal: onde o estoque deve chegar com o pedido."),
-        tb.ColunaTabela("estoque", "Est. atual", centro=True, numerica=True),
+                        dica=f"Mínimo: estoque para {p.dias_ruptura} dias de venda; abaixo disso, vai faltar."
+                             "\n\nIdeal: quanto ter depois do pedido."),
+        tb.ColunaTabela("estoque", "Estoque", centro=True, numerica=True),
         tb.ColunaTabela("quantidade", "Sugestão", centro=True, numerica=True,
                         dica="A quantidade do pedido. Digite outro número para mudar.\n\nEm azul: alterada à mão."),
         tb.ColunaTabela("subtotal", "Subtotal", direita=True, numerica=True),
@@ -65,15 +70,15 @@ def _dica_status(tag: str, r: dict, p: calculo.Parametros) -> str | None:
     if tag == calculo.RUPTURA:
         return "Estoque zerado." if p.ruptura_unidades == 0 else f"Estoque de até {dicas.qtd(p.ruptura_unidades, 'unidade')}."
     if tag == calculo.RUPTURA_PROXIMA:
-        return f"O estoque cobre {dicas.qtd(p.dias_ruptura, 'dia')} de venda ou menos."
+        return f"O estoque dura {dicas.qtd(p.dias_ruptura, 'dia')} de venda ou menos."
     if tag == calculo.CORRIGIDO:
         return ("O sistema de vendas mostra estoque negativo.\n\nVale o estoque digitado aqui até o sistema de "
                 "vendas deixar de mostrar negativo.")
     if tag == calculo.SEM_CLASSIFICACAO:
         return f"Produto sem categoria: sugestão com {p.dias_sem_classificacao} dias estimados."
     if tag == calculo.GIRO_BAIXO:
-        return (f"Vendeu no máximo {dicas.qtd(p.giro_baixo_max_unidades, 'unidade')} nos últimos "
-                f"{dicas.qtd(p.giro_baixo_dias, 'dia')}.")
+        return (f"Vendeu até {dicas.qtd(p.giro_baixo_max_unidades, 'unidade')} nos últimos "
+                f"{dicas.qtd(p.giro_baixo_dias, 'dia')}.\n\nCom \"Ocultar giro baixo\" ligado, sai do pedido.")
     if tag == calculo.VENDA_PONTUAL:
         unidades = f"{_numero(r['unidades_90d'])} unidade" + ("" if r["unidades_90d"] == 1 else "s")
         entre = ("os produtos que mais faturam na loja" if r["curva_valor"] == "A"
@@ -96,8 +101,23 @@ def _celula_produto(r: dict) -> list:
     return tb.celula(*linhas)
 
 
+# Nome que a etiqueta mostra na tela, quando difere do valor interno (29/10/2026, textos em linguagem de dono de
+# farmácia aprovados pelo Mariano). Só na tela e no filtro Status: os valores internos seguem nos filtros
+# guardados, na exportação e no Dashboard.
+ROTULO_STATUS = {
+    calculo.A_REVISAR: "Conferir preço",
+    calculo.SEM_CLASSIFICACAO: "Sem categoria",
+    calculo.ALTERADO: "Mudado por você",
+}
+
+
+def rotulo_status(tag: str) -> str:
+    return ROTULO_STATUS.get(tag, tag)
+
+
 def _celula_status(r: dict, p: calculo.Parametros) -> list:
-    tags = [tb.pedaco(t, _CLASSE_STATUS[t], _dica_status(t, r, p)) for t in r["status"] if t in _CLASSE_STATUS]
+    tags = [tb.pedaco(rotulo_status(t), _CLASSE_STATUS[t], _dica_status(t, r, p))
+            for t in r["status"] if t in _CLASSE_STATUS]
     if not tags:
         return tb.celula(tb.pedaco("—", "aux"))
     # Uma embaixo da outra ("se não couber", pedido de 29/09/2026 — na
@@ -221,6 +241,10 @@ def _celula_sugestao(r: dict) -> list:
     return tb.celula(*linhas)
 
 
+_DICA_CURVA = dicas.dica("A: os produtos que mais faturam na loja. B: os do meio. C: os que menos faturam",
+                         "A 1ª letra é pelo valor vendido; a 2ª, pela quantidade")
+
+
 def _linha(r: dict, p: calculo.Parametros) -> dict:
     return {
         "id": r["linha"],
@@ -229,7 +253,7 @@ def _linha(r: dict, p: calculo.Parametros) -> dict:
         "celulas": {
             "nome": _celula_produto(r),
             "status": _celula_status(r, p),
-            "curva": tb.celula(tb.pedaco(r["curva"], "forte")),
+            "curva": tb.celula(tb.pedaco(r["curva"], "forte", _DICA_CURVA)),
             "preco": _celula_compra(r),
             "venda_90d": tb.celula(tb.pedaco(_numero(r["venda_90d"]))),
             "estoque_max": tb.celula(tb.pedaco(f"{_numero(r['estoque_min'])} / {_numero(r['estoque_max'])}")),
@@ -251,11 +275,11 @@ def _indicadores(pedido: pd.DataFrame, p: calculo.Parametros) -> None:
     cards = [
         {"icone": "moeda", "tom": "verde", "valor": ui.formatar_moeda(i.orcamento), "label": "Orçamento total",
          "sub": f"{ui.formatar_numero(i.unidades)} unidades marcadas"},
-        {"icone": "produto", "tom": "roxo", "valor": ui.formatar_numero(i.itens), "label": "Itens com sugestão",
-         "sub": f"{ui.formatar_numero(i.marcados)} selecionados"},
+        {"icone": "produto", "tom": "roxo", "valor": ui.formatar_numero(i.itens), "label": "Produtos para comprar",
+         "sub": f"{ui.formatar_numero(i.marcados)} marcados no pedido"},
         {"icone": "alerta", "tom": "ambar", "valor": ui.formatar_numero(i.ruptura), "label": "Ruptura",
-         "sub": f"{ui.formatar_numero(i.ruptura_sem_pedido)} sem pedido"},
-        {"icone": "duvida", "tom": "azul", "valor": ui.formatar_numero(sem), "label": "Sem classificação",
+         "sub": f"{ui.formatar_numero(i.ruptura_sem_pedido)} ainda fora do pedido"},
+        {"icone": "duvida", "tom": "azul", "valor": ui.formatar_numero(sem), "label": "Sem categoria",
          "sub": "Saiba mais ›"},
     ]
     with st.container(key="pedido-cards"):
@@ -265,5 +289,5 @@ def _indicadores(pedido: pd.DataFrame, p: calculo.Parametros) -> None:
                 theme.kpis([card], unico=True)
         with colunas[3], st.container(key="pedido-card-sem"):
             theme.kpis([cards[3]], unico=True)
-            if st.button("Saiba mais sobre os produtos sem classificação", key=f"{_KEY}_saiba_mais"):
+            if st.button("Saiba mais sobre os produtos sem categoria", key=f"{_KEY}_saiba_mais"):
                 _dialog_saiba_mais(sem, p.dias_sem_classificacao)

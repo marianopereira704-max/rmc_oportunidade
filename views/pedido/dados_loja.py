@@ -98,10 +98,13 @@ def _base_categorias(versao: tuple) -> pd.DataFrame:
 
 @st.cache_data(max_entries=2, show_spinner=False)
 def _genericos(versao: tuple) -> pd.DataFrame:
+    """Da cópia no Spaces quando há (core/copia_spaces.py) — a mesma que o cálculo de madrugada lê (29/10/2026)."""
     from integrations import pedido_tela
 
-    with get_session() as session:
-        return pedido_tela.genericos(session)
+    def do_banco():
+        with get_session() as session:
+            return pedido_tela.genericos(session)
+    return copia_spaces.ler_ou_montar("genericos", versao, do_banco)
 
 
 @st.cache_data(ttl=3600, max_entries=30, show_spinner="Calculando o pedido da loja...")
@@ -114,15 +117,38 @@ def _calcular(empresa: str, loja: str, meses: int, versoes: tuple, params: calcu
     expirava a cada 5 min e recalculava sem dado novo (~0,7 s, medido em
     02/10/2026); a 1 h fica só de garantia pra dias de venda que a rotina
     completa depois da foto."""
-    from pedido import pronto
+    from pedido import precalculo, telas_loja
     from pedido.armazenamento import do_ambiente
     from pedido.plano import Chaves
 
-    p = pronto.atualizar(do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja, meses)
-    if p is None:
+    # Pronto da madrugada (29/10/2026) quando a assinatura bate; senão a conta na hora, de pedido/telas_loja.py —
+    # a mesma que a rotina usa.
+    pronto = _pronto("assistente", empresa, loja, precalculo.assinatura_assistente(foto, versoes, meses, params,
+                                                                                    correcoes))
+    if pronto is not None:
+        return pronto
+    return telas_loja.assistente(do_ambiente(), Chaves(settings.pedido.prefixo), empresa, loja, meses, params,
+                                 dict(correcoes), _base_categorias(versoes[0]), _genericos(versoes[1]))
+
+
+def _pronto(tela: str, empresa: str, loja: str, assinatura: str):
+    """O resultado do cálculo de madrugada (pedido/precalculo.py) desta tela, se a assinatura bate e o selo confere;
+    senão None. Qualquer falha também é None: a tela calcula na hora, como antes."""
+    import logging
+
+    from pedido import precalculo
+    from pedido.armazenamento import do_ambiente
+    from pedido.plano import Chaves
+
+    chave = settings.pedido.precalculo_chave
+    if not chave:
         return None
-    linhas = calculo.calcular(p, _base_categorias(versoes[0]), _genericos(versoes[1]), params, dict(correcoes))
-    return linhas, p.meta
+    try:
+        return precalculo.ler(do_ambiente(), Chaves(settings.pedido.prefixo), copia_spaces.nome_do_banco(), empresa,
+                              loja, tela, assinatura, chave)
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).warning("pronto de %s não lido; calculando na hora", tela, exc_info=True)
+        return None
 
 
 def calculo_da_loja(loja: dict, config: ConfigPedido, correcoes: dict) -> tuple[pd.DataFrame, dict] | None:
@@ -137,10 +163,16 @@ def calculo_da_loja(loja: dict, config: ConfigPedido, correcoes: dict) -> tuple[
                      foto=f"{marcador.get('data')}|{marcador.get('gerado_em')}")
 
 
-def invalidar() -> None:
-    """Chamar depois de mudar categorias ou genéricos (aba Dados)."""
+def invalidar(publicar: bool = False) -> None:
+    """Chamar depois de mudar categorias ou genéricos (aba Dados). `publicar` (29/10/2026): acabou de gravar
+    Configurações ou personalização — a foto dos insumos do cálculo de madrugada vai na hora. A aba Dados chama sem
+    ele a cada clique; as mudanças de lá entram pela publicação de no máximo 10 em 10 min (app.py)."""
     _versoes.clear()
     _versao_catalogo.clear()   # categoria manual muda a classificação de produtos (cascata, 25/10/2026)
     _calcular.clear()
     configuracao.clear()
     _invalidar_estado()   # personalização salva em Configurações: vale já, nesta sessão
+    if publicar:
+        from integrations import insumos
+
+        insumos.publicar_em_segundo_plano(forcar=True)

@@ -27,16 +27,26 @@ logger = logging.getLogger(__name__)
 MANTER = 2
 
 
-def _pasta(nome: str) -> str:
+def nome_do_banco() -> str:
+    """O nome do banco da `DATABASE_URL` (SQLite: o nome do arquivo). Separa no Spaces o que é do app local (banco
+    dev) do que é do publicado — também as fotos dos insumos e os resultados do cálculo de madrugada."""
     from sqlalchemy.engine import make_url
 
     banco = make_url(settings.db.url).database or "banco"
-    banco = banco.replace("\\", "/").rsplit("/", 1)[-1]          # SQLite: só o nome do arquivo
-    return f"{settings.pedido.prefixo}/cache_app/{banco}/{nome}/"
+    return banco.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _pasta(nome: str) -> str:
+    return f"{settings.pedido.prefixo}/cache_app/{nome_do_banco()}/{nome}/"
 
 
 def _assinatura(versao) -> str:
     return hashlib.sha1(repr(versao).encode("utf-8")).hexdigest()[:16]
+
+
+def chave(nome: str, versao) -> str:
+    """Onde fica a cópia da tabela `nome` na `versao` (o manifesto do cálculo de madrugada aponta para ela)."""
+    return f"{_pasta(nome)}{_assinatura(versao)}.parquet"
 
 
 def ler_ou_montar(nome: str, versao, montar, armaz=None) -> pd.DataFrame:

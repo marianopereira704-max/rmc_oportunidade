@@ -37,6 +37,7 @@ from views.dados.importar import _categorias_importar, _importar_base_genericos,
 from views.dados.rotinas import (
     _fila_loja_automatica,
     _fontes_categorias,
+    _precalculo,
     _rotina_gps,
     _sincronizar_lojas,
     _sincronizar_lojas_automatico,
@@ -120,6 +121,7 @@ def _rotinas_aba() -> None:
     _sincronizar_lojas()
     st.divider()
     _rotina_gps()
+    _precalculo()
     st.divider()
     _fontes_categorias()
 

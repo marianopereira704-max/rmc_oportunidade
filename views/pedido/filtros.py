@@ -6,6 +6,7 @@ import streamlit as st
 
 from pedido import calculo
 from views.pedido.estado import _KEY
+from views.pedido.tabela_pedido import rotulo_status
 
 # Filtro Status: o valor fica em `<base>_valor` e o campo tem chave com
 # versão (`<base>_<n>`). Tirar "Giro baixo" de dentro do callback do
@@ -49,7 +50,7 @@ def _linha_filtros(loja_id: int, todas: pd.DataFrame) -> tuple[str | None, tuple
                               label_visibility="collapsed")
         escolhidas = st.multiselect("Categoria", categorias, placeholder="Categoria", key=f"{_KEY}_cat_{loja_id}",
                                     label_visibility="collapsed")
-        tags = st.multiselect("Status", status, default=ja_escolhidos, placeholder="Status",
+        tags = st.multiselect("Status", status, default=ja_escolhidos, placeholder="Status", format_func=rotulo_status,
                               key=f"{base}_{st.session_state.get(f'{base}_v', 0)}",
                               on_change=_status_mudou, args=(base,), label_visibility="collapsed")
         fabs = st.multiselect("Fabricante", fabricantes, placeholder="Fabricante", key=f"{_KEY}_fab_{loja_id}",

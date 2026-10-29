@@ -47,6 +47,12 @@ if not st.session_state.get("_vinculo_conferido"):
     st.session_state["_vinculo_conferido"] = True
     loja_barra.conferir_vinculos_em_segundo_plano()
 
+# Fotos dos insumos do cálculo de madrugada (29/10/2026, integrations/insumos.py): em segundo plano, no máximo a cada
+# 10 min por processo e só grava se algo mudou — pega o que mudou na aba Dados (categorias, genéricos) antes da noite.
+from integrations import insumos as _insumos  # noqa: E402
+
+_insumos.publicar_em_segundo_plano()
+
 
 def _aviso_ip_fechado() -> None:
     st.session_state["ip_streamlit_aviso_fechado"] = True

@@ -109,7 +109,7 @@ cumpriram o papel. **Apagados em 29/10/2026** (com o `tests/test_casamento_lojas
 
 **Decidido (29/10/2026): A e B** — passo a passo no fim desta etapa, feito pelo M.
 
-## 4. Assistente mais simples (C, textos aprovados pelo M)
+## 4. Assistente mais simples (C, textos aprovados pelo M) — feita em 29/10/2026
 
 - **Fim das pílulas "Personalizado desta loja" / "Padrão".** Loja com personalização usa a personalização, sempre;
   sem personalização, o padrão. A lista aparece direto, sem escolha. Um texto discreto no topo diz qual vale
@@ -118,6 +118,11 @@ cumpriram o papel. **Apagados em 29/10/2026** (com o `tests/test_casamento_lojas
   vistas (Ruptura, Giro baixo, Venda pontual, A revisar, curva ABC). Método: o C levanta todos os textos numa
   tabela "como está → proposta" em linguagem de dono de farmácia; o M aprova; o C aplica.
 - Teste visual atualizado (o fluxo das pílulas sai do roteiro).
+
+**Feito:** textos aprovados pelo M aplicados; pílulas fora. Testados pela regra do M: "Conferir preço" passou (mesma
+largura de "Ruptura próxima"); "Mínimo / Ideal" e o "?" da dica nova da Curva não passaram em 1280 px (a tabela
+deixava de caber e o nome do produto quebrava) — ficaram "Mín./Ideal" (dica por extenso) e a dica na letra da
+curva. O teste visual ganhou a regra de EIXOS E ESPAÇO para todas as tabelas e cards (`_verificar_eixos`).
 
 ## 5. Cálculo de madrugada — opção C (C, desenho aprovado pelo M antes de codar)
 

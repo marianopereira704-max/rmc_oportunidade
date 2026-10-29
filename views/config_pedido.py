@@ -353,7 +353,7 @@ def _salvar(config: ConfigPedido, usuario: str) -> None:
 
     with get_session() as session:
         configuracao_pedido.salvar(session, config, usuario)
-    dados_pedido.invalidar()
+    dados_pedido.invalidar(publicar=True)
     try:
         configuracao_pedido.publicar_para_rotina(do_ambiente(), Chaves(settings.pedido.prefixo), config, usuario)
         st.session_state["config_pedido_msg"] = (
@@ -507,7 +507,7 @@ def _personalizacao() -> None:
         with get_session() as session:
             gravada = configuracao_pedido.salvar_loja(session, loja_id, nova, usuario["nome"])
         st.session_state.pop(f"config_pedido_copia_{loja_id}", None)
-        dados_pedido.invalidar()
+        dados_pedido.invalidar(publicar=True)
         st.session_state["config_pedido_msg"] = (
             ("success", f"Personalização salva ({cfg.quantos_campos(gravada)} campo(s) diferentes do padrão).")
             if gravada else ("info", "Tudo igual ao padrão: a loja segue o padrão."))
@@ -521,7 +521,7 @@ def _personalizacao() -> None:
                 with get_session() as session:
                     configuracao_pedido.remover_loja(session, loja_id, usuario["nome"])
                 st.session_state.pop("config_pedido_remover", None)
-                dados_pedido.invalidar()
+                dados_pedido.invalidar(publicar=True)
                 st.session_state["config_pedido_msg"] = ("success", "Personalização removida: a loja segue o padrão.")
             else:
                 st.session_state["config_pedido_remover"] = loja_id

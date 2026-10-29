@@ -1,21 +1,19 @@
-"""Assistente de pedido: pop-ups ao abrir a loja (estoque negativo, sem classificação) e a escolha
-Personalizado desta loja × Padrão."""
+"""Assistente de pedido: pop-ups ao abrir a loja (estoque negativo, sem classificação) e o rótulo de quais regras
+valem (desta loja ou padrão)."""
 from __future__ import annotations
 
 import streamlit as st
 
-from core import dicas, ui
+from core import dicas
 from core.db import get_session
 from pedido.configuracao import ConfigPedido
 from views import popups
 from views.pedido.estado import _ABRIR_NEGATIVOS, _KEY, _invalidar_estado
 
 def _texto_sem_classificacao(n: int, dias: int) -> str:
-    return (f"**{ui.formatar_numero(n)} produto(s) desta sugestão estão sem classificação.** A inteligência de pedido "
-            "não se aplica a eles: sem categoria, o sistema não sabe se são medicamento ou perfumaria, nem quantos "
-            f"dias de estoque usar. Para evitar ruptura, sugerimos um pedido mínimo: estoque para **{dias} dias** de "
-            "venda.  \nA classificação é feita pela administração; classificado, o produto passa a seguir a regra "
-            "normal.")
+    # Textos em linguagem de dono de farmácia (etapa 4 do plano de 29/10/2026, aprovados pelo Mariano).
+    return (f"**{dicas.qtd(n, 'produto')} ainda sem categoria.** Para não faltar, a inteligência de pedido sugere "
+            f"comprar o suficiente para **{dicas.qtd(dias, 'dia')} de venda**.")
 
 
 @popups.popup("Produtos sem classificação", "aviso")
@@ -39,12 +37,11 @@ def _alerta_negativos(usuario_id: int, loja_id: int, foto: str, n: int) -> None:
     """1º pop-up ao abrir a loja. Sem X: a resposta é o que libera a lista."""
     from integrations import pedido_area
 
-    st.markdown(f"**{ui.formatar_numero(n)} produto(s) com estoque negativo.** Deseja corrigir manualmente ou "
-                "considerar todos com estoque zero?")
-    st.caption("Com estoque zero, a sugestão cobre o ideal inteiro do produto. Corrigindo, a linha é recalculada "
-               "com o estoque que você digitar; os que ficarem sem correção contam como zero. A pergunta volta "
-               "quando chegar uma foto nova do estoque.")
-    corrigir, zero = popups.botoes("Considerar todos zero", "Corrigir manualmente", chave=f"{_KEY}_alerta_neg")
+    st.markdown(f"**{dicas.qtd(n, 'produto')} com estoque negativo no seu sistema.** Normalmente é venda lançada "
+                "antes da entrada da nota.")
+    st.caption("Você pode digitar o estoque certo de cada um ou considerar todos como zero. Considerando como zero, "
+               "a sugestão pede o estoque completo. A pergunta volta quando o estoque for atualizado.")
+    corrigir, zero = popups.botoes("Considerar como zero", "Digitar o estoque certo", chave=f"{_KEY}_alerta_neg")
     if corrigir:
         _responder_aviso(usuario_id, loja_id, pedido_area.AVISO_NEGATIVO, foto, "corrigir")
         st.session_state[_ABRIR_NEGATIVOS] = True   # um pop-up não abre outro: abre no rerun
@@ -73,16 +70,16 @@ def _resumo_config(c: ConfigPedido) -> str:
             f"ruptura próxima {c.dias_ruptura} dias{proprias}")
 
 
-def _escolher_parametros(loja_id: int, personalizado: ConfigPedido, padrao: ConfigPedido) -> str | None:
-    """Pílulas da loja com personalização (Q5i de 01/10/2026): nenhuma vem
-    marcada — a lista só aparece depois da escolha; trocar recalcula na hora
-    (as quantidades digitadas continuam: são da área de trabalho)."""
-    rotulos = {"loja": "Personalizado desta loja", "padrao": "Padrão"}
-    with st.container(key="pedido-parametros", horizontal=True, vertical_alignment="center", gap="small"):
-        st.markdown('<span class="rmc-pedido-rotulo">Parâmetros</span>', unsafe_allow_html=True)
-        return st.pills(
-            "Parâmetros", list(rotulos), format_func=rotulos.get, key=f"{_KEY}_param_{loja_id}",
-            label_visibility="collapsed",
-            help=dicas.dica(f"Personalizado desta loja: {_resumo_config(personalizado)}",
-                        f"Padrão: {_resumo_config(padrao)}"),
-        )
+def _regras_usadas(personalizado: ConfigPedido | None, padrao: ConfigPedido) -> None:
+    """Qual regra vale, em texto discreto no topo (29/10/2026). Antes, a loja com personalização mostrava as pílulas
+    "Personalizado desta loja" / "Padrão" (Q5i de 01/10/2026), nenhuma marcada, e a lista só aparecia depois da
+    escolha — mas, se a loja tem regras próprias, são elas que valem: a escolha era um passo a mais sem resposta
+    certa para o dono da farmácia."""
+    if personalizado is not None:
+        rotulo, frase = "Regras desta loja", f"Esta loja tem regras próprias: {_resumo_config(personalizado)}"
+    else:
+        rotulo, frase = "Regras padrão", f"Esta loja segue as regras padrão: {_resumo_config(padrao)}"
+    texto = dicas.dica(frase, "Quem muda é a administração, em Configurações de Pedidos.")
+    with st.container(key="pedido-parametros"):
+        st.markdown(f'<span class="rmc-pedido-rotulo dica-abaixo" data-dica="{dicas.atributo(texto)}">{rotulo}</span>',
+                    unsafe_allow_html=True)
