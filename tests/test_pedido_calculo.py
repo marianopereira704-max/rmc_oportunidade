@@ -382,3 +382,12 @@ def test_acima_da_venda_sem_nenhuma_nota_paga():
     base = pd.DataFrame([("205", "MIP/OTC")], columns=["ean", "categoria"])
     df = calculo.calcular(_pronto(vendas, estoque, compras), base, SEM_GENERICOS)
     assert _linha(df, "P5")["preco"] == pytest.approx(50.00)
+
+
+def test_exportacao_do_enviar_pedido_tem_ean_produto_e_quantidade():
+    """"Enviar pedido" do celular e anexo dos e-mails para as lojas (29/10/2026)."""
+    linhas = pd.DataFrame({"nome": ["A", "B", "C"], "quantidade": [3, 0, 2], "ean_principal": ["789", "", None],
+                           "eans": [["789", "790"], ["111"], ["222"]]})
+    saida = calculo.exportacao_envio(linhas)
+    assert list(saida.columns) == ["EAN", "PRODUTO", "QUANTIDADE"]
+    assert saida.values.tolist() == [["789", "A", 3], ["222", "C", 2]]

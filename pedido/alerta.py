@@ -79,6 +79,31 @@ def problemas_precalculo(armaz, chaves: Chaves, hoje: dt.date, partes: int) -> l
     return saida
 
 
+def problemas_emails(armaz, chaves: Chaves, hoje: dt.date) -> list[str]:
+    """E-mails para as lojas (pedido/emails.py, 29/10/2026), quando o job rodou: relatório do dia faltando (o job
+    caiu antes de gravar), mais de 10% de falhas no envio ou o limite diário do Gmail atingido."""
+    from pedido import emails
+
+    saida = []
+    for banco in emails.bancos_com_lista(armaz, chaves):
+        pasta = f"{chaves.prefixo}/controle/emails/{banco}/relatorios/"
+        dias = [(hoje - dt.timedelta(days=d)).isoformat() for d in (0, 1)]
+        k = next((f"{pasta}{dia}.json" for dia in dias if armaz.existe(f"{pasta}{dia}.json")), None)
+        if k is None:
+            saida.append(f"E-mails para as lojas (banco {banco}): o job não deixou relatório hoje. Sem a "
+                         "PRECALCULO_CHAVE ou sem a senha do Gmail nos Secrets do GitHub, nenhum e-mail sai.")
+            continue
+        r = armaz.ler_json(k)
+        tentados = int(r.get("enviados", 0)) + int(r.get("falhas", 0))
+        if tentados and r.get("falhas", 0) > tentados * 0.10:
+            saida.append(f"E-mails para as lojas (banco {banco}): {r['falhas']} de {tentados} envios falharam.")
+        if r.get("limite_atingido"):
+            saida.append(f"E-mails para as lojas (banco {banco}): o limite de {emails.LIMITE_DIA} e-mails por dia "
+                         f"foi atingido e {r.get('fora_pelo_limite', 0)} pessoa(s) ficaram sem o e-mail. É hora de "
+                         "pensar noutro remetente (o Gmail da conta comum aceita ~500 por dia).")
+    return saida
+
+
 def _prefixo_alerta(chaves: Chaves) -> str:
     return f"{chaves.prefixo}/controle/alerta/"
 
@@ -179,6 +204,9 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
     p.add_argument("--coleta", default="",
                    help="resultado do job da coleta no GitHub (success, failure, cancelled, skipped)")
     p.add_argument("--precalculo", action="store_true", help="confere também o cálculo de madrugada")
+    p.add_argument("--emails", action="store_true", help="confere também os e-mails para as lojas")
+    p.add_argument("--so-emails", action="store_true",
+                   help="confere SÓ os e-mails para as lojas (disparo manual 'so_emails')")
     p.add_argument("--so-precalculo", action="store_true",
                    help="confere SÓ o cálculo de madrugada (disparo manual 'só o pré-cálculo': a coleta da noite já "
                         "foi conferida, e conferir de novo reenviaria o mesmo e-mail)")
@@ -187,6 +215,14 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
     armaz = ArmazenamentoLocal(a.destino.split(":", 1)[1]) if a.destino.startswith("local:") else do_ambiente()
     chaves = Chaves(settings.pedido.prefixo)
 
+    if a.so_emails:
+        lista = problemas_emails(armaz, chaves, hoje)
+        if not lista:
+            print("Alerta: nada a avisar.", flush=True)
+            return 0
+        return _enviar(enviar_email, lista, f"E-mails para as lojas — {len(lista)} problema(s) em {hoje:%d/%m/%Y}",
+                       "\n".join(["Os e-mails para as lojas terminaram com problema:", ""] + [f"- {p}" for p in lista]
+                                 + ["", "Detalhes no relatório do dia no Spaces (pedido/controle/emails/)."]))
     if a.so_precalculo:
         lista = problemas_precalculo(armaz, chaves, hoje, a.partes)
         if not lista:
@@ -222,6 +258,11 @@ def main(argv: list[str] | None = None, enviar_email=enviar) -> int:
             lista += problemas_precalculo(armaz, chaves, hoje, a.partes)
         except Exception as exc:  # noqa: BLE001
             lista.append(f"Não deu para conferir o cálculo de madrugada ({type(exc).__name__}).")
+    if a.emails:
+        try:
+            lista += problemas_emails(armaz, chaves, hoje)
+        except Exception as exc:  # noqa: BLE001
+            lista.append(f"Não deu para conferir os e-mails para as lojas ({type(exc).__name__}).")
     armaz.salvar_json(f"{_prefixo_alerta(chaves)}{atual['data']}.json", {**atual, "problemas": lista})
     if not lista:
         print("Alerta: nada a avisar.", flush=True)

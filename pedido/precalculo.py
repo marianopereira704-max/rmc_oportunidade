@@ -191,6 +191,23 @@ def foto_da_loja(armaz, chaves, empresa: str) -> str | None:
     return f"{m.get('data')}|{m.get('gerado_em')}"
 
 
+def assinaturas_da_loja(armaz, chaves, ins: Insumos, loja: dict, limite_bonificacao: float) -> tuple[str | None, dict]:
+    """(foto, tela → assinatura) de uma loja, como o app montaria agora. Sem foto de estoque: (None, {}). Também a
+    rotina dos e-mails para as lojas (pedido/emails.py) usa, para ler os resultados prontos."""
+    foto = foto_da_loja(armaz, chaves, loja["empresa_gps"])
+    if foto is None:
+        return None, {}
+    config = ins.config(int(loja["id"]))
+    params = config.parametros(limite_bonificacao)
+    corr = ins.correcoes_da_loja(int(loja["id"]))
+    return foto, {
+        "assistente": assinatura_assistente(foto, ins.versoes, config.meses_fechados, params, corr),
+        "estoque": assinatura_estoque(foto, ins.versoes[0], ins.versao_catalogo, config, limite_bonificacao),
+        "ruptura": assinatura_ruptura(foto, ins.versoes, ins.versao_catalogo, config, corr, limite_bonificacao),
+        "compras": assinatura_compras(foto, ins.versoes, ins.versao_catalogo, config, limite_bonificacao),
+    }
+
+
 def calcular_loja(armaz, chaves, ins: Insumos, loja: dict, chave: str, limite_bonificacao: float, agora: str,
                   relogio=None) -> dict[str, str]:
     """As 4 telas de uma loja: o que foi feito em cada uma ("calculada", "em dia" ou "sem dado")."""
@@ -200,19 +217,13 @@ def calcular_loja(armaz, chaves, ins: Insumos, loja: dict, chave: str, limite_bo
 
     relogio = relogio or time.monotonic
     empresa, lg, loja_id = loja["empresa_gps"], loja["loja_gps"], int(loja["id"])
-    foto = foto_da_loja(armaz, chaves, empresa)
+    foto, assinaturas = assinaturas_da_loja(armaz, chaves, ins, loja, limite_bonificacao)
     if foto is None:
         return {t: "sem dado" for t in TELAS}
     config = ins.config(loja_id)
     params = config.parametros(limite_bonificacao)
     meses = config.meses_fechados
     corr = ins.correcoes_da_loja(loja_id)
-    assinaturas = {
-        "assistente": assinatura_assistente(foto, ins.versoes, meses, params, corr),
-        "estoque": assinatura_estoque(foto, ins.versoes[0], ins.versao_catalogo, config, limite_bonificacao),
-        "ruptura": assinatura_ruptura(foto, ins.versoes, ins.versao_catalogo, config, corr, limite_bonificacao),
-        "compras": assinatura_compras(foto, ins.versoes, ins.versao_catalogo, config, limite_bonificacao),
-    }
     # O cálculo do Assistente serve a 3 telas: com as correções (Assistente e Ruptura) e sem (Compras) — o mesmo
     # que o app pede ao cache dele. Feito uma vez, só se alguma tela precisar.
     calcs: dict = {}

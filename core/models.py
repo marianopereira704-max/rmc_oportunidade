@@ -109,6 +109,10 @@ class Usuario(Base):
     criado_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
     excluido_em: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
     excluido_por: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # E-mails para as lojas (29/10/2026, migração 0020): vazio = o padrão (aviso de ruptura ligado, relatório
+    # diário desligado) — `integrations/usuarios.preferencias`.
+    email_ruptura: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    email_relatorio: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     __table_args__ = (UniqueConstraint("cnpj_login", "papel", name="uq_login_papel"),)
 

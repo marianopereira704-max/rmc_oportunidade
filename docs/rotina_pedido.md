@@ -48,6 +48,9 @@ E uma **variável** (Settings → Secrets and variables → Actions → aba
 `PRECALCULO_AGENDADO` = `1` liga o cálculo de madrugada na execução da
 meia-noite. Sem ela, o job só roda pelo botão (ver 4c).
 
+`APP_URL` (Secret, 29/10/2026): o endereço publicado do app, para os links dos e-mails para as lojas; e a variável
+`EMAILS_AGENDADO` = `1` liga esses e-mails na execução da meia-noite (ver 4d).
+
 Quando trocar uma chave (a da API do GPS e a do Spaces estão pendentes de
 troca), atualize aqui também.
 
@@ -179,3 +182,22 @@ python -m pedido --destino local:C:/tmp/pedido --empresas <idEmpresa> --orcament
 
 Sem `--destino`, grava no Spaces configurado no `secrets.toml` (o bucket
 real).
+
+## 4d. E-mails para as lojas (29/10/2026)
+
+Job **E-mails para as lojas** (`python -m pedido.emails`), depois do pré-cálculo: para cada usuário de loja (Comprador
+e Proprietário) ativo e com senha criada, **um e-mail com todas as lojas dele** — o aviso de ruptura (curva A e B pela
+1ª letra que zeraram desde a foto anterior) no topo e o relatório diário embaixo, cada um se estiver ligado em "Minhas
+notificações" (padrão: aviso ligado, relatório desligado) — com o **Excel do pedido sugerido** de cada loja (EAN,
+produto e quantidade). Desenho: `docs/specs/2026-10-29-emails-lojas-design.md`.
+
+- A lista de quem recebe o quê é publicada pelo app (`pedido/insumos/<banco>/destinatarios.json`). Antes da
+  publicação, só o app local publica: os e-mails vão só para os usuários do banco dev.
+- Nunca duas vezes no mesmo dia (`pedido/controle/emails/<banco>/enviados/<dia>.json`); limite de 400 por dia (o Gmail
+  da conta comum aceita ~500 e também manda os e-mails de senha e o alerta).
+- **Rodar à mão:** Run workflow com "O que rodar" = `so_emails`; com "so_para" preenchido, TODOS os e-mails vão para
+  esse endereço e nada fica registrado (conferência).
+- **Agendado:** só com `EMAILS_AGENDADO = 1`. Depende do pré-cálculo (`PRECALCULO_AGENDADO = 1`).
+- **Prévia na própria máquina:** `python -m pedido.emails --previa <pasta>` grava os e-mails (.html, .txt e o Excel)
+  sem enviar.
+- O alerta avisa: relatório do job faltando, mais de 10% de falhas, limite atingido.

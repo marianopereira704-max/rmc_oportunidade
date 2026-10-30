@@ -101,6 +101,14 @@ def _publicar_agora() -> None:
             publicar(session)
     except Exception:  # noqa: BLE001 — só um atalho: a tela segue, a rotina usa a foto anterior
         logger.warning("fotos dos insumos não publicadas", exc_info=True)
+    # Junto, a lista de destinatários dos e-mails para as lojas (29/10/2026, integrations/destinatarios.py).
+    try:
+        from integrations import destinatarios
+
+        with get_session() as session:
+            destinatarios.publicar(session)
+    except Exception:  # noqa: BLE001 — a rotina usa a lista anterior
+        logger.warning("lista de destinatários não publicada", exc_info=True)
 
 
 def publicar_em_segundo_plano(forcar: bool = False) -> None:

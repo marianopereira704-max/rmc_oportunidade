@@ -238,3 +238,14 @@ def test_sincronizacao_tira_o_acesso_de_quem_saiu(session, rede):
     assert outro.excluido_por == usuarios.SINCRONIZACAO
     motivos = {h.motivo for h in session.query(UsuarioLojaHistorico)}
     assert motivos == {"Loja fora do grupo econômico da loja principal", "Loja principal saiu da rede (usuário excluído)"}
+
+
+def test_preferencias_de_email_com_o_padrao(session):
+    """E-mails para as lojas (29/10/2026): vazio = aviso de ruptura ligado, relatório desligado (decisão do Mariano)."""
+    ana = _ana(session)
+    assert usuarios.preferencias(ana) == (True, False)
+    usuarios.gravar_preferencias(session, ana.id, ruptura=False, relatorio=True)
+    session.flush()
+    assert usuarios.preferencias(session.get(Usuario, ana.id)) == (False, True)
+    with pytest.raises(ValueError):
+        usuarios.gravar_preferencias(session, 9999, True, True)

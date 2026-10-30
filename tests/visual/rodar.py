@@ -323,6 +323,20 @@ def _telas_celular(page, url, token):
         yield f"{nome}_produtos", []
         _rolar(page, -20000)
 
+    # Minhas notificações (29/10/2026): como a Ana, compradora da loja fictícia — o lojista lê o e-mail no celular e
+    # o link do rodapé abre esta tela.
+    _no_pc(page)
+    page.locator('[class*="st-key-nav_sair"] button').click()
+    _abrir_login(page, url)
+    page.get_by_label("E-mail ou CNPJ").fill("ana.compras@ficticia.com.br")
+    page.get_by_label("Senha").fill("senha-teste-1")
+    page.get_by_role("button", name="Entrar").click()
+    page.locator('[class*="st-key-nav_notificacoes"] button').wait_for(timeout=120_000)
+    page.locator('[class*="st-key-nav_notificacoes"] button').click()
+    page.locator('[class*="st-key-tela-notificacoes"]').first.wait_for(timeout=60_000)
+    _no_celular(page)
+    yield "notificacoes", []
+
 
 def _telas_pronto(page, url):
     """2ª volta: entra e percorre o Assistente (escolhendo a loja fictícia) e o Dashboard. Os pop-ups ao abrir a loja
@@ -564,6 +578,11 @@ def _telas(page, url):
     page.locator(".linha.corpo").first.wait_for(timeout=120_000)
     _estabilizar(page)
     yield "pedido_comprador", []
+    # Minhas notificações (29/10/2026, e-mails para as lojas): só usuário de loja vê, no pé da barra lateral.
+    page.locator('[class*="st-key-nav_notificacoes"] button').click()
+    page.locator('[class*="st-key-tela-notificacoes"]').first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    yield "notificacoes", []
 
 
 def _telas_assistente(page):

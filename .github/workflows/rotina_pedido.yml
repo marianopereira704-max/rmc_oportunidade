@@ -26,6 +26,12 @@ on:
         options:
           - completa
           - so_precalculo
+          - so_emails
+      so_para:
+        description: "Só com so_emails: mandar TODOS os e-mails para este endereço (teste); vazio = para cada pessoa"
+        type: string
+        required: false
+        default: ""
 
 # Nunca duas rodadas ao mesmo tempo: a segunda espera a primeira terminar.
 concurrency:
@@ -35,7 +41,7 @@ concurrency:
 jobs:
   coleta:
     name: Parte ${{ matrix.parte }} de 8
-    if: inputs.modo != 'so_precalculo'
+    if: inputs.modo != 'so_precalculo' && inputs.modo != 'so_emails'
     runs-on: ubuntu-latest
     # O GitHub corta em 6 h; a rotina para sozinha antes (PEDIDO_ORCAMENTO_MINUTOS)
     # e a próxima execução continua de onde ela parou.
@@ -78,7 +84,7 @@ jobs:
   rede:
     name: Compras da rede (Análise)
     needs: coleta
-    if: always() && inputs.modo != 'so_precalculo'
+    if: always() && inputs.modo != 'so_precalculo' && inputs.modo != 'so_emails'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -108,7 +114,7 @@ jobs:
   precalculo:
     name: Pré-cálculo ${{ matrix.parte }} de 8
     needs: coleta
-    if: always() && (inputs.modo == 'so_precalculo' || vars.PRECALCULO_AGENDADO == '1')
+    if: always() && (inputs.modo == 'so_precalculo' || (inputs.modo != 'so_emails' && vars.PRECALCULO_AGENDADO == '1'))
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
@@ -133,6 +139,41 @@ jobs:
           DO_SPACES_ACCESS_KEY: ${{ secrets.DO_SPACES_ACCESS_KEY }}
           DO_SPACES_SECRET_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
 
+  # E-mails para as lojas (pedido/emails.py, 29/10/2026): aviso de ruptura e
+  # relatório diário, um e-mail por pessoa, com o Excel do pedido de cada loja.
+  # Lê os resultados prontos do pré-cálculo e a lista de destinatários que o
+  # app publica (a rotina não alcança o banco). No agendamento, só com a
+  # variável EMAILS_AGENDADO = 1; no botão, "so_emails" (com "so_para" manda
+  # tudo para um endereço só, sem registrar nada). O endereço vai por variável
+  # de ambiente, nunca colado no comando (repositório público).
+  emails:
+    name: E-mails para as lojas
+    needs: precalculo
+    if: always() && (inputs.modo == 'so_emails' || (inputs.modo != 'so_precalculo' && vars.EMAILS_AGENDADO == '1' && needs.precalculo.result != 'skipped'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: E-mails
+        run: python -m pedido.emails ${SO_PARA:+--so-para "$SO_PARA"}
+        env:
+          SO_PARA: ${{ inputs.so_para }}
+          RMC_IGNORAR_SECRETS: "1"
+          PRECALCULO_CHAVE: ${{ secrets.PRECALCULO_CHAVE }}
+          APP_URL: ${{ secrets.APP_URL }}
+          EMAIL_REMETENTE: ${{ secrets.EMAIL_REMETENTE }}
+          EMAIL_SENHA_APP: ${{ secrets.EMAIL_SENHA_APP }}
+          DO_SPACES_ENDPOINT: ${{ secrets.DO_SPACES_ENDPOINT }}
+          DO_SPACES_REGION: ${{ secrets.DO_SPACES_REGION }}
+          DO_SPACES_BUCKET: ${{ secrets.DO_SPACES_BUCKET }}
+          DO_SPACES_ACCESS_KEY: ${{ secrets.DO_SPACES_ACCESS_KEY }}
+          DO_SPACES_SECRET_KEY: ${{ secrets.DO_SPACES_SECRET_KEY }}
+
   # Alerta por e-mail (pedido/alerta.py, 28/10/2026): só quando a execução
   # trouxe menos do que devia (parte sem relatório, erro, nenhuma foto de
   # estoque, queda de lojas; e, quando o job rodou, o cálculo de madrugada).
@@ -140,7 +181,7 @@ jobs:
   # o cálculo (conferir a coleta de novo reenviaria o e-mail da noite).
   alerta:
     name: Alerta por e-mail
-    needs: [coleta, rede, precalculo]
+    needs: [coleta, rede, precalculo, emails]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -155,6 +196,8 @@ jobs:
         run: >-
           python -m pedido.alerta --partes 8 --coleta ${{ needs.coleta.result }}
           ${{ inputs.modo == 'so_precalculo' && '--so-precalculo' || '' }}
+          ${{ inputs.modo == 'so_emails' && '--so-emails' || '' }}
+          ${{ inputs.modo != 'so_emails' && needs.emails.result != 'skipped' && '--emails' || '' }}
           ${{ inputs.modo != 'so_precalculo' && needs.precalculo.result != 'skipped' && '--precalculo' || '' }}
         env:
           RMC_IGNORAR_SECRETS: "1"

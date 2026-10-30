@@ -14,7 +14,7 @@ from core import acesso, auth, monitoramento, theme
 from core.config import settings
 from core.db import get_session, init_db
 from views import (cadastro, config_pedido, dados, dashboard_compras, dashboard_estoque, dashboard_ruptura, login,
-                   loja_barra, menu_lateral, oportunidade_loja, popups, oportunidade_produto, pedido)
+                   loja_barra, menu_lateral, notificacoes, oportunidade_loja, popups, oportunidade_produto, pedido)
 
 st.set_page_config(
     page_title=f"{settings.nome_fornecedor} Oportunidades",
@@ -127,6 +127,13 @@ _ROTULO_NIVEL = {acesso.ADM: "Admin", acesso.CONSULTOR: "Consultor", acesso.COMP
 if "secao_ativa" not in st.session_state:
     st.session_state["secao_ativa"] = acesso.secao_inicial(_nivel, _paineis)
 
+# Link do rodapé dos e-mails para as lojas (29/10/2026): `?pagina=notificacoes` abre "Minhas notificações" depois
+# do login. Lido uma vez: o parâmetro sai do endereço, e a navegação segue normal.
+if st.query_params.get("pagina") == acesso.NOTIFICACOES:
+    del st.query_params["pagina"]
+    if acesso.pode_ver(_nivel, acesso.NOTIFICACOES, _paineis):
+        st.session_state["secao_ativa"] = acesso.NOTIFICACOES
+
 # Trava de acesso: nunca renderizar uma seção admin-only pra quem não é admin
 # — cobre tanto alguém digitando/injetando a chave quanto o caso real: um
 # admin estava na aba Dados, deu logout, um consultor logou na mesma sessão
@@ -171,6 +178,15 @@ with st.sidebar:
                 st.rerun()
 
     theme.nav_divisoria()
+    # "Minhas notificações" (29/10/2026): no pé, acima do "Sair", só para usuários de loja.
+    if acesso.pode_ver(_nivel, acesso.NOTIFICACOES, _paineis):
+        _ativa = st.session_state["secao_ativa"] == acesso.NOTIFICACOES
+        with st.container():
+            st.markdown(f'<div class="nav-marker{"-ativo" if _ativa else ""}"></div>', unsafe_allow_html=True)
+            if st.button("Minhas notificações", key="nav_notificacoes", icon=":material/notifications:",
+                         use_container_width=True):
+                st.session_state["secao_ativa"] = acesso.NOTIFICACOES
+                st.rerun()
     with st.container():
         st.markdown('<div class="nav-marker"></div>', unsafe_allow_html=True)
         if st.button("Sair", key="nav_sair", icon=":material/logout:", use_container_width=True):
@@ -179,6 +195,7 @@ with st.sidebar:
     loja_barra.atualizacao(loja_barra.escolha(usuario))
 
 _secoes_por_chave = {chave: fn for chave, _r, _i, _g, fn, _a in SECOES}
+_secoes_por_chave[acesso.NOTIFICACOES] = notificacoes.render
 if st.session_state["secao_ativa"] is None:
     # Usuário de loja sem nenhum painel (não deveria acontecer: o Cadastro
     # exige ao menos um) — melhor um aviso que uma tela que ele não pode ver.

@@ -39,6 +39,9 @@ _ANTIGOS = {"GERENTE": COMPRADOR}
 
 ADMINISTRACAO = {"dados", "config_pedido"}
 CADASTRO = "cadastro"   # ADM e Consultor (fora de SO_ADM e de DAS_LOJAS)
+# "Minhas notificações" (29/10/2026): só Comprador e Proprietário — os e-mails para as lojas são deles. Fora dos
+# painéis: todo usuário de loja vê, tenha os painéis que tiver.
+NOTIFICACOES = "notificacoes"
 SO_ADM = ADMINISTRACAO | {"oportunidade_loja"}
 DAS_LOJAS = {"oportunidade_produto", "pedido"}   # o que Comprador/Proprietário veem
 # Painéis que se atribuem a um usuário de loja (Cadastro → Atribuir Painéis),
@@ -77,6 +80,8 @@ def pode_ver(nivel: str, secao: str, paineis=None) -> bool:
     (07/10/2026, etapa 4 — Q11/Q21: obrigatório e sem padrão; sem painel,
     nenhuma tela). ADM e Consultor não usam painéis. `secao` pode ser uma
     tela de um painel com várias (dashboard_estoque → painel "dashboard")."""
+    if secao == NOTIFICACOES:   # e-mails para as lojas: só quem os recebe (29/10/2026)
+        return nivel in (COMPRADOR, PROPRIETARIO)
     if nivel == ADM:
         return True
     if nivel == CONSULTOR:

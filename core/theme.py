@@ -1030,6 +1030,10 @@ div[class*="st-key-cadastro_email_"] {_sel("botao_terciario")}:not(:disabled) {{
 div[class*="st-key-cadastro_excluir_"] {_sel("botao_terciario")} {{ color: #B4532A; }}
 div[class*="st-key-tela-cadastro"] .rmc-badge {{ white-space: nowrap; }}
 
+/* Minhas notificações (29/10/2026, views/notificacoes.py): uma coluna de leitura, não a largura toda. */
+div[class*="st-key-tela-notificacoes"] {{ max-width: 640px; }}
+.rmc-notif-para {{ color: var(--texto-suporte); margin: var(--esp-2) 0 0; }}
+
 /* === RODAPÉ FIXO DO PEDIDO (29/09/2026) — bloco isolado: se precisar
    desfazer, apagar só daqui até "FIM DO RODAPÉ FIXO". Os botões ficam
    DENTRO da faixa fixa (nunca por cima de outro elemento clicável). === */

@@ -58,6 +58,10 @@ def _concluir(tipo: str, texto: str) -> None:
     lista relida do banco."""
     st.session_state[_MSG] = (tipo, texto)
     _usuarios_da_loja.clear()
+    # E-mails para as lojas (29/10/2026): quem recebe mudou — a lista vai para a rotina na hora.
+    from integrations import insumos
+
+    insumos.publicar_em_segundo_plano(forcar=True)
 
 
 def _limpar_resultado() -> None:
@@ -182,8 +186,15 @@ def _linha(r: dict) -> None:
                          f'{html.escape(usuarios.descrever_nivel(r["nivel"], r["linhas"]))}</div>',
                          unsafe_allow_html=True)
         telefone = f'<div class="rmc-cad-sub">{html.escape(r["telefone"])}</div>' if r["telefone"] else ""
-        c_email.markdown(f'<div class="rmc-cad-celula rmc-cad-email">{html.escape(r["email"])}{telefone}</div>',
-                         unsafe_allow_html=True)
+        # O que ele recebe por e-mail (29/10/2026): discreto, embaixo do endereço; quem ainda não criou a senha não
+        # recebe nada até criar.
+        recebe = [n for n, sim in (("aviso de ruptura", r["email_ruptura"]), ("relatório", r["email_relatorio"])) if sim]
+        recebe_texto = " e ".join(recebe) if recebe else "nenhum"
+        if r["status"] == "Aguardando" and recebe:
+            recebe_texto += " (depois de criar a senha)"
+        notificacoes = f'<div class="rmc-cad-sub">E-mails: {recebe_texto}</div>' if not excluido else ""
+        c_email.markdown(f'<div class="rmc-cad-celula rmc-cad-email">{html.escape(r["email"])}{telefone}'
+                         f'{notificacoes}</div>', unsafe_allow_html=True)
         dica = (f' class="dica-abaixo" data-dica="{dicas.atributo(dicas.dica("Excluído por " + (r["excluido_por"] or "—") + (" em " + r["excluido_em"].strftime("%d/%m/%Y") if r["excluido_em"] else "")))}"') if excluido else ""
         c_status.markdown(f'<span{dica}>{theme.badge(r["status"], _STATUS[r["status"]])}</span>',
                           unsafe_allow_html=True)
@@ -270,6 +281,18 @@ def _formulario(r: dict | None, loja: dict | None) -> None:
                              key=f"{k}_paineis", help=dicas.dica("As telas que o usuário vê.",
                                                                  "Obrigatório: não há padrão. O Comprador não recebe o Dashboard."))
 
+    if r is not None:
+        # E-mails para as lojas (29/10/2026): o mesmo que o usuário escolhe em "Minhas notificações" — para quando
+        # o lojista pede por telefone.
+        popups.secao("E-mails")
+        c1, c2 = st.columns(2)
+        email_ruptura = c1.toggle("Aviso de ruptura", value=r["email_ruptura"], key=f"{k}_email_ruptura",
+                                  help=dicas.dica("Quando um produto que mais fatura na loja zera.",
+                                                  "Só chega nos dias em que isso acontece."))
+        email_relatorio = c2.toggle("Relatório diário", value=r["email_relatorio"], key=f"{k}_email_relatorio",
+                                    help=dicas.dica("Todo dia de manhã: orçamento, itens a comprar, ruptura e os 10 "
+                                                    "mais críticos."))
+
     dados = usuarios.DadosUsuario(nome=nome or "", cargo=cargo or "", email=email or "", telefone=telefone or "",
                                   nivel=nivel or "", linhas=linhas, paineis=paineis, loja_principal_id=loja_id)
     # Erros acima do rodapé (o rodapé fica preso embaixo do pop-up).
@@ -290,6 +313,7 @@ def _formulario(r: dict | None, loja: dict | None) -> None:
             try:
                 with get_session() as session:
                     usuarios.editar(session, r["id"], dados, usuario["nome"])
+                    usuarios.gravar_preferencias(session, r["id"], email_ruptura, email_relatorio)
             except ValueError as exc:
                 aviso.error(str(exc))
                 return

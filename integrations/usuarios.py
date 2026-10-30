@@ -75,6 +75,31 @@ def status(usuario: Usuario) -> str:
 
 
 # ---------------------------------------------------------------------------
+# E-mails para as lojas (29/10/2026, docs/specs/2026-10-29-emails-lojas-design.md)
+# ---------------------------------------------------------------------------
+
+# O padrão decidido pelo Mariano: quem é cadastrado começa recebendo o aviso de ruptura; o relatório é opcional.
+PADRAO_EMAIL_RUPTURA = True
+PADRAO_EMAIL_RELATORIO = False
+
+
+def preferencias(usuario: Usuario) -> tuple[bool, bool]:
+    """(aviso de ruptura, relatório diário), com o padrão onde o usuário nunca escolheu (coluna vazia)."""
+    ruptura = PADRAO_EMAIL_RUPTURA if usuario.email_ruptura is None else bool(usuario.email_ruptura)
+    relatorio = PADRAO_EMAIL_RELATORIO if usuario.email_relatorio is None else bool(usuario.email_relatorio)
+    return ruptura, relatorio
+
+
+def gravar_preferencias(session: Session, usuario_id: int, ruptura: bool, relatorio: bool) -> None:
+    """Grava as duas, mesmo iguais ao padrão: a escolha feita fica, ainda que o padrão mude."""
+    u = session.get(Usuario, usuario_id)
+    if u is None:
+        raise ValueError("Usuário não encontrado.")
+    u.email_ruptura = bool(ruptura)
+    u.email_relatorio = bool(relatorio)
+
+
+# ---------------------------------------------------------------------------
 # Login por e-mail
 # ---------------------------------------------------------------------------
 
@@ -459,6 +484,7 @@ def da_loja(session: Session, loja_id: int, com_excluidos: bool = False) -> list
             "lojas": ([_rotulo_loja(principal)] if principal else []) + [_rotulo_loja(l) for l in outras],
             "grupo": principal.grupo_economico if principal else None,
             "excluido_por": u.excluido_por, "excluido_em": u.excluido_em,
+            "email_ruptura": preferencias(u)[0], "email_relatorio": preferencias(u)[1],
         })
     ordem = {"Aguardando": 0, "Ativo": 1, "Excluído": 2}
     return sorted(saida, key=lambda r: (ordem[r["status"]], r["nome"].lower()))

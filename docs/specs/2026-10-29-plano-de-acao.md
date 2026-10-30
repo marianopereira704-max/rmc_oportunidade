@@ -203,6 +203,13 @@ depois que a rotina da madrugada encontra" — não dá para avisar no meio do d
 Ainda a conferir: o Gmail do sistema tem limite diário (~500 e-mails/dia na conta comum); com centenas de lojas e
 dois e-mails por usuário, conferir a conta antes.
 
+**Feito em 29/10/2026 (tarefas 1 a 6 de `docs/specs/2026-10-29-emails-lojas-plano.md`):** um e-mail por pessoa com
+todas as lojas dela (aviso no topo, relatório embaixo), curva A/B pela 1ª letra, o Excel do pedido de cada loja em
+anexo (pedido do Mariano ao ver o exemplo), limite de 400 por dia, tela "Minhas notificações", interruptores no
+Editar usuário, job "E-mails" (`so_emails`, `so_para`, `EMAILS_AGENDADO`) e alerta. **Pendente com o M (tarefa 7):**
+o Secret `APP_URL`, o primeiro e-mail real só para ele e, depois, ligar `EMAILS_AGENDADO = 1`. Antes da publicação,
+só os usuários do banco dev recebem.
+
 ## 8. Dívidas acumuladas — estruturais (C)
 
 - `reconciliation/motor.py` (947 linhas): dividir em fuzzy-match, filas e reprocessamento, se a divisão for natural.

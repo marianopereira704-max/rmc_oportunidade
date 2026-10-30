@@ -170,3 +170,36 @@ def test_parte_cortada_pelo_github_vira_problema(tmp_path):
     assert enviados == []
     alerta.main(base + ["--coleta", "cancelled"], enviar_email=lambda d, a, t: enviados.append(t))
     assert len(enviados) == 1 and "'cancelled'" in enviados[0]
+
+
+# ---------------------------------------------------------------------------
+# E-mails para as lojas (pedido/emails.py, 29/10/2026)
+# ---------------------------------------------------------------------------
+
+def _emails(armaz, dia=None, **rel):
+    armaz.salvar_json("pedido/insumos/rmc/destinatarios.json", {"destinatarios": []})
+    if dia:
+        armaz.salvar_json(f"pedido/controle/emails/rmc/relatorios/{dia}.json",
+                          {"enviados": 10, "falhas": 0, "limite_atingido": False, **rel})
+
+
+def test_emails_relatorio_faltando_falhas_e_limite(tmp_path):
+    armaz = ArmazenamentoLocal(tmp_path)
+    _emails(armaz)
+    assert "não deixou relatório" in alerta.problemas_emails(armaz, CH, dt.date(2026, 10, 30))[0]
+    _emails(armaz, "2026-10-30", falhas=2)
+    assert "2 de 12" in alerta.problemas_emails(armaz, CH, dt.date(2026, 10, 30))[0]
+    _emails(armaz, "2026-10-30", limite_atingido=True, fora_pelo_limite=7)
+    assert "7 pessoa(s)" in alerta.problemas_emails(armaz, CH, dt.date(2026, 10, 30))[0]
+    _emails(armaz, "2026-10-30")
+    assert alerta.problemas_emails(armaz, CH, dt.date(2026, 10, 30)) == []
+
+
+def test_so_emails_confere_so_os_emails(tmp_path):
+    armaz = ArmazenamentoLocal(tmp_path)
+    _relatorio(armaz, "2026-10-30", "parte1de2", historicos_gravados=0)    # coleta com problema: não é a vez dela
+    _emails(armaz, "2026-10-30")
+    enviados = []
+    codigo = alerta.main(["--destino", f"local:{tmp_path}", "--partes", "2", "--hoje", "2026-10-30", "--so-emails"],
+                         enviar_email=lambda d, a, t: enviados.append(t))
+    assert (codigo, enviados) == (0, [])

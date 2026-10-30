@@ -153,20 +153,10 @@ def _dialog_descartar(loja: dict, usuario: dict, alterados: int) -> None:
 
 
 def _excel(abas: dict[str, pd.DataFrame]) -> bytes:
-    """Uma planilha com uma aba por item, colunas na largura do conteúdo
-    (até 50 caracteres) e o cabeçalho travado — abre pronta pra ler."""
-    import io
+    """A planilha das exportações: pedido/planilha.py (a rotina dos e-mails para as lojas usa a mesma, 29/10/2026)."""
+    from pedido import planilha
 
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as escritor:
-        for nome, tabela in abas.items():
-            tabela.to_excel(escritor, index=False, sheet_name=nome)
-            folha = escritor.sheets[nome]
-            folha.freeze_panes = "A2"
-            for i, coluna in enumerate(tabela.columns, start=1):
-                largura = max([len(str(coluna))] + [len(str(v)) for v in tabela[coluna].head(500)])
-                folha.column_dimensions[folha.cell(row=1, column=i).column_letter].width = min(50, largura + 2)
-    return buffer.getvalue()
+    return planilha.excel(abas)
 
 
 def _arquivo_exportacao(tabela: pd.DataFrame, formato: str) -> bytes:
