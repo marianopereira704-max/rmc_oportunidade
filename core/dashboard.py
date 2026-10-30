@@ -35,7 +35,6 @@ Definições (medidas em 18 lojas reais, 21/10/2026):
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -108,51 +107,6 @@ def preparar(df: pd.DataFrame, config, linha: pd.Series | None = None) -> pd.Dat
 
 def _pct(parte: float, todo: float) -> float:
     return float(parte / todo * 100) if todo else 0.0
-
-
-@dataclass(frozen=True)
-class CardsEstoque:
-    produtos: int
-    unidades: float
-    ruptura: int                 # TODOS os itens em ruptura, inclusive os de giro baixo
-    ruptura_pct: float           # % dos produtos
-    ruptura_giro_baixo: int      # desses, quantos vendem pouco (informativo)
-    venda_risco_dia: float       # R$ por dia
-    estoque_valor: float         # R$ a custo
-    excesso_valor: float
-    excesso_pct: float           # % do estoque
-    parado_valor: float
-    parado_pct: float
-    cobertura_dias: float | None
-
-
-def cards_estoque(d: pd.DataFrame) -> CardsEstoque:
-    """Os 4 cards da tela Ruptura + a cobertura média."""
-    if d.empty:
-        return CardsEstoque(0, 0.0, 0, 0.0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, None)
-    n = len(d)
-    valor = float(d["valor_estoque"].sum())
-    demanda = float(pd.to_numeric(d["demanda_dia"], errors="coerce").fillna(0).sum())
-    unidades = float(d["estoque_pos"].sum())
-    rup = d["em_ruptura"]
-    return CardsEstoque(
-        produtos=n, unidades=unidades, ruptura=int(rup.sum()), ruptura_pct=_pct(rup.sum(), n),
-        ruptura_giro_baixo=int((rup & d["giro_baixo_real"]).sum()), venda_risco_dia=float(d["venda_risco_dia"].sum()),
-        estoque_valor=valor, excesso_valor=float(d["valor_excesso"].sum()), excesso_pct=_pct(d["valor_excesso"].sum(), valor),
-        parado_valor=float(d["valor_parado"].sum()), parado_pct=_pct(d["valor_parado"].sum(), valor),
-        cobertura_dias=unidades / demanda if demanda else None,
-    )
-
-
-def ruptura_por_curva(d: pd.DataFrame) -> pd.DataFrame:
-    """A, B e C (1ª letra da curva, a de valor vendido): produtos, em ruptura e
-    % da curva em ruptura. As três linhas existem sempre, mesmo sem produto."""
-    base = pd.DataFrame(index=pd.Index(CURVAS, name="curva"), data={"produtos": 0, "em_ruptura": 0})
-    if not d.empty:
-        base["produtos"] = d.groupby("curva_valor_letra").size().reindex(CURVAS).fillna(0).astype(int)
-        base["em_ruptura"] = d[d["em_ruptura"]].groupby("curva_valor_letra").size().reindex(CURVAS).fillna(0).astype(int)
-    base["pct"] = [_pct(r, p) for r, p in zip(base["em_ruptura"], base["produtos"])]
-    return base
 
 
 def estoque_por_linha(d: pd.DataFrame) -> pd.DataFrame:

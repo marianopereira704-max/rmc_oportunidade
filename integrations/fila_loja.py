@@ -26,7 +26,7 @@ from sqlalchemy.orm import Session
 from core.models import EanGenerico, FilaResolucaoEAN, OrigemFila, StatusFila
 from core.sql import insert_ignorando_conflito
 from pedido import categorias as cat
-from reconciliation import motor
+from reconciliation import fuzzy
 from reconciliation.normalizador import normalizar_texto
 
 
@@ -61,7 +61,7 @@ def atualizar(session: Session, catalogo: pd.DataFrame, base_categorias: pd.Data
     registros = []
     for r in novos.itertuples(index=False):
         descricao = (r.nome or "").strip()[:250] or f"EAN {r.ean}"
-        melhor = motor.buscar_candidatos(session, normalizar_texto(descricao), cache=cache)
+        melhor = fuzzy.buscar_candidatos(session, normalizar_texto(descricao), cache=cache)
         registros.append({
             "ean": r.ean, "descricao_observada": descricao, "origem": OrigemFila.LOJA_API,
             # Sugestão sempre que houver candidato razoável — mas nunca resolve

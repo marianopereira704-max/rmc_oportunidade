@@ -28,13 +28,13 @@ def _ler_estado(loja_id: int) -> tuple[dict, dict]:
     """Correções de estoque negativo e personalização da loja: 2 consultas
     pequenas, guardadas na sessão por 30 s (cada consulta custa ~140 ms até o
     banco em NY, e o clique num filtro roda o script inteiro)."""
-    from integrations import configuracao_pedido, pedido_rascunho
+    from integrations import configuracao_pedido, pedido_registros
 
     atual = st.session_state.get(_ESTADO)
     if atual and atual["loja"] == loja_id and time.monotonic() - atual["em"] < _ESTADO_SEGUNDOS:
         return atual["correcoes"], atual["personalizacao"]
     with get_session() as session:
-        correcoes = pedido_rascunho.correcoes(session, loja_id)
+        correcoes = pedido_registros.correcoes(session, loja_id)
         personalizacao = configuracao_pedido.da_loja(session, loja_id)
     st.session_state[_ESTADO] = {"loja": loja_id, "em": time.monotonic(), "correcoes": correcoes,
                                  "personalizacao": personalizacao}

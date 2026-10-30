@@ -18,7 +18,7 @@ from core.models import (
     StatusFila,
     TabelaGruppy,
 )
-from reconciliation import motor
+from reconciliation import fuzzy, motor
 from reconciliation.normalizador import normalizar_ean, normalizar_percentual, normalizar_texto
 
 
@@ -130,7 +130,7 @@ def test_resolver_ean_atalho_ja_resolvido_nao_refaz_fuzzy(session, monkeypatch):
         chamou_buscar["vezes"] += 1
         return []
 
-    monkeypatch.setattr(motor, "buscar_candidatos", _buscar_candidatos_espiao)
+    monkeypatch.setattr(fuzzy, "buscar_candidatos", _buscar_candidatos_espiao)
 
     resultado = motor.resolver_ean(
         session, ean="7891000000003", descricao_origem="descricao completamente diferente",
@@ -403,7 +403,7 @@ def test_reprocessar_fila_resolve_item_forte_automaticamente(session, monkeypatc
         session, ean="7891000000010", descricao_observada="Dipirona parecida",
         origem=OrigemFila.GPS, valor=100,
     )
-    monkeypatch.setattr(motor, "buscar_candidatos", lambda *a, **k: (generico, 95.0))
+    monkeypatch.setattr(fuzzy, "buscar_candidatos", lambda *a, **k: (generico, 95.0))
 
     resultado = motor.reprocessar_fila_resolucao(session)
 
@@ -426,7 +426,7 @@ def test_reprocessar_fila_atualiza_sugestao_faixa_media_sem_resolver(session, mo
         origem=OrigemFila.GPS, valor=100,
     )
     assert fila.sugestao_base_generico_id is None
-    monkeypatch.setattr(motor, "buscar_candidatos", lambda *a, **k: (generico, 80.0))
+    monkeypatch.setattr(fuzzy, "buscar_candidatos", lambda *a, **k: (generico, 80.0))
 
     resultado = motor.reprocessar_fila_resolucao(session)
 
@@ -446,7 +446,7 @@ def test_reprocessar_fila_item_sem_match_bom_permanece_intocado(session, monkeyp
         session, ean="7891000000012", descricao_observada="Produto sem nada parecido",
         origem=OrigemFila.GPS, valor=100,
     )
-    monkeypatch.setattr(motor, "buscar_candidatos", lambda *a, **k: None)
+    monkeypatch.setattr(fuzzy, "buscar_candidatos", lambda *a, **k: None)
 
     resultado = motor.reprocessar_fila_resolucao(session)
 
@@ -466,7 +466,7 @@ def test_reprocessar_fila_e_idempotente_rodar_duas_vezes(session, monkeypatch):
         session, ean="7891000000013", descricao_observada="Sinvastatina parecida",
         origem=OrigemFila.GPS, valor=100,
     )
-    monkeypatch.setattr(motor, "buscar_candidatos", lambda *a, **k: (generico, 95.0))
+    monkeypatch.setattr(fuzzy, "buscar_candidatos", lambda *a, **k: (generico, 95.0))
 
     primeiro = motor.reprocessar_fila_resolucao(session)
     segundo = motor.reprocessar_fila_resolucao(session)
@@ -485,7 +485,7 @@ def test_reprocessar_fila_rodar_duas_vezes_na_faixa_media_nao_conta_como_nova_su
         session, ean="7891000000014", descricao_observada="Cinarizina parecida",
         origem=OrigemFila.GPS, valor=100,
     )
-    monkeypatch.setattr(motor, "buscar_candidatos", lambda *a, **k: (generico, 80.0))
+    monkeypatch.setattr(fuzzy, "buscar_candidatos", lambda *a, **k: (generico, 80.0))
 
     primeiro = motor.reprocessar_fila_resolucao(session)
     segundo = motor.reprocessar_fila_resolucao(session)
@@ -528,7 +528,7 @@ def test_reprocessar_fila_resolve_por_ean_ja_existente_sem_precisar_de_fuzzy_mat
             "EAN já tem uma resolução exata em EanGenerico."
         )
 
-    monkeypatch.setattr(motor, "buscar_candidatos", _buscar_candidatos_nao_deveria_ser_chamado)
+    monkeypatch.setattr(fuzzy, "buscar_candidatos", _buscar_candidatos_nao_deveria_ser_chamado)
 
     resultado = motor.reprocessar_fila_resolucao(session)
 

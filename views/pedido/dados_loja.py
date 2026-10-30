@@ -10,7 +10,6 @@ from core.config import settings
 from core.db import get_session
 from pedido import calculo
 from pedido.configuracao import ConfigPedido
-from views import loja_barra
 from views.pedido.estado import _invalidar_estado
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -78,12 +77,6 @@ def _categorias_da_loja(todas: pd.DataFrame, config: ConfigPedido) -> dict:
     return cl.mapa_da_loja(tabela, cl.eans_da_tabela(todas))
 
 
-def categorias_da_loja(todas: pd.DataFrame, config: ConfigPedido) -> dict:
-    """EAN → (categoria, origem) só dos produtos desta loja: o Dashboard usa para dar a linha de compra (a
-    categoria fixa) de cada produto."""
-    return _categorias_da_loja(todas, config)
-
-
 @st.cache_data(max_entries=2, show_spinner=False)
 @limite.pesado
 def _base_categorias(versao: tuple) -> pd.DataFrame:
@@ -149,18 +142,6 @@ def _pronto(tela: str, empresa: str, loja: str, assinatura: str):
     except Exception:  # noqa: BLE001
         logging.getLogger(__name__).warning("pronto de %s não lido; calculando na hora", tela, exc_info=True)
         return None
-
-
-def calculo_da_loja(loja: dict, config: ConfigPedido, correcoes: dict) -> tuple[pd.DataFrame, dict] | None:
-    """O MESMO cálculo e o MESMO cache da tela do Assistente, para outras
-    telas (Dashboard, 21/10/2026): quem abre o Dashboard e depois o Assistente
-    da mesma loja não calcula duas vezes. `correcoes`: o que
-    `pedido_rascunho.correcoes` devolve (linha → Correcao). None = a rotina
-    ainda não coletou nenhuma foto de estoque desta empresa."""
-    marcador = loja_barra.marcador_estoque(loja["empresa_gps"]) or {}
-    return _calcular(loja["empresa_gps"], loja["loja_gps"], config.meses_fechados, _versoes(), parametros(config),
-                     tuple(sorted((l, c.estoque) for l, c in correcoes.items())),
-                     foto=f"{marcador.get('data')}|{marcador.get('gerado_em')}")
 
 
 def invalidar(publicar: bool = False) -> None:

@@ -1,5 +1,5 @@
 """Pedido, Fase 5: níveis de acesso (core/acesso.py), rascunho, estoque
-negativo e exportação (integrations/pedido_rascunho.py + pedido/calculo.py)."""
+negativo e exportação (integrations/pedido_registros.py + pedido/calculo.py)."""
 import pandas as pd
 import pytest
 from sqlalchemy import create_engine
@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 
 from core import acesso
 from core.models import Base, ExportacaoPedido, Loja
-from integrations import pedido_rascunho as rasc
+from integrations import pedido_registros as rasc
 from pedido import calculo
 from tests.test_pedido_calculo import SEM_GENERICOS, _linha, _pronto
 

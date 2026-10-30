@@ -59,39 +59,6 @@ def fabrica(tmp_path):
 # precisa_rodar / registro de resultado
 # ---------------------------------------------------------------------------
 
-def test_precisa_rodar_quando_a_rotina_nunca_rodou(fabrica):
-    with fabrica() as sessao:
-        assert rotinas.precisa_rodar(sessao, ROTINA) is True
-
-
-def test_nao_precisa_rodar_depois_de_sucesso_no_mesmo_dia(fabrica):
-    agora = dt.datetime(2026, 9, 15, 9, 0)
-    with fabrica() as sessao:
-        rotinas.registrar_sucesso(sessao, ROTINA, mensagem="ok", agora=agora)
-
-    with fabrica() as sessao:
-        mais_tarde = dt.datetime(2026, 9, 15, 23, 59)
-        assert rotinas.precisa_rodar(sessao, ROTINA, agora=mais_tarde) is False
-
-
-def test_precisa_rodar_de_novo_no_dia_seguinte(fabrica):
-    with fabrica() as sessao:
-        rotinas.registrar_sucesso(sessao, ROTINA, agora=dt.datetime(2026, 9, 15, 23, 59))
-
-    with fabrica() as sessao:
-        assert rotinas.precisa_rodar(sessao, ROTINA, agora=dt.datetime(2026, 9, 16, 0, 1)) is True
-
-
-def test_falha_nao_conta_como_ja_rodou_hoje(fabrica):
-    """O ponto mais importante do módulo: erro transitório da API externa não
-    pode congelar a rotina até o dia seguinte."""
-    agora = dt.datetime(2026, 9, 15, 9, 0)
-    with fabrica() as sessao:
-        rotinas.registrar_falha(sessao, ROTINA, "API fora do ar", agora=agora)
-
-    with fabrica() as sessao:
-        assert rotinas.precisa_rodar(sessao, ROTINA, agora=dt.datetime(2026, 9, 15, 9, 30)) is True
-
 
 def test_registrar_sucesso_limpa_o_erro_anterior(fabrica):
     with fabrica() as sessao:
@@ -308,23 +275,3 @@ def test_race_real_contra_postgres_so_um_processo_ganha_a_rotina():
     assert sum(1 for v in vitorias if v) == 1, (
         f"exatamente um processo deveria ganhar a rotina, ganharam {sum(1 for v in vitorias if v)}"
     )
-
-
-def test_trava_renovada_nao_expira_e_trava_abandonada_expira(tmp_path):
-    """Envio vivo renova e segura a trava; envio que morreu sem liberar para
-    de renovar e, passada a janela, outro envio consegue a trava."""
-    import datetime as _dt
-
-    from sqlalchemy import create_engine as _ce
-    from sqlalchemy.orm import Session as _S
-
-    from core.models import Base as _Base
-
-    engine = _ce(f"sqlite:///{tmp_path / 'trava.db'}", future=True)
-    _Base.metadata.create_all(engine)
-    t0 = _dt.datetime(2026, 9, 24, 12, 0)
-    with _S(engine) as s:
-        assert rotinas.reivindicar_trava(s, "upload_gps", agora=t0, janela_tentativa_minutos=5)
-        rotinas.renovar_trava(s, "upload_gps", agora=t0 + _dt.timedelta(minutes=4))
-        assert not rotinas.reivindicar_trava(s, "upload_gps", agora=t0 + _dt.timedelta(minutes=8), janela_tentativa_minutos=5)
-        assert rotinas.reivindicar_trava(s, "upload_gps", agora=t0 + _dt.timedelta(minutes=10), janela_tentativa_minutos=5)

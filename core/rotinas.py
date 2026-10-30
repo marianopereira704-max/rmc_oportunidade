@@ -103,19 +103,6 @@ def obter(session: Session, nome: str) -> ControleRotina | None:
     ).scalar_one_or_none()
 
 
-def precisa_rodar(session: Session, nome: str, agora: dt.datetime | None = None) -> bool:
-    """True quando a rotina ainda não teve NENHUM sucesso hoje.
-
-    Note que só olha sucesso: uma tentativa que falhou hoje não conta como
-    "já rodou", de propósito — senão uma indisponibilidade momentânea da API
-    externa deixaria o dado velho até o dia seguinte."""
-    agora = _agora(agora)
-    controle = obter(session, nome)
-    if controle is None or controle.ultimo_sucesso_em is None:
-        return True
-    return controle.ultimo_sucesso_em < _inicio_do_dia(agora)
-
-
 def _inicio_do_dia(agora: dt.datetime) -> dt.datetime:
     return dt.datetime(agora.year, agora.month, agora.day)
 
@@ -161,68 +148,6 @@ def reivindicar(
         .execution_options(synchronize_session=False, dml_strategy="core_only")
     )
     return session.execute(stmt).rowcount == 1
-
-
-def reivindicar_trava(
-    session: Session,
-    nome: str,
-    agora: dt.datetime | None = None,
-    janela_tentativa_minutos: int = JANELA_TENTATIVA_PADRAO_MINUTOS,
-) -> bool:
-    """Trava de "uma execução por vez", sem a regra de "uma vez por dia" de
-    `reivindicar` — para trabalhos disparados por pessoa (ex: processar uma
-    planilha GPS), que podem rodar várias vezes no mesmo dia mas nunca dois ao
-    mesmo tempo.
-
-    Mesma técnica de `reivindicar`: um UPDATE condicional atômico, e quem
-    altera a linha ganha. A trava está livre quando `ultima_tentativa_em` é
-    NULL (liberada por `liberar_trava` ao terminar) ou mais velha que a janela
-    — este segundo caso é o processo que morreu no meio sem liberar, e não pode
-    bloquear o upload para sempre."""
-    agora = _agora(agora)
-    garantir(session, nome)
-    session.flush()
-    limite_tentativa = agora - dt.timedelta(minutes=janela_tentativa_minutos)
-    stmt = (
-        update(ControleRotina)
-        .where(
-            ControleRotina.nome == nome,
-            or_(
-                ControleRotina.ultima_tentativa_em.is_(None),
-                ControleRotina.ultima_tentativa_em < limite_tentativa,
-            ),
-        )
-        .values(ultima_tentativa_em=agora, atualizado_em=agora)
-        .execution_options(synchronize_session=False, dml_strategy="core_only")
-    )
-    return session.execute(stmt).rowcount == 1
-
-
-def renovar_trava(session: Session, nome: str, agora: dt.datetime | None = None) -> None:
-    """"Ainda estou vivo": empurra `ultima_tentativa_em` pra agora, se a
-    trava estiver tomada. Quem segura a trava chama isto de tempos em tempos;
-    assim a janela de expiração pode ser curta (um processo que morreu libera
-    a trava em minutos) sem derrubar um trabalho longo que segue vivo."""
-    agora = _agora(agora)
-    session.execute(
-        update(ControleRotina)
-        .where(ControleRotina.nome == nome, ControleRotina.ultima_tentativa_em.is_not(None))
-        .values(ultima_tentativa_em=agora, atualizado_em=agora)
-        .execution_options(synchronize_session=False, dml_strategy="core_only")
-    )
-
-
-def liberar_trava(session: Session, nome: str, agora: dt.datetime | None = None) -> None:
-    """Solta a trava de `reivindicar_trava` — chamar SEMPRE ao terminar, com
-    sucesso ou falha (num `finally`), senão o próximo envio espera a janela
-    inteira expirar."""
-    agora = _agora(agora)
-    session.execute(
-        update(ControleRotina)
-        .where(ControleRotina.nome == nome)
-        .values(ultima_tentativa_em=None, atualizado_em=agora)
-        .execution_options(synchronize_session=False, dml_strategy="core_only")
-    )
 
 
 def reivindicar_forcado(

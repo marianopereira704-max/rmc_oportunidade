@@ -11,7 +11,7 @@ do mesmo laboratório só inativa as UFs que se sobrepõem com a nova — UFs qu
 tabela anterior cobria e a nova não cobre continuam vigentes na tabela antiga.
 
 Cada linha da planilha tem seu EAN reconciliado contra a Base Genéricos via
-`reconciliation.motor.resolver_ean` — isso é side-effect (registra o EAN como
+`reconciliation.fuzzy.resolver_ean` — isso é side-effect (registra o EAN como
 resolvido ou o enfileira), o item da tabela em si guarda só o EAN bruto (a
 junção com o genérico é sempre feita depois, via EanGenerico, nunca guardada
 aqui — ver core/models.py).
@@ -50,7 +50,7 @@ from core.models import (
 from integrations import mapeamento as mapeamento_integ
 from integrations.base import IntegrationAdapter, ResultadoSincronizacao, StatusIntegracao
 from pedido import categorias as categorias_pedido
-from reconciliation import motor as reconciliation_motor
+from reconciliation import fuzzy
 from reconciliation.normalizador import normalizar_ean, normalizar_percentual
 from storage import filesystem
 
@@ -234,10 +234,10 @@ def processar_planilha_gruppy(
     processados = 0
     ignorados_sem_ean = 0
     linhas_invalidas = 0
-    cache_candidatos: dict = {}  # ver reconciliation/motor.py::buscar_candidatos
-    cache_eans_resolvidos = reconciliation_motor.carregar_cache_eans_resolvidos(session)
-    cache_fila_pendente: dict = {}  # ver reconciliation/motor.py::upsert_fila_resolucao
-    cache_descricao_pendente: dict = {}  # ver reconciliation/motor.py::resolver_ean
+    cache_candidatos: dict = {}  # ver reconciliation/fuzzy.py::buscar_candidatos
+    cache_eans_resolvidos = fuzzy.carregar_cache_eans_resolvidos(session)
+    cache_fila_pendente: dict = {}  # ver reconciliation/fila.py::upsert_fila_resolucao
+    cache_descricao_pendente: dict = {}  # ver reconciliation/fuzzy.py::resolver_ean
 
     # Mesma técnica de integrations/gps.py::_dataframe_normalizado — colunas
     # renomeadas por campo (não por nome de coluna da planilha) permitem
@@ -317,7 +317,7 @@ def processar_planilha_gruppy(
             # enfileira. `valor` fica 0 de propósito — a Gruppy é catálogo de
             # preço unitário, não valor transacionado; a fila prioriza por
             # dinheiro real em jogo, que só o GPS carrega (ver reconciliation/motor.py).
-            reconciliation_motor.resolver_ean(
+            fuzzy.resolver_ean(
                 session, ean=ean, descricao_origem=descricao, origem=OrigemFila.GRUPPY,
                 valor=0, aparece_em_estoque=False, criado_por="sistema",
                 cache_candidatos=cache_candidatos, cache_eans_resolvidos=cache_eans_resolvidos,
@@ -334,17 +334,6 @@ def processar_planilha_gruppy(
         msg += f" {linhas_invalidas} linhas ignoradas (custo/preço/desconto inválido ou vazio)."
 
     return ResultadoSincronizacao(status=StatusIntegracao.MANUAL, registros_processados=processados, mensagem=msg)
-
-
-def buscar_tabela_por_fs_node(session: Session, fs_node_id: int) -> TabelaGruppy | None:
-    """Achado da investigação (Passo 1): `TabelaGruppy.upload_fs_node_id` já
-    existe desde sempre e já é populado em `processar_planilha_gruppy` — não
-    precisou de coluna nova. Usada pelo Explorador de Arquivos pra decidir se
-    um arquivo tem "Excluir definitivamente" no menu (só existe pra Gruppy —
-    GPS/Base Genéricos não têm esse elo de volta pro FSNode)."""
-    return session.execute(
-        select(TabelaGruppy).where(TabelaGruppy.upload_fs_node_id == fs_node_id)
-    ).scalar_one_or_none()
 
 
 @dataclass

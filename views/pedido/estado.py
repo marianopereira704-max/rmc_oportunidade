@@ -42,7 +42,7 @@ class _EstadoLoja:
 
 
 def _estado_loja(uid: int, usuario_nome: str, loja_id: int) -> _EstadoLoja:
-    from integrations import configuracao_pedido, pedido_area, pedido_rascunho
+    from integrations import configuracao_pedido, pedido_area, pedido_registros
 
     atual = st.session_state.get(_ESTADO)
     if atual is not None and atual.chave == (uid, loja_id) and time.monotonic() - atual.lido_em < _ESTADO_SEGUNDOS:
@@ -51,7 +51,7 @@ def _estado_loja(uid: int, usuario_nome: str, loja_id: int) -> _EstadoLoja:
         listas = pedido_area.listas(session, loja_id)
         estado = _EstadoLoja(
             chave=(uid, loja_id), lido_em=time.monotonic(),
-            correcoes=pedido_rascunho.correcoes(session, loja_id),
+            correcoes=pedido_registros.correcoes(session, loja_id),
             area=pedido_area.area(session, uid, loja_id),
             listas=listas,
             avisos=pedido_area.avisos(session, uid, usuario_nome, loja_id,

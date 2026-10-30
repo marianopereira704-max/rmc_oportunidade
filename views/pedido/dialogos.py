@@ -17,7 +17,7 @@ from views.pedido.formato import _agora, _hora_local, _identificacao_loja, _nume
 
 @popups.popup("Estoque negativo", "longo")
 def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: dict) -> None:
-    from integrations import pedido_rascunho
+    from integrations import pedido_registros
 
     st.caption("O GPS mostra estes produtos com algum EAN negativo. No cálculo, o negativo conta como 0 — nada "
                "trava. Se souber o estoque real, digite aqui: a linha é recalculada com ele (vale só neste sistema, "
@@ -62,7 +62,7 @@ def _dialog_negativos(loja: dict, negativos: pd.DataFrame, meta: dict, usuario: 
             return
         gps = dict(zip(negativos["linha"], negativos["estoque_gps"].astype(float)))
         with get_session() as session:
-            gravadas, removidas = pedido_rascunho.salvar_correcoes(session, loja["id"], valores, gps,
+            gravadas, removidas = pedido_registros.salvar_correcoes(session, loja["id"], valores, gps,
                                                                    meta.get("data_foto"), usuario["nome"])
         # Correção nova muda a assinatura desta loja: a foto dos insumos vai na hora (cálculo de madrugada, 29/10).
         from integrations import insumos
@@ -182,7 +182,7 @@ def _dialog_exportar(loja: dict, pedido: pd.DataFrame, todas: pd.DataFrame, usua
     """Três exportações (01/10/2026). Só o formato Gruppy é "o pedido": ele
     fica registrado (aviso contra pedido duplicado) e encerra a lista aberta.
     Tabela completa e Só giro baixo são pra conferir e conversar com a loja."""
-    from integrations import pedido_area, pedido_rascunho
+    from integrations import pedido_area, pedido_registros
 
     tipo = st.radio("O que exportar", list(_TIPOS_EXPORTACAO), format_func=lambda t: _TIPOS_EXPORTACAO[t][0],
                     captions=[d for _, d in _TIPOS_EXPORTACAO.values()], key=f"{_KEY}_tipo_exportacao")
@@ -204,7 +204,7 @@ def _dialog_exportar(loja: dict, pedido: pd.DataFrame, todas: pd.DataFrame, usua
 
         def _registrar() -> None:
             with get_session() as session:
-                pedido_rascunho.registrar_exportacao(session, loja["id"], formato, len(tabela), i.unidades,
+                pedido_registros.registrar_exportacao(session, loja["id"], formato, len(tabela), i.unidades,
                                                      i.orcamento, usuario["nome"])
                 lista = pedido_area.ao_exportar(session, usuario["id"], loja["id"])
             _concluir("success", "Pedido exportado" + (

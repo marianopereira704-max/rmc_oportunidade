@@ -7,7 +7,7 @@ from sqlalchemy import select
 from core import auth, ui
 from core.db import get_session
 from core.models import BaseGenerico, OrigemFila
-from reconciliation import motor as reconciliation_motor
+from reconciliation import fila, reprocessamento
 from views import analise_comum
 from views.dados.comum import _categorias_contexto, _explicacao, _milhar
 from views.dados.sem_classificacao import _meses_compras
@@ -63,7 +63,7 @@ def _fila_ean() -> None:
         )
         if st.button("Reprocessar fila contra a base atual", key="fila_ean_reprocessar", type="primary"):
             with get_session() as session:
-                resultado = reconciliation_motor.reprocessar_fila_resolucao(session)
+                resultado = reprocessamento.reprocessar_fila_resolucao(session)
             st.session_state["fila_ean_reprocesso_resultado"] = resultado
             st.rerun()
 
@@ -74,9 +74,9 @@ def _fila_ean() -> None:
     # acumulado no título de cada item.
     por_lojas = origem_opcoes[origem_label] == OrigemFila.LOJA_API
     with get_session() as session:
-        itens = reconciliation_motor.listar_fila_priorizada(session, origem_filtro=origem_opcoes[origem_label],
+        itens = fila.listar_fila_priorizada(session, origem_filtro=origem_opcoes[origem_label],
                                                             por_lojas=por_lojas)
-        total_lojas = reconciliation_motor.soma_ocorrencias_pendentes(session, OrigemFila.LOJA_API) if por_lojas else 0
+        total_lojas = fila.soma_ocorrencias_pendentes(session, OrigemFila.LOJA_API) if por_lojas else 0
         genericos = session.execute(
             select(BaseGenerico).where(BaseGenerico.ativo.is_(True)).order_by(BaseGenerico.nome_canonico)
         ).scalars().all()
@@ -123,7 +123,7 @@ def _fila_ean() -> None:
                     st.markdown(f"Sugestão automática: **{nome_sugestao}** ({score_texto} de similaridade)")
                     if st.button("Confirmar sugestão", key=f"confirmar_sug_{item.id}", use_container_width=True):
                         with get_session() as s2:
-                            reconciliation_motor.confirmar_resolucao_manual(
+                            fila.confirmar_resolucao_manual(
                                 s2, item.id, item.sugestao_base_generico_id, usuario["nome"]
                             )
                         st.rerun()
@@ -136,7 +136,7 @@ def _fila_ean() -> None:
                 )
                 if escolha != "—" and st.button("Vincular", key=f"vincular_{item.id}", use_container_width=True):
                     with get_session() as s2:
-                        reconciliation_motor.confirmar_resolucao_manual(
+                        fila.confirmar_resolucao_manual(
                             s2, item.id, opcoes_generico_id_por_nome[escolha], usuario["nome"]
                         )
                     st.rerun()
@@ -145,12 +145,12 @@ def _fila_ean() -> None:
                 novo_nome = st.text_input("Cadastrar como genérico novo", key=f"novo_generico_{item.id}")
                 if novo_nome.strip() and st.button("Cadastrar e vincular", key=f"cadastrar_{item.id}", use_container_width=True):
                     with get_session() as s2:
-                        reconciliation_motor.registrar_novo_generico(s2, item.id, novo_nome.strip(), usuario["nome"])
+                        fila.registrar_novo_generico(s2, item.id, novo_nome.strip(), usuario["nome"])
                     st.rerun()
 
                 if st.button("Ignorar este item", key=f"ignorar_{item.id}", use_container_width=True):
                     with get_session() as s2:
-                        reconciliation_motor.ignorar_fila(s2, item.id)
+                        fila.ignorar_fila(s2, item.id)
                     st.rerun()
 
 

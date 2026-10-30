@@ -268,12 +268,12 @@ def _rodape_celular(loja: dict, usuario: dict, pedido: pd.DataFrame, area, lista
     codigo = loja.get("legacy_id") or "".join(ch for ch in (loja.get("cnpj") or "") if ch.isdigit())
 
     def _enviado() -> None:
-        from integrations import pedido_area, pedido_rascunho
+        from integrations import pedido_area, pedido_registros
 
         i = calculo.indicadores(marcados)
         # Conta como exportação (decisão do Mariano): registro, aviso contra pedido duplicado e a lista encerrada.
         with get_session() as session:
-            pedido_rascunho.registrar_exportacao(session, loja["id"], "Enviado", len(tabela), i.unidades,
+            pedido_registros.registrar_exportacao(session, loja["id"], "Enviado", len(tabela), i.unidades,
                                                  i.orcamento, usuario["nome"])
             lista = pedido_area.ao_exportar(session, usuario["id"], loja["id"])
         _concluir("success", "Pedido enviado" + (f"; a lista \"{lista}\" foi encerrada." if lista else "."))

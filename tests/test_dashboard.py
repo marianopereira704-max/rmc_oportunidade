@@ -44,9 +44,7 @@ def test_ruptura_e_completa_inclui_giro_baixo_e_venda_pontual():
     d = _preparar(_quadro(RUPTURA, RUPTURA_POUCO_GIRO, EFICIENTE))
     pontual = d[d["nome"] == "RUPTURA GIRO BAIXO"].iloc[0]
     assert pontual["em_ruptura"] and pontual["giro_baixo_real"]
-    c = dash.cards_estoque(d)
-    assert (c.ruptura, c.ruptura_giro_baixo) == (2, 1)
-    assert c.ruptura_pct == pytest.approx(2 / 3 * 100)
+    assert int(d["em_ruptura"].sum()) == 2 and int((d["em_ruptura"] & d["giro_baixo_real"]).sum()) == 1
 
 
 def test_ruptura_respeita_o_limite_de_unidades_da_configuracao():
@@ -67,44 +65,18 @@ def test_valores_em_reais_somam_o_estoque_e_cada_real_esta_em_uma_classe_so():
     assert (d["valor_eficiente"] >= 0).all()
 
 
-def test_cards_do_estoque():
-    d = _preparar(_quadro(RUPTURA, RUPTURA_POUCO_GIRO, PROXIMA, EXCESSO, PARADO, EFICIENTE))
-    c = dash.cards_estoque(d)
-    # estoque a custo: 4×5 + 300×1 + 20×10 + 10×4 = 560
-    assert c.produtos == 6 and c.estoque_valor == pytest.approx(560)
-    assert c.excesso_valor == pytest.approx(180) and c.excesso_pct == pytest.approx(180 / 560 * 100)
-    assert c.parado_valor == pytest.approx(200) and c.parado_pct == pytest.approx(200 / 560 * 100)
-    # venda em risco/dia: RUPTURA 2/dia × R$ 10 + RUPTURA GIRO BAIXO 0,01/dia × R$ 20 = 20,20
-    assert c.venda_risco_dia == pytest.approx(20.2)
-    # cobertura média = unidades em estoque ÷ demanda diária total (2 + 0,01 + 2 + 2 + 0,01 + 1 = 7,02)
-    assert c.unidades == 334 and c.cobertura_dias == pytest.approx(334 / 7.02)
-
-
 def test_estoque_negativo_nunca_vira_valor_negativo():
     """O cálculo do Assistente já trata negativo como 0, mas uma linha estranha não pode entortar os cards."""
     estranha = ("NEGATIVO", -5, 1.0, 4.0, 9.0, 7, 90, "AA", lc.GENERICOS, "PRESCRIÇÃO GENÉRICO", "medicamento")
     d = _preparar(_quadro(estranha, EFICIENTE))
     assert d.loc[d["nome"] == "NEGATIVO", "estoque_pos"].iloc[0] == 0
-    c = dash.cards_estoque(d)
-    assert c.estoque_valor == pytest.approx(40) and c.ruptura == 1
+    assert d["valor_estoque"].sum() == pytest.approx(40) and int(d["em_ruptura"].sum()) == 1
 
 
 def test_sem_preco_o_produto_nao_entra_nos_reais_mas_continua_contado():
     sem_custo = ("SEM CUSTO", 50, 1.0, None, None, 7, 90, "BB", lc.GENERICOS, "PRESCRIÇÃO GENÉRICO", "medicamento")
     d = _preparar(_quadro(sem_custo, RUPTURA))
-    c = dash.cards_estoque(d)
-    assert c.produtos == 2 and c.estoque_valor == 0 and c.venda_risco_dia == pytest.approx(20)
-
-
-def test_ruptura_por_curva_traz_as_tres_curvas_sempre():
-    d = _preparar(_quadro(RUPTURA, RUPTURA_POUCO_GIRO, EFICIENTE, PARADO, EXCESSO))
-    r = dash.ruptura_por_curva(d)
-    assert list(r.index) == ["A", "B", "C"]
-    # A: RUPTURA (AA), RUPTURA GIRO BAIXO (AB), EFICIENTE (AA) → 2 de 3 em ruptura; B: EXCESSO (BC); C: PARADO (CC)
-    assert r["produtos"].tolist() == [3, 1, 1] and r["em_ruptura"].tolist() == [2, 0, 0]
-    assert r["pct"].tolist() == pytest.approx([2 / 3 * 100, 0, 0])
-    vazio = dash.ruptura_por_curva(_preparar(_quadro()))
-    assert list(vazio.index) == ["A", "B", "C"] and vazio["produtos"].tolist() == [0, 0, 0]
+    assert len(d) == 2 and d["valor_estoque"].sum() == 0 and d["venda_risco_dia"].sum() == pytest.approx(20)
 
 
 def test_estoque_por_linha_soma_o_estoque_e_vem_do_maior_para_o_menor():
@@ -148,8 +120,6 @@ def test_quadro_vazio_nao_quebra_nada():
     """Loja sem vendas na janela volta do cálculo sem linhas (visto em 3 de 21 lojas reais)."""
     d = dash.preparar(pd.DataFrame(columns=["estoque"]), CONFIG)
     assert d.empty
-    c = dash.cards_estoque(d)
-    assert (c.produtos, c.ruptura, c.estoque_valor, c.cobertura_dias) == (0, 0, 0.0, None)
     assert dash.criticos(d).empty and dash.filtrar(d, linhas=["x"]).empty
 
 

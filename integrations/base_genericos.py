@@ -1,7 +1,7 @@
 """Importação em massa da Base Genéricos a partir de uma planilha CURADA por
 humano — bem diferente de Gruppy/GPS: aqui não tem fuzzy-match nenhum, a
 coluna de descrição já É o nome canônico, decidido por gente antes do
-upload. Ver `reconciliation.motor.importar_base_genericos` pra regra de
+upload. Ver `reconciliation.importacao_base.importar_base_genericos` pra regra de
 agrupamento (mesma descrição -> mesmo genérico) e idempotência (EAN já
 resolvido nunca é sobrescrito).
 
@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 
 from core.config import settings
 from integrations.base import ResultadoSincronizacao, StatusIntegracao
-from reconciliation import motor as reconciliation_motor
+from reconciliation import importacao_base
 from reconciliation.normalizador import normalizar_ean
 from storage import filesystem
 
@@ -96,7 +96,7 @@ def processar_planilha_base_genericos(
         for linha in df_norm.itertuples(index=False)
     ]
 
-    resultado = reconciliation_motor.importar_base_genericos(session, linhas, criado_por)
+    resultado = importacao_base.importar_base_genericos(session, linhas, criado_por)
 
     partes = [
         f"{resultado.genericos_criados} genérico(s) novo(s) criado(s)",

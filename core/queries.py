@@ -25,9 +25,6 @@ class PaginaResultado:
         return max(1, -(-self.total_linhas // self.tamanho_pagina))
 
 
-
-
-
 def _lista_distinct(session: Session, coluna) -> list[str]:
     """Valores distintos pra alimentar dropdown de filtro — exclui NULL e
     string vazia (não só NULL): uma fonte externa pode mandar "" em vez de
@@ -46,14 +43,6 @@ def lista_ufs(session: Session) -> list[str]:
 
 def lista_atendentes(session: Session) -> list[str]:
     return _lista_distinct(session, Loja.atendente_comercial)
-
-
-def lista_consultores_farma(session: Session) -> list[str]:
-    return _lista_distinct(session, Loja.consultor_farma)
-
-
-def lista_consultores_internos(session: Session) -> list[str]:
-    return _lista_distinct(session, Loja.consultor_interno)
 
 
 def lista_grupos_economicos(session: Session) -> list[str]:

@@ -465,26 +465,6 @@ def test_excluir_tabela_gruppy_nao_afeta_outras_tabelas_do_sistema(session, past
     assert antes["usuarios"] == 1
 
 
-def test_buscar_tabela_por_fs_node_so_acha_arquivo_gruppy(session, pasta_raiz_id):
-    # É essa função que decide se "Excluir definitivamente" aparece no menu
-    # do Explorador (views/dados.py::_explorador) — Base Genéricos não tem
-    # elo de volta pro FSNode (só TabelaGruppy.upload_fs_node_id existe),
-    # então nunca deve "achar" uma tabela pra esse botão aparecer.
-
-    conteudo_base = _xlsx_bytes([{"FCC": "F001", "EAN": 666666, "DESCRIÇÃO MARCOS": "Produto Base"}])
-    base_genericos_integ.processar_planilha_base_genericos(
-        session, conteudo_base, "base_completa.xlsx", "admin", pasta_raiz_id,
-    )
-    fs_node_base = session.execute(select(FSNode).where(FSNode.nome == "base_completa.xlsx")).scalar_one()
-
-    fs_node_id_gruppy, tabela_id = _criar_upload_gruppy(session, pasta_raiz_id, "Lab Visivel", "777")
-
-    assert gruppy_integ.buscar_tabela_por_fs_node(session, fs_node_base.id) is None
-    tabela_encontrada = gruppy_integ.buscar_tabela_por_fs_node(session, fs_node_id_gruppy)
-    assert tabela_encontrada is not None
-    assert tabela_encontrada.id == tabela_id
-
-
 # ---------------------------------------------------------------------------
 # Planilha enviada na seção errada (24/09/2026: uma tabela Gruppy subiu na
 # Base Genéricos e virou 22 genéricos canônicos falsos)
@@ -518,5 +498,3 @@ def test_gruppy_recusa_planilha_de_compras_gps():
     with pytest.raises(ValueError, match="CNPJ"):
         gruppy_integ.validar_planilha(df)
     gruppy_integ.validar_planilha(pd.DataFrame(columns=_CABECALHO_GRUPPY_REAL))
-
-

@@ -36,7 +36,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.models import Base, FilaResolucaoEAN, OrigemFila, StatusFila
-from reconciliation import motor
+from reconciliation import fila, motor
 
 
 @pytest.fixture()
@@ -173,8 +173,8 @@ def test_lote_respeita_o_tamanho_do_bloco(session, monkeypatch):
         assert len(bloco) <= 3
         return original(session, bloco)
 
-    monkeypatch.setattr(motor, "_gravar_bloco_fila", espiao)
-    monkeypatch.setattr(motor, "_TAMANHO_BLOCO_FILA", 3)
+    monkeypatch.setattr(fila, "_gravar_bloco_fila", espiao)
+    monkeypatch.setattr(fila, "_TAMANHO_BLOCO_FILA", 3)
 
     itens = [{"ean": f"B-{i}", "descricao_observada": "x", "origem": OrigemFila.GPS, "valor": 1.0} for i in range(10)]
     motor.upsert_fila_resolucao_em_lote(session, itens)

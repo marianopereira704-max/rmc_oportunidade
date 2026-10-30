@@ -104,10 +104,6 @@ def grupo(categoria: str | None) -> str:
     return CATEGORIAS.get(categoria or "", SEM_CLASSIFICACAO)
 
 
-def e_generico(categoria: str | None) -> bool:
-    return categoria == GENERICO
-
-
 def chave_ean(valor) -> str | None:
     """Só dígitos, sem zeros à esquerda. A lista da CMED e algumas planilhas
     trazem GTIN-14 ("07896…") onde o GPS tem o EAN-13 ("7896…"); sem tirar o

@@ -2,11 +2,10 @@
 de pedido — cada gravação leva o usuário e a data/hora (decisão de
 27/09/2026).
 
-O nome do módulo é da Fase 5, quando ele guardava também o "rascunho da
-loja" (quantidades digitadas). O rascunho foi substituído pela área de
-trabalho por usuário + loja (integrations/pedido_area.py) em 29/09/2026 e
-as funções dele foram apagadas em 02/10/2026; a tabela `rascunhos_pedido`
-fica no banco sem uso (migração não apaga tabela).
+Até 29/10/2026 se chamava `pedido_rascunho.py` — nome da Fase 5, quando guardava também o "rascunho da loja"
+(quantidades digitadas), substituído pela área de trabalho por usuário + loja (integrations/pedido_area.py) em
+29/09/2026. A tabela `rascunhos_pedido` fica no banco sem uso até a migração das tabelas sem uso, que entra depois
+da publicação (alembic/depois_da_publicacao/).
 """
 from __future__ import annotations
 

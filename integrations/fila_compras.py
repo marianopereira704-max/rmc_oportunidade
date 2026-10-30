@@ -28,7 +28,7 @@ from sqlalchemy.orm import Session
 
 from core.models import EanGenerico, FilaResolucaoEAN, OrigemFila, StatusFila
 from pedido import categorias as cat
-from reconciliation import motor
+from reconciliation import fila, fuzzy
 
 MESES_DO_VALOR = 3
 
@@ -73,7 +73,7 @@ def atualizar(session: Session, resumo: pd.DataFrame, base_categorias: pd.DataFr
     with session.no_autoflush:
         for r in novos.itertuples(index=False):
             descricao = (r.nome or "").strip()[:250] if isinstance(r.nome, str) else ""
-            base_id = motor.resolver_ean(
+            base_id = fuzzy.resolver_ean(
                 session, ean=r.ean, descricao_origem=descricao or f"EAN {r.ean}", origem=OrigemFila.GPS,
                 valor=0, criado_por="sistema", cache_candidatos=cache_candidatos,
                 cache_eans_resolvidos=cache_resolvidos, cache_eans_completo=True, ocorrencias=0,
@@ -81,7 +81,7 @@ def atualizar(session: Session, resumo: pd.DataFrame, base_categorias: pd.DataFr
             )
             if base_id is not None:
                 automaticos += 1
-    motor.upsert_fila_resolucao_em_lote(session, buffer_fila)
+    fila.upsert_fila_resolucao_em_lote(session, buffer_fila)
     session.flush()
     regravados = _regravar_valores(session, resumo)
     return ResultadoFilaCompras(len(genericos), len(genericos) - len(fora), len(buffer_fila), automaticos, regravados)
