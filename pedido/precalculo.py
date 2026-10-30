@@ -32,13 +32,27 @@ VERSAO = 1
 TELAS = ("assistente", "estoque", "ruptura", "compras")
 
 
+def _bibliotecas() -> str:
+    """As versões das bibliotecas que fazem as contas também entram na assinatura (29/10/2026): o GitHub instalou o
+    pandas 3.1 e os resultados feitos com ele diferiam do app (3.0.5) — valores de venda no Compras, tipo de coluna
+    no Estoque — e ficavam "em dia" na execução seguinte. Versão diferente → o app calcula na hora."""
+    import numpy
+    import pyarrow
+
+    return f"pandas {pd.__version__}; numpy {numpy.__version__}; pyarrow {pyarrow.__version__}"
+
+
+BIBLIOTECAS = _bibliotecas()
+
+
 # ---------------------------------------------------------------------------
 # Assinatura — o app e a rotina chamam AS MESMAS funções
 # ---------------------------------------------------------------------------
 
 def _assinatura(tela: str, **campos) -> str:
     """JSON ordenado (tupla e lista viram a mesma coisa; as versões vêm do banco no app e do manifesto na rotina)."""
-    texto = json.dumps({"tela": tela, "versao": VERSAO, **campos}, sort_keys=True, default=str, ensure_ascii=False)
+    texto = json.dumps({"tela": tela, "versao": VERSAO, "bibliotecas": BIBLIOTECAS, **campos}, sort_keys=True,
+                       default=str, ensure_ascii=False)
     return hashlib.sha256(texto.encode("utf-8")).hexdigest()
 
 

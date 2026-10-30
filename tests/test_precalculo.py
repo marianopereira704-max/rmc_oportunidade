@@ -80,6 +80,10 @@ def test_assinatura_muda_com_a_configuracao_da_loja_e_com_a_versao_do_codigo(mon
     antes = _todas(b)
     monkeypatch.setattr(precalculo, "VERSAO", precalculo.VERSAO + 1)
     assert all(_todas(b)[t] != v for t, v in antes.items())
+    # Outra versão do pandas (29/10/2026: o GitHub instalou a 3.1 e os resultados diferiam do app).
+    antes = _todas(b)
+    monkeypatch.setattr(precalculo, "BIBLIOTECAS", "pandas 3.1.0; numpy 2.5.4; pyarrow 25.0.1")
+    assert all(_todas(b)[t] != v for t, v in antes.items())
 
 
 # ---------------------------------------------------------------------------
