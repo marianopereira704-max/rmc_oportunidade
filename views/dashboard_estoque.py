@@ -160,13 +160,14 @@ def _cards(c: de.CardsEstoque, dados: comum_dash.DadosEstoque) -> None:
 def _colunas_categoria() -> list[tb.ColunaTabela]:
     return [
         tb.ColunaTabela("categoria", "Categoria", largura="fit-content(340px)"),
-        tb.ColunaTabela("skus", "SKUs", direita=True, numerica=True),
-        tb.ColunaTabela("unidades", "Unid. em estoque", direita=True, numerica=True),
-        tb.ColunaTabela("estoque_compra", "Estoque a preço de compra", direita=True, numerica=True),
-        tb.ColunaTabela("estoque_venda", "Estoque a preço de venda", direita=True, numerica=True,
+        tb.ColunaTabela("skus", "SKUs", direita=True, numerica=True, celular=None),
+        tb.ColunaTabela("unidades", "Unid. em estoque", direita=True, numerica=True, celular=None),
+        tb.ColunaTabela("estoque_compra", "Estoque a preço de compra", direita=True, numerica=True,
+                        rotulo_celular="Estoque (R$)"),
+        tb.ColunaTabela("estoque_venda", "Estoque a preço de venda", direita=True, numerica=True, celular=None,
                         dica=dicas.dica("Quanto o estoque vale se for todo vendido pelo preço de venda.",
                                         "É só uma informação complementar.")),
-        tb.ColunaTabela("cobertura", "Cobertura (dias)", direita=True, numerica=True,
+        tb.ColunaTabela("cobertura", "Cobertura (dias)", direita=True, numerica=True, rotulo_celular="Cobertura",
                         dica=dicas.dica("Unidades em estoque ÷ unidades vendidas por dia.",
                                         "Quem não vendeu continua nas unidades e não nas vendas, por isso a "
                                         "cobertura pode ficar alta.")),
@@ -240,7 +241,7 @@ def _tabela_categorias(base: pd.DataFrame, selecionadas: list[str]) -> None:
     if linhas:
         linhas.append(linha_total(de.total_por_categoria(base)))
     tb.tabela(f"{_KEY}_categorias", _colunas_categoria(), linhas, ordem, ao_ordenar=_ordenar_categoria, densa=True,
-              selecao_linhas=selecionadas, ao_clicar_linha=_clicar_categoria,
+              selecao_linhas=selecionadas, ao_clicar_linha=_clicar_categoria, celular="tabela",
               vazio=("Nenhuma categoria", "Com estes filtros não há SKU com estoque."))
 
 
@@ -272,16 +273,18 @@ def _grafico_linha(base: pd.DataFrame) -> None:
 
 def _colunas_criticos(dias: int) -> list[tb.ColunaTabela]:
     return [
-        tb.ColunaTabela("nome", "Produto", largura="fit-content(300px)"),
-        tb.ColunaTabela("situacao", "Status", centro=True),
-        tb.ColunaTabela("curva", "Curva", centro=True),
-        tb.ColunaTabela("estoque", "Estoque", direita=True, numerica=True),
-        tb.ColunaTabela("excesso_un", "Excesso (un.)", direita=True, numerica=True),
+        tb.ColunaTabela("nome", "Produto", largura="fit-content(300px)", celular="titulo"),
+        tb.ColunaTabela("situacao", "Status", centro=True, celular="etiquetas"),
+        tb.ColunaTabela("curva", "Curva", centro=True, celular=None),
+        tb.ColunaTabela("estoque", "Estoque", direita=True, numerica=True, celular=None),
+        tb.ColunaTabela("excesso_un", "Excesso (un.)", direita=True, numerica=True, celular=None),
         tb.ColunaTabela("valor_estoque", "Estoque a preço de compra", direita=True, numerica=True,
+                        rotulo_celular="Valor em estoque",
                         dica=dicas.dica("Unidades × último preço de compra.",
                                         'Em "a revisar", o custo não é confiável (embalagem, cadastro ou compra fora do '
                                         'padrão) e o SKU não entra no valor em R$.')),
-        tb.ColunaTabela("vendidas_n", f"Vendidas em {ui.formatar_numero(dias)} dias", direita=True, numerica=True),
+        tb.ColunaTabela("vendidas_n", f"Vendidas em {ui.formatar_numero(dias)} dias", direita=True, numerica=True,
+                        celular=None),
         tb.ColunaTabela("cobertura", "Cobertura", direita=True, numerica=True),
     ]
 
@@ -354,7 +357,7 @@ def _criticos(filtrado: pd.DataFrame, assinatura_filtros: tuple, dados: comum_da
 
     dias = int(dados.config.dias_parado)
     tb.tabela(f"{_KEY}_criticos", _colunas_criticos(dias), [linha_critico(r) for r in fatia.to_dict("records")], ordem,
-              ao_ordenar=_ordenar_criticos, acao="Ver detalhes", densa=True,
+              ao_ordenar=_ordenar_criticos, acao="Ver detalhes", densa=True, celular="cartao",
               vazio=("Nenhum SKU crítico", "Com estes filtros não há SKU em excesso nem parado."))
     total = len(ordenado)
     if total:

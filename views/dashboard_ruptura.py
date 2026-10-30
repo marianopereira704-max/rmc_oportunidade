@@ -158,13 +158,13 @@ def _cards(c: dr.Cards, rotulo_perda: str, sub_perda: str, regras: dr.Regras) ->
 def _colunas_categoria() -> list[tb.ColunaTabela]:
     return [
         tb.ColunaTabela("categoria", "Categoria", largura="fit-content(340px)"),
-        tb.ColunaTabela("produtos", "Produtos", direita=True, numerica=True),
+        tb.ColunaTabela("produtos", "Produtos", direita=True, numerica=True, celular=None),
         tb.ColunaTabela("em_ruptura", "Em ruptura", direita=True, numerica=True),
         tb.ColunaTabela("nivel_servico", "Nível de serviço", direita=True, numerica=True,
                         dica=dicas.dica("A parte do mix que tem estoque.",
                                         "Vermelho, âmbar e verde pelos limites das Configurações de Pedidos.")),
-        tb.ColunaTabela("perda", "Perda", direita=True, numerica=True),
-        tb.ColunaTabela("investimento", "Investimento necessário", direita=True, numerica=True),
+        tb.ColunaTabela("perda", "Perda", direita=True, numerica=True, celular=None),
+        tb.ColunaTabela("investimento", "Investimento necessário", direita=True, numerica=True, celular=None),
     ]
 
 
@@ -223,7 +223,7 @@ def _tabela_categorias(base: pd.DataFrame, selecionadas: list[str], regras: dr.R
     if linhas:
         linhas.append(linha_total(dr.total(base), regras))
     tb.tabela(f"{_KEY}_categorias", _colunas_categoria(), linhas, ordem, ao_ordenar=_ordenar_categoria, densa=True,
-              selecao_linhas=selecionadas, ao_clicar_linha=_clicar_categoria,
+              selecao_linhas=selecionadas, ao_clicar_linha=_clicar_categoria, celular="tabela",
               vazio=("Nenhuma categoria", "Com estes filtros não há produto no mix."))
 
 
@@ -266,16 +266,16 @@ def _grafico_risco(base: pd.DataFrame, regras: dr.Regras) -> None:
 
 def _colunas_criticos() -> list[tb.ColunaTabela]:
     return [
-        tb.ColunaTabela("nome", "Produto", largura="fit-content(260px)"),
-        tb.ColunaTabela("situacao", "Situação", centro=True),
-        tb.ColunaTabela("curva", "Curva", centro=True),
-        tb.ColunaTabela("ultima_venda", "Última venda", direita=True),
-        tb.ColunaTabela("compra_data", "Última compra", direita=True),
-        tb.ColunaTabela("venda_90d", "Vendidas 90 dias", direita=True, numerica=True),
+        tb.ColunaTabela("nome", "Produto", largura="fit-content(260px)", celular="titulo"),
+        tb.ColunaTabela("situacao", "Situação", centro=True, celular="etiquetas"),
+        tb.ColunaTabela("curva", "Curva", centro=True, celular=None),
+        tb.ColunaTabela("ultima_venda", "Última venda", direita=True, celular=None),
+        tb.ColunaTabela("compra_data", "Última compra", direita=True, celular=None),
+        tb.ColunaTabela("venda_90d", "Vendidas 90 dias", direita=True, numerica=True, celular=None),
         tb.ColunaTabela("perda_produto", "Perda", direita=True, numerica=True,
                         dica=dicas.dica("Em ruptura: a perda da falta aberta, ou a projeção de 30 dias enquanto o "
                                         "histórico do estoque não tem o período.", "Ruptura próxima ainda não tem perda.")),
-        tb.ColunaTabela("risco", "Risco", centro=True),
+        tb.ColunaTabela("risco", "Risco", centro=True, celular="etiquetas"),
         tb.ColunaTabela("repor_un", "Repor", direita=True, numerica=True,
                         dica=dicas.dica("A sugestão do Assistente de pedido, até o estoque ideal, e quanto custa.")),
     ]
@@ -337,7 +337,7 @@ def _criticos(filtrado: pd.DataFrame, assinatura_filtros: tuple, dados: comum_da
     st.session_state[_PAGINA] = pagina
 
     tb.tabela(f"{_KEY}_criticos", _colunas_criticos(), [linha_critico(r) for r in fatia.reset_index(drop=True).to_dict("records")],
-              ordem, ao_ordenar=_ordenar_criticos, acao="Ver detalhes", densa=True,
+              ordem, ao_ordenar=_ordenar_criticos, acao="Ver detalhes", densa=True, celular="cartao",
               vazio=("Nenhum produto crítico", "Com estes filtros não há produto em ruptura nem com ruptura próxima."))
     total = len(ordenado)
     if total:

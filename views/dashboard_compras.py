@@ -182,10 +182,10 @@ def _colunas_categoria() -> list[tb.ColunaTabela]:
                         dica=dicas.dica("As compras da categoria no mês anterior, corrigidas pela variação da venda "
                                         "semana a semana contra as mesmas semanas daquele mês.")),
         tb.ColunaTabela("consumido", "Consumido", direita=True, numerica=True),
-        tb.ColunaTabela("compra_venda", "Compra × Venda", direita=True, numerica=True,
+        tb.ColunaTabela("compra_venda", "Compra × Venda", direita=True, numerica=True, celular=None,
                         dica=dicas.dica("O comprado dividido pelo vendido a custo.")),
-        tb.ColunaTabela("sem_demanda", "Sem demanda", direita=True, numerica=True),
-        tb.ColunaTabela("excesso", "Excesso", direita=True, numerica=True),
+        tb.ColunaTabela("sem_demanda", "Sem demanda", direita=True, numerica=True, celular=None),
+        tb.ColunaTabela("excesso", "Excesso", direita=True, numerica=True, celular=None),
         tb.ColunaTabela("eficiencia", "Eficiência", direita=True, numerica=True,
                         dica=dicas.dica("A parte do comprado que foi compra certa.",
                                         "Vermelho abaixo de 80%, verde a partir de 90%.")),
@@ -251,7 +251,7 @@ def _tabela_categorias(d: pd.DataFrame, selecionadas: list[str], ctx: dc.Context
         linhas.append({"id": "__total", "classe": "total", "selecionavel": False,
                        "celulas": {"categoria": tb.celula(tb.pedaco("Total")), **_celulas(dc.metricas(d, ctx), False)}})
     tb.tabela(f"{_KEY}_categorias", _colunas_categoria(), linhas, ordem, ao_ordenar=_ordenar_categoria, densa=True,
-              selecao_linhas=selecionadas, ao_clicar_linha=_clicar_categoria,
+              selecao_linhas=selecionadas, ao_clicar_linha=_clicar_categoria, celular="tabela",
               vazio=("Nenhuma compra", "Não há compra nem venda neste período."))
 
 
@@ -337,16 +337,16 @@ def _grafico_dotacao(dados: comum_dash.DadosCompras, filtrado: pd.DataFrame, ctx
 
 def _colunas_produtos() -> list[tb.ColunaTabela]:
     return [
-        tb.ColunaTabela("nome", "Produto", largura="fit-content(300px)"),
+        tb.ColunaTabela("nome", "Produto", largura="fit-content(300px)", celular="titulo"),
         tb.ColunaTabela("comprado_un", "Comprado", direita=True, numerica=True),
         tb.ColunaTabela("vendido_un", "Vendido", direita=True, numerica=True),
-        tb.ColunaTabela("limite", "Limite", direita=True, numerica=True,
+        tb.ColunaTabela("limite", "Limite", direita=True, numerica=True, celular=None,
                         dica=dicas.dica("A venda do período mais o estoque ideal do Assistente de pedido.")),
-        tb.ColunaTabela("nao_otimizado", "Não otimizado", direita=True, numerica=True,
+        tb.ColunaTabela("nao_otimizado", "Não otimizado", direita=True, numerica=True, celular="dado_largo",
                         dica=dicas.dica("Excesso: as unidades pagas acima do limite × o custo médio delas. As "
                                         "bonificadas contam primeiro e valem zero.",
                                         "Sem demanda: tudo o que foi pago.")),
-        tb.ColunaTabela("classe", "Classificação", centro=True),
+        tb.ColunaTabela("classe", "Classificação", centro=True, celular="etiquetas"),
     ]
 
 
@@ -396,7 +396,7 @@ def _produtos(filtrado: pd.DataFrame, assinatura_filtros: tuple, dados: comum_da
     st.session_state[_PAGINA] = pagina
 
     tb.tabela(f"{_KEY}_produtos", _colunas_produtos(), [linha_produto(r) for r in fatia.to_dict("records")],
-              ordem, ao_ordenar=_ordenar_produtos, acao="Ver detalhes", densa=True,
+              ordem, ao_ordenar=_ordenar_produtos, acao="Ver detalhes", densa=True, celular="cartao",
               vazio=("Nenhum produto", "Com estes filtros não há compra em excesso nem sem demanda."))
     total = len(ordenado)
     if total:

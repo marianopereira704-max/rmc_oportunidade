@@ -32,16 +32,16 @@ _KEY = "op_produto"
 
 def _colunas(laboratorio: str) -> list[tb.ColunaTabela]:
     return [
-        tb.ColunaTabela("nome_canonico", "Produto", "fit-content(230px)"),
+        tb.ColunaTabela("nome_canonico", "Produto", "fit-content(230px)", celular="titulo"),
         tb.ColunaTabela("laboratorio", "Laboratório", "fit-content(150px)"),
         tb.ColunaTabela("preco_pago", "Preço pago", direita=True, numerica=True,
                         dica="Média das notas com preço acima da tabela, pela quantidade de cada uma.\n\n"
                              "Sem nenhuma nota acima, a média de todas as notas do período."),
         tb.ColunaTabela("preco_laboratorio", laboratorio, direita=True, numerica=True),
-        tb.ColunaTabela("diferenca", "Diferença un.", direita=True, numerica=True),
+        tb.ColunaTabela("diferenca", "Diferença un.", direita=True, numerica=True, celular=None),
         tb.ColunaTabela("quantidade", "Qtd.", direita=True, numerica=True,
                         dica="Unidades das notas acima da tabela (as que entram na economia)."),
-        tb.ColunaTabela("economia", "Economia", direita=True, numerica=True),
+        tb.ColunaTabela("economia", "Economia", direita=True, numerica=True, celular="destaque"),
     ]
 
 
@@ -54,7 +54,7 @@ def _categoria(valor) -> str | None:
 def _celula_produto(r: dict, com_loja: bool) -> list:
     linhas = [tb.pedaco(r["nome_canonico"], "forte quebra")]
     if r.get("categoria"):
-        linhas.append(tb.pedaco(_categoria(r["categoria"]), "aux"))
+        linhas.append(tb.pedaco(_categoria(r["categoria"]), "aux so-pc"))
     if com_loja:
         linhas.append([
             tb.pedaco(f"{(r.get('razao_social') or '').strip()} ·", "aux"),
@@ -69,7 +69,8 @@ def _celula_preco(r: dict) -> list:
         texto = f"{r['notas_acima']} de {validas} nota{'s' if validas != 1 else ''} acima"
     else:
         texto = f"{validas} nota{'s' if validas != 1 else ''}" if validas else "só a revisar"
-    return tb.celula(tb.pedaco(comum.moeda(r["preco_pago"])), tb.pedaco(texto, "aux"))
+    # "N de M notas acima" fica só no PC (29/10/2026, Mariano): no cartão do celular, o detalhe mostra as notas.
+    return tb.celula(tb.pedaco(comum.moeda(r["preco_pago"])), tb.pedaco(texto, "aux so-pc"))
 
 
 def _celula_economia(r: dict) -> list:
@@ -225,7 +226,7 @@ def _render() -> None:
     tb.tabela(
         f"{_KEY}_tabela", _colunas(laboratorio), [_linha(r, not uma_loja) for r in fatia.to_dict("records")], ordem,
         ao_ordenar=lambda coluna: comum.alternar_ordem(_KEY, coluna.campo, coluna.numerica),
-        acao="Ver detalhes", densa=True,
+        acao="Ver detalhes", densa=True, celular="cartao",
     )
 
     clicada = tb.acao_clicada(f"{_KEY}_tabela")

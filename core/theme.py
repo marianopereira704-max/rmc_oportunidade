@@ -943,10 +943,6 @@ div[class*="st-key-dash-pag"] {_sel("botao_secundario")} {{
 }}
 div[class*="st-key-dash-pag"] {_sel("botao_secundario")}:hover:not(:disabled) {{ border-color: var(--navy); background: #FFFFFF; }}
 div[class*="st-key-dash-pag"] {_sel("botao_secundario")}:disabled {{ opacity: .45; }}
-/* Celular: dois cards por linha (quatro espremiam o "R$ 70,85" contra a borda). */
-@media (max-width: 640px) {{
-    div[class*="st-key-tela-dashboard"] .rmc-kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
-}}
 /* === FIM DO DASHBOARD === */
 /* Assistente de pedido — topo, pílulas de parâmetros, cards e linha de
    filtros (01/10/2026). */
@@ -1046,6 +1042,61 @@ div[class*="st-key-rodape-pedido"] {{
     box-shadow: 0 -6px 16px rgba(23, 55, 94, 0.06);
 }}
 /* === FIM DO RODAPÉ FIXO === */
+
+/* === CELULAR (29/10/2026, etapa 6 — decidido pelo Mariano; medido em 390 × 844) — bloco isolado. Abaixo de 640 px
+   (a largura em que o próprio Streamlit empilha as colunas). As tabelas viram cartão dentro do componente
+   (views/tabela.py); aqui, o que é do Streamlit. Fora do celular, o que é só do celular fica escondido. === */
+/* A versão escondida do rodapé some com a caixa que o Streamlit põe em volta de todo contêiner com chave
+   (`envoltorio_layout`): só o contêiner escondido, a caixa vazia ainda contava o vão — o rodapé do PC subiu 14 px
+   (teste visual de 29/10/2026). */
+div[class*="st-key-pedido_filtros_celular"], {_sel("elemento")}:has(.rmc-filtros-abertos),
+div[class*="st-key-rodape-celular"], {_sel("envoltorio_layout")}:has(> div[class*="st-key-rodape-celular"]) {{ display: none; }}
+@media (max-width: 640px) {{
+    /* Cards: dois por linha (quatro espremiam o "R$ 70,85" contra a borda); "so-pc" some. */
+    .rmc-kpis {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    .rmc-kpi.so-pc {{ display: none; }}
+    /* Assistente: Orçamento na linha inteira, Produtos e Ruptura embaixo; "Sem categoria" sai (o pop-up ao abrir a
+       loja já avisa). */
+    div[class*="st-key-pedido-cards"] {_sel("bloco_horizontal")} {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    div[class*="st-key-pedido-cards"] {_sel("bloco_horizontal")} > div:first-child {{ grid-column: 1 / -1; }}
+    div[class*="st-key-pedido-cards"] {_sel("bloco_horizontal")} > div:has(div[class*="st-key-pedido-card-sem"]) {{ display: none; }}
+    /* Assistente: a busca e o botão "Filtros"; os outros campos só com ele aberto, dois por linha. */
+    div[class*="st-key-pedido-filtros-linha"] {{ flex-wrap: wrap; }}
+    /* A busca e o botão sozinhos na 1ª linha: com "1 1 0", a Categoria subia para a linha deles e a busca
+       encolhia a um ícone (teste visual de 29/10/2026). */
+    div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_busca"] {{ flex: 1 1 calc(100% - 132px); min-width: 0; }}
+    div[class*="st-key-pedido_filtros_celular"] {{ display: block; flex: none; }}
+    div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_cat_"],
+    div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_status_"],
+    div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_fab_"],
+    div[class*="st-key-pedido-filtros-linha"] div[class*="st-key-pedido_giro"] {{ display: none; }}
+    div[class*="st-key-pedido-filtros-linha"]:has(.rmc-filtros-abertos) div[class*="st-key-pedido_cat_"],
+    div[class*="st-key-pedido-filtros-linha"]:has(.rmc-filtros-abertos) div[class*="st-key-pedido_status_"],
+    div[class*="st-key-pedido-filtros-linha"]:has(.rmc-filtros-abertos) div[class*="st-key-pedido_fab_"],
+    div[class*="st-key-pedido-filtros-linha"]:has(.rmc-filtros-abertos) div[class*="st-key-pedido_giro"] {{
+        display: block; flex: 1 1 calc(50% - 4px); min-width: 0;
+    }}
+    /* Rodapé: só "Enviar pedido" e o "⋯"; some ao rolar para baixo e volta ao rolar para cima (opção B — a
+       classe no <body> vem de views/enviar_pedido.py). */
+    div[class*="st-key-rodape-pc"], {_sel("envoltorio_layout")}:has(> div[class*="st-key-rodape-pc"]) {{ display: none; }}
+    /* Lado a lado: no celular o Streamlit empilha os contêineres horizontais (o "⋯" ia para baixo do Enviar). */
+    div[class*="st-key-rodape-celular"] {{ display: flex; flex-direction: row; flex-wrap: nowrap; align-items: center; }}
+    {_sel("envoltorio_layout")}:has(> div[class*="st-key-rodape-celular"]) {{ display: block; }}
+    div[class*="st-key-rodape-celular"] > * {{ width: auto; }}
+    div[class*="st-key-pedido_enviar"] {{ flex: 1 1 0; min-width: 0; }}
+    div[class*="st-key-pedido_mais"] {{ flex: 0 0 auto; min-width: 104px; }}
+    div[class*="st-key-pedido_mais"] button {{ width: 100%; min-height: 44px; }}
+    {_sel("envoltorio_layout")}:has(> div[class*="st-key-rodape-pedido"]) {{ transition: transform .2s ease; }}
+    body.rmc-rolando-baixo {_sel("envoltorio_layout")}:has(> div[class*="st-key-rodape-pedido"]) {{
+        transform: translateY(110%);
+    }}
+}}
+@media (prefers-reduced-motion: reduce) {{
+    {_sel("envoltorio_layout")}:has(> div[class*="st-key-rodape-pedido"]) {{ transition: none; }}
+}}
+/* Nome do produto no detalhe do cartão do Assistente (views/pedido/tabela_pedido._dialog_detalhe). */
+.rmc-detalhe-nome {{ font-size: var(--fs-destaque); font-weight: 700; color: var(--navy); line-height: 1.3; }}
+/* === FIM DO CELULAR === */
 
 </style>
 """
@@ -1161,7 +1212,7 @@ def kpis(cards: list[dict], unico: bool = False) -> None:
     """Linha de cards de indicador. Cada card: {"icone": loja|moeda|produto|
     media|alerta|carrinho|pausa, "tom": azul|verde|roxo|ambar|vermelho, "valor", "label", "sub"
     (opcional), "variacao" (float|None), "dica_variacao", "dica" (opcional: a conta do número, ao
-    passar o mouse no card — Dashboard, 21/10/2026)}.
+    passar o mouse no card — Dashboard, 21/10/2026), "classe" (opcional: "so-pc" some no celular, 29/10/2026)}.
 
     O "$" vira entidade HTML: o Markdown do Streamlit leria "R$ … R$" como
     fórmula (mesmo motivo de views/analise_comum._sem_matematica)."""
@@ -1177,7 +1228,8 @@ def kpis(cards: list[dict], unico: bool = False) -> None:
         # O container-query mede o .rmc-kpi; quem muda de direção é o
         # .rmc-kpi-dentro (um elemento não consulta o próprio tamanho).
         partes.append(
-            f'<div class="rmc-kpi {c.get("tom", "azul")}{" dica-abaixo" if dica else ""}"{dica}><div class="rmc-kpi-dentro">'
+            f'<div class="rmc-kpi {c.get("tom", "azul")}{" " + c["classe"] if c.get("classe") else ""}'
+            f'{" dica-abaixo" if dica else ""}"{dica}><div class="rmc-kpi-dentro">'
             f'<span class="icone"><svg viewBox="0 0 24 24" aria-hidden="true">{_ICONES_KPI[c["icone"]]}</svg></span>'
             f'<div class="corpo"><div class="label">{html.escape(c["label"])}</div>'
             f'<div class="linha-valor"><span class="valor">{html.escape(c["valor"])}</span>'

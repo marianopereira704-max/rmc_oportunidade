@@ -21,7 +21,11 @@ O que faz:
 5. CAPTURA: fotografa cada tela e compara com `tests/visual/referencia/`.
    Diferença acima da tolerância = falha, com uma imagem destacando o que
    mudou em `tests/visual/resultado/`.
-6. CÁLCULO DE MADRUGADA (29/10/2026): publica as fotos dos insumos, roda
+6. CELULAR (29/10/2026, etapa 6): login, Criar senha, Por Produto, Assistente
+   (topo, filtros abertos, lista com o rodapé escondido, rodapé de volta,
+   detalhe do produto, "⋯") e as três páginas do Dashboard em 390 × 844,
+   com as mesmas conferências (`*_390.png`); os cartões não podem vazar.
+7. CÁLCULO DE MADRUGADA (29/10/2026): publica as fotos dos insumos, roda
    `pedido.precalculo`, esconde os dados brutos da loja fictícia e percorre
    de novo o Assistente e o Dashboard, agora pelo resultado PRONTO — as
    capturas (`pronto_*`) têm de ser iguais às MESMAS referências.
@@ -192,6 +196,132 @@ def _preparar_pronto(env: dict) -> None:
             shutil.move(str(arq), destino)
     if not any(escondidos.rglob("*.parquet")):
         raise RuntimeError("Nenhum dado bruto da loja fictícia para esconder: a 2ª volta não provaria nada.")
+
+
+CELULAR = {"width": 390, "height": 844}   # celular comum (etapa 6, 29/10/2026)
+
+
+def _no_celular(page) -> None:
+    page.set_viewport_size(CELULAR)
+    page.wait_for_timeout(600)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+
+
+def _no_pc(page) -> None:
+    """A barra lateral do celular fica recolhida: a navegação entre as telas é feita em 1280 px."""
+    page.set_viewport_size({"width": LARGURAS[0], "height": ALTURA})
+    page.wait_for_timeout(400)
+    _estabilizar(page)
+
+
+def _rolar(page, dy: int) -> None:
+    """Como o dedo: rola o que estiver embaixo (o Streamlit rola um contêiner por dentro, não a página)."""
+    page.mouse.move(CELULAR["width"] // 2, CELULAR["height"] // 2)
+    page.mouse.wheel(0, dy)
+    page.wait_for_timeout(500)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+
+
+def _ate(page, texto: str) -> None:
+    page.get_by_text(texto, exact=True).first.evaluate("e => e.scrollIntoView({block: 'start'})")
+    page.wait_for_timeout(300)
+    _estabilizar(page)
+
+
+def _token_de_ativacao(env: dict) -> str:
+    """Link de "Criar senha" do usuário Aguardando da loja fictícia (tests/visual/loja_ficticia.py)."""
+    codigo = ("from core.db import get_session\nfrom core.models import Usuario\nfrom integrations import usuarios as u\n"
+              "with get_session() as s:\n    us = s.query(Usuario).filter_by(login='carlos@ficticia.com.br').one()\n"
+              "    print(u.criar_token(s, us.id, u.ATIVACAO))")
+    saida = subprocess.run([sys.executable, "-c", codigo], cwd=RAIZ, env=env, capture_output=True, text=True,
+                           check=True).stdout
+    return saida.strip().splitlines()[-1]
+
+
+def _telas_celular(page, url, token):
+    """Celular (etapa 6, 29/10/2026): as telas da loja em 390 × 844, com as mesmas conferências das outras
+    larguras (contrato, vãos das tabelas que continuam tabela, eixos e espaço, cartões que não vazam, pop-ups)."""
+    _abrir_login(page, url)
+    yield "login", []
+    page.goto(f"{url}/?token={token}")
+    page.get_by_text("Crie a sua senha", exact=False).first.wait_for(timeout=60_000)
+    _estabilizar(page)
+    yield "criar_senha", []
+
+    _no_pc(page)
+    _entrar(page, url)
+    page.get_by_role("button", name="Por Produto").click()
+    _escolher_laboratorio(page)
+    _no_celular(page)
+    yield "por_produto", []
+    _rolar(page, 900)
+    yield "por_produto_lista", []
+    _abrir_detalhe(page, "Notas fiscais do período", page.locator("button.acao"))
+    yield "por_produto_detalhe", []
+    page.keyboard.press("Escape")
+    page.locator(_DIALOGO).wait_for(state="detached", timeout=30_000)
+    _rolar(page, -20000)
+
+    # Assistente: a loja fictícia; os pop-ups ao abrir a loja já foram respondidos na volta de 1280 px.
+    _no_pc(page)
+    page.locator('[class*="st-key-nav_pedido"] button').click()
+    campo = page.locator('[class*="st-key-loja_barra"] input')
+    campo.wait_for(timeout=60_000)
+    campo.click()
+    page.keyboard.type("FICTÍCIA")
+    page.get_by_role("option").first.click()
+    page.locator(".linha.corpo").first.wait_for(timeout=120_000)
+    _no_celular(page)
+    page.locator(".rmc-tabela.estreita.modo-cartao").first.wait_for(timeout=30_000)
+    yield "pedido_topo", []
+    page.locator('[class*="st-key-pedido_filtros_celular"] button').click()
+    page.locator('[class*="st-key-pedido_cat_"] input').first.wait_for(state="visible", timeout=30_000)
+    _estabilizar(page)
+    page.mouse.move(1, 1)
+    yield "pedido_filtros", []
+    page.locator('[class*="st-key-pedido_filtros_celular"] button').click()
+    page.locator('[class*="st-key-pedido_cat_"] input').first.wait_for(state="hidden", timeout=30_000)
+    _estabilizar(page)
+    # Rolando para baixo, o rodapé some (opção B); voltando um pouco, ele reaparece.
+    _rolar(page, 700)
+    page.wait_for_function("document.body.classList.contains('rmc-rolando-baixo')", timeout=10_000)
+    page.wait_for_timeout(400)
+    yield "pedido_lista", []
+    _rolar(page, -200)
+    page.wait_for_function("!document.body.classList.contains('rmc-rolando-baixo')", timeout=10_000)
+    page.wait_for_timeout(400)
+    yield "pedido_rodape", []
+    page.locator(".cel.botao.so-celular button").first.click()
+    page.get_by_role("dialog").get_by_text("Mín./Ideal", exact=False).first.wait_for(timeout=30_000)
+    _estabilizar(page)
+    yield "pedido_detalhe", []
+    page.keyboard.press("Escape")
+    page.locator(_DIALOGO).wait_for(state="detached", timeout=30_000)
+    page.locator('[class*="st-key-pedido_mais"] button').first.click()
+    page.get_by_role("button", name="Descartar alterações").last.wait_for(state="visible", timeout=30_000)
+    _estabilizar(page)
+    yield "pedido_mais", []
+    page.keyboard.press("Escape")
+    _rolar(page, -20000)
+
+    # Dashboard: as três páginas, no topo e na tabela de produtos.
+    for pagina, tela, titulo, nome in (("estoque", "dashboard-estoque", "Produtos críticos", "dashboard_estoque"),
+                                       ("ruptura", "dashboard-ruptura", "Produtos críticos", "dashboard_ruptura"),
+                                       ("compras", "dashboard-compras", "Produtos com compra não otimizada",
+                                        "dashboard_compras")):
+        _no_pc(page)
+        if not page.locator(f".st-key-nav_dashboard_{pagina} button").is_visible():
+            page.locator(".st-key-nav_dashboard button").click()
+        page.locator(f".st-key-nav_dashboard_{pagina} button").click()
+        page.locator(f'[class*="st-key-tela-{tela}"]').first.wait_for(timeout=60_000)
+        page.locator(".linha.corpo").first.wait_for(timeout=120_000)
+        _no_celular(page)
+        yield nome, []
+        _ate(page, titulo)
+        yield f"{nome}_produtos", []
+        _rolar(page, -20000)
 
 
 def _telas_pronto(page, url):
@@ -634,6 +764,8 @@ VAO_DIFERENCA_MAX_PX = 8
 # 16 px e mesmo assim sobrava um buraco visível entre "Responsável" e
 # "Produtos" (a primeira versão desta checagem passou nela — 25/09/2026).
 _JS_TABELAS = r"""quadros => quadros.map(quadro => {
+  // Cartões do celular (29/10/2026): não há colunas, nem vãos — o que vale para eles está em _JS_EIXOS.
+  if (quadro.closest('.rmc-tabela.estreita.modo-cartao')) return {titulos: [], vaos: [], quebrados: []};
   const linhas = [...quadro.children].filter(l => l.classList.contains('linha'));
   const ncol = linhas.length ? linhas[0].children.length : 0;
   const extensao = Array.from({length: ncol}, () => [Infinity, -Infinity]);
@@ -697,6 +829,32 @@ _JS_EIXOS = r"""(larguraMax) => {
     return r;
   };
   for (const quadro of document.querySelectorAll('.rmc-tabela .quadro')) {
+    if (quadro.closest('.rmc-tabela.estreita.modo-cartao')) {
+      // Cartões do celular (29/10/2026): o cartão inteiro dentro da tela, nenhuma célula vazando, etiqueta numa
+      // linha e o botão de detalhe sem cobrir o nome.
+      const t = {nome: 'cartões', largura: quadro.getBoundingClientRect().width, larguraMax, vazam: [], eixoX: [],
+                 eixoY: [], selos: []};
+      for (const l of [...quadro.children].filter(l => l.classList.contains('corpo') && l.offsetParent !== null)) {
+        const nome = l.innerText.trim().split('\n')[0].slice(0, 30);
+        const r = l.getBoundingClientRect();
+        if (r.right > innerWidth + 1 || l.scrollWidth > l.clientWidth + 1) t.vazam.push(`cartão ${nome}`);
+        [...l.children].forEach(cel => {
+          if (cel.offsetParent !== null && cel.scrollWidth > cel.clientWidth + 1)
+            t.vazam.push(`${cel.dataset.rotulo || 'célula'}: ${cel.innerText.trim().slice(0, 30)}`);
+        });
+        const botao = l.querySelector('.cel.botao button'), titulo = l.querySelector('.cel[data-papel="titulo"]');
+        if (botao && titulo && botao.offsetParent !== null) {
+          const cb = botao.getBoundingClientRect(), ct = caixa(titulo);
+          if (ct && ct.r > cb.left && ct.t < cb.bottom && ct.b > cb.top) t.eixoX.push(`botão cobre o nome: ${nome}`);
+        }
+        l.querySelectorAll('[class*="selo-"]').forEach(s => {
+          const alt = parseFloat(getComputedStyle(s).lineHeight) || 16;
+          if (s.offsetParent !== null && s.getBoundingClientRect().height > alt * 1.6) t.selos.push(s.innerText.trim());
+        });
+      }
+      out.tabelas.push(t);
+      continue;
+    }
     const linhas = [...quadro.children].filter(l => l.classList.contains('linha') && l.offsetParent !== null);
     if (linhas.length < 2) continue;
     const cab = linhas[0], corpo = linhas.slice(1);
@@ -891,8 +1049,26 @@ def main() -> int:
                 page.close()
             navegador.close()
 
+    def volta_celular(url: str, atualizar: bool, token: str) -> None:
+        with sync_playwright() as p:
+            navegador = p.chromium.launch()
+            page = navegador.new_page(viewport=CELULAR)
+            tela = "inicio"
+            try:
+                for tela, mascaras in _telas_celular(page, url, token):
+                    _estabilizar(page)
+                    _registrar(page, tela, CELULAR["width"], mascaras, atualizar,
+                               falhas_contrato, conferidos, falhas_visuais, falhas_layout)
+            except Exception as erro:
+                page.screenshot(path=str(RESULTADO / f"ERRO_depois_de_{tela}_{CELULAR['width']}.png"))
+                raise RuntimeError(f"Roteiro do celular parou depois da tela '{tela}': {erro}") from erro
+            navegador.close()
+
     try:
         volta(_telas, url, args.atualizar)
+        # Celular (etapa 6, 29/10/2026): com o mesmo app e o mesmo banco (os pop-ups ao abrir a loja já foram
+        # respondidos na volta de 1280 px).
+        volta_celular(url, args.atualizar, _token_de_ativacao(env))
     finally:
         app.terminate()
         app.wait(timeout=30)  # solta o visual.db antes da próxima execução

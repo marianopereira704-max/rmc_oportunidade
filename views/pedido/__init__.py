@@ -47,6 +47,7 @@ Arquivos (28/10/2026 — o pedido.py único tinha 1.130 linhas):
 """
 from __future__ import annotations
 
+import datetime as dt
 import html
 
 import pandas as pd
@@ -69,12 +70,13 @@ from views.pedido.estado import (
     _ORDEM_PADRAO,
     _atualizar_area,
     _avisar_uma_vez,
+    _concluir,
     _estado_loja,
     _notificar,
 )
 from views.pedido.filtros import _linha_filtros
 from views.pedido.formato import _hora_local
-from views.pedido.tabela_pedido import _colunas, _indicadores, _linha
+from views.pedido.tabela_pedido import _colunas, _dialog_detalhe, _indicadores, _linha
 
 def render() -> None:
     with theme.tela("pedido"):
@@ -228,7 +230,14 @@ def _render() -> None:
         vazio=("Nenhum produto para pedir", "O estoque desta loja cobre o ideal de todos os produtos com esses filtros"),
         densa=True, ao_editar=_editar,
         selecao=dict(zip(fatia["linha"], fatia["selecionado"])), ao_marcar=_marcar,
+        # Celular (29/10/2026): um cartão por produto e o detalhe num toque (views/tabela.py).
+        celular="cartao", detalhe_celular="Ver detalhes",
     )
+    clicada = tb.acao_clicada(f"{_KEY}_tabela")
+    if clicada is not None:
+        escolhida = fatia[fatia["linha"] == clicada]
+        if not escolhida.empty:
+            _dialog_detalhe(escolhida.iloc[0].to_dict(), p)
     if not linhas.empty:
         ui.controles_paginacao(pagina, _KEY)
 
@@ -242,28 +251,71 @@ def _rodape(loja: dict, usuario: dict, pedido: pd.DataFrame, todas: pd.DataFrame
     já causou clique que não funcionava)."""
     marcados = pedido[pedido["selecionado"] & (pedido["quantidade"] > 0)]
     with st.container(key="rodape-pedido"):
-        # Botões na largura natural, alinhados à direita: em colunas iguais,
-        # "Descartar alterações" quebrava em 2 linhas em 1280 px (29/09/2026).
-        esq, dir_ = st.columns([1, 3.4], vertical_alignment="center")
-        if area.atualizado_em is not None:
-            # ✓ do mesmo tamanho e cinza-esverdeado apagado: diz "está salvo"
-            # sem chamar atenção (Q8 de 02/10/2026).
-            esq.markdown(f'<span class="rmc-muted"><span class="rmc-salvo">✓</span> Salvo automaticamente · '
-                         f'{_hora_local(area.atualizado_em)}</span>', unsafe_allow_html=True)
-        else:
-            esq.markdown('<span class="rmc-muted">Segue a sugestão</span>', unsafe_allow_html=True)
-        # "Ocultar giro baixo" saiu daqui pra linha de filtros (01/10/2026).
-        with dir_.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", gap="small"):
-            if st.button("Descartar alterações", key=f"{_KEY}_descartar", disabled=not area.itens,
-                         icon=":material/delete:"):
-                _dialog_descartar(loja, usuario, len(area.itens))
-            # "Listas (N)": o nº avisa, sem abrir nada, que já há pedido montado
-            # pra esta loja (era a função do botão do topo, que saiu).
-            if st.button(f"Listas ({len(listas)})" if listas else "Listas", key=f"{_KEY}_listas",
-                         icon=":material/list_alt:"):
-                _dialog_listas(loja, usuario, pedido, listas, area.lista_aberta_id, bool(area.itens))
-            # Habilitado mesmo sem marcados: "Só giro baixo" e "Tabela
-            # completa" não dependem da seleção (01/10/2026).
-            if st.button(f"Exportar selecionados ({ui.formatar_numero(len(marcados))})", key=f"{_KEY}_exportar",
-                         icon=":material/download:", type="primary", disabled=todas.empty):
-                _dialog_exportar(loja, pedido, todas, usuario)
+        # Duas versões, uma escondida por CSS (core/theme.py): no PC a de sempre; no celular (29/10/2026) só
+        # "Enviar pedido" e o "⋯" (Listas e Descartar) — três botões lado a lado não cabem.
+        with st.container(key="rodape-pc"):
+            _rodape_pc(loja, usuario, pedido, todas, area, listas, marcados)
+        with st.container(key="rodape-celular", horizontal=True, vertical_alignment="center", gap="small"):
+            _rodape_celular(loja, usuario, pedido, area, listas, marcados)
+
+
+def _rodape_celular(loja: dict, usuario: dict, pedido: pd.DataFrame, area, listas: list,
+                    marcados: pd.DataFrame) -> None:
+    from views import enviar_pedido
+    from views.pedido.dialogos import _excel
+
+    tabela = calculo.exportacao_envio(marcados)
+    codigo = loja.get("legacy_id") or "".join(ch for ch in (loja.get("cnpj") or "") if ch.isdigit())
+
+    def _enviado() -> None:
+        from integrations import pedido_area, pedido_rascunho
+
+        i = calculo.indicadores(marcados)
+        # Conta como exportação (decisão do Mariano): registro, aviso contra pedido duplicado e a lista encerrada.
+        with get_session() as session:
+            pedido_rascunho.registrar_exportacao(session, loja["id"], "Enviado", len(tabela), i.unidades,
+                                                 i.orcamento, usuario["nome"])
+            lista = pedido_area.ao_exportar(session, usuario["id"], loja["id"])
+        _concluir("success", "Pedido enviado" + (f"; a lista \"{lista}\" foi encerrada." if lista else "."))
+
+    enviar_pedido.botao(
+        f"{_KEY}_enviar", f"Enviar pedido ({ui.formatar_numero(len(marcados))})",
+        _excel({"Pedido": tabela}) if not tabela.empty else None,
+        f"pedido_{codigo}_{dt.date.today():%Y%m%d}.xlsx", f"Pedido — {loja.get('razao_social') or codigo}", _enviado)
+    # "Mais" com o ícone; a largura mínima vem do CSS (core/theme.py) — sem ela saía "M…" (29/10/2026).
+    with st.popover("Mais", icon=":material/more_horiz:", key=f"{_KEY}_mais"):
+        if st.button(f"Listas ({len(listas)})" if listas else "Listas", key=f"{_KEY}_listas_cel",
+                     icon=":material/list_alt:", use_container_width=True):
+            _dialog_listas(loja, usuario, pedido, listas, area.lista_aberta_id, bool(area.itens))
+        if st.button("Descartar alterações", key=f"{_KEY}_descartar_cel", disabled=not area.itens,
+                     icon=":material/delete:", use_container_width=True):
+            _dialog_descartar(loja, usuario, len(area.itens))
+
+
+def _rodape_pc(loja: dict, usuario: dict, pedido: pd.DataFrame, todas: pd.DataFrame, area, listas: list,
+               marcados: pd.DataFrame) -> None:
+    # Botões na largura natural, alinhados à direita: em colunas iguais,
+    # "Descartar alterações" quebrava em 2 linhas em 1280 px (29/09/2026).
+    esq, dir_ = st.columns([1, 3.4], vertical_alignment="center")
+    if area.atualizado_em is not None:
+        # ✓ do mesmo tamanho e cinza-esverdeado apagado: diz "está salvo"
+        # sem chamar atenção (Q8 de 02/10/2026).
+        esq.markdown(f'<span class="rmc-muted"><span class="rmc-salvo">✓</span> Salvo automaticamente · '
+                     f'{_hora_local(area.atualizado_em)}</span>', unsafe_allow_html=True)
+    else:
+        esq.markdown('<span class="rmc-muted">Segue a sugestão</span>', unsafe_allow_html=True)
+    # "Ocultar giro baixo" saiu daqui pra linha de filtros (01/10/2026).
+    with dir_.container(horizontal=True, horizontal_alignment="right", vertical_alignment="center", gap="small"):
+        if st.button("Descartar alterações", key=f"{_KEY}_descartar", disabled=not area.itens,
+                     icon=":material/delete:"):
+            _dialog_descartar(loja, usuario, len(area.itens))
+        # "Listas (N)": o nº avisa, sem abrir nada, que já há pedido montado
+        # pra esta loja (era a função do botão do topo, que saiu).
+        if st.button(f"Listas ({len(listas)})" if listas else "Listas", key=f"{_KEY}_listas",
+                     icon=":material/list_alt:"):
+            _dialog_listas(loja, usuario, pedido, listas, area.lista_aberta_id, bool(area.itens))
+        # Habilitado mesmo sem marcados: "Só giro baixo" e "Tabela
+        # completa" não dependem da seleção (01/10/2026).
+        if st.button(f"Exportar selecionados ({ui.formatar_numero(len(marcados))})", key=f"{_KEY}_exportar",
+                     icon=":material/download:", type="primary", disabled=todas.empty):
+            _dialog_exportar(loja, pedido, todas, usuario)

@@ -100,6 +100,13 @@ class ColunaTabela:
     numerica: bool = False  # 1º clique: número do maior pro menor, texto de A a Z
     dica: str | None = None  # "?" ao lado do título, com esta explicação
     icone: str | None = None  # ícone à esquerda do conteúdo de cada célula: "local" | "pessoa"
+    # Celular (29/10/2026, etapa 6): onde a coluna aparece quando a tabela fica estreita e a tela pediu
+    # `celular=` em `tabela()`. "titulo" (nome no topo do cartão), "etiquetas", "dado" (rótulo + valor, meia
+    # largura), "dado_largo", "acao" (a quantidade, embaixo à esquerda), "destaque" (o número principal, embaixo à
+    # direita) ou None (só no PC). No modo "tabela" (poucas colunas), qualquer papel = a coluna fica.
+    celular: str | None = "dado"
+    rotulo_celular: str | None = None  # o rótulo no cartão, quando difere do título da coluna
+    ordem_celular: int = 0             # a ordem dos dados no cartão (menor primeiro); 0 = a da tabela
     id: str = field(default="")
 
     def __post_init__(self) -> None:
@@ -316,6 +323,69 @@ button.titulo:focus-visible { outline: 2px solid var(--navy, #17375E); outline-o
 .abrir[aria-expanded="true"] svg { transform: rotate(180deg); }
 @media (prefers-reduced-motion: reduce) { .linha.corpo.clicavel > .cel { transition: none; } }
 
+/* === CELULAR (29/10/2026, etapa 6) — só com `celular=` na tabela e a tabela estreita (classe "estreita", posta
+   pelo JS abaixo de 600 px de largura). No PC nada daqui vale: o que é só do celular nasce com display: none, e
+   elemento escondido não ocupa coluna do grid. === */
+.so-celular, .passo { display: none; }
+.estreita .so-pc { display: none; }
+.estreita .cel > div.so-celular { display: block; }
+.estreita span.so-celular { display: inline; }
+
+/* Modo "tabela": só as colunas com papel, em vãos menores. */
+.estreita.modo-tabela .quadro { grid-template-columns: var(--colunas-celular); column-gap: var(--esp-3, 12px); }
+.estreita.modo-tabela .linha { padding-left: var(--esp-3, 12px); padding-right: var(--esp-3, 12px); }
+.estreita.modo-tabela .cel[data-papel="fora"] { display: none; }
+
+/* Modo "cartão": um cartão por linha. O cartão é o resumo; o botão do canto abre o detalhe. */
+.estreita.modo-cartao .quadro { display: flex; flex-direction: column; gap: var(--esp-2, 8px); border: 0;
+  background: transparent; }
+.estreita.modo-cartao .linha.cabecalho { display: none; }
+.estreita.modo-cartao .linha.corpo {
+  /* Sem vão entre as duas colunas: a linha que separa a quantidade e o subtotal sai inteira (com vão, picotava). */
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--esp-2, 8px) 0;
+  position: relative; padding: var(--esp-3, 12px); border: 1px solid var(--borda, #E4E7EB);
+  border-radius: var(--raio-lg, 12px); background: #FFFFFF;
+}
+.estreita.modo-cartao .linha.corpo:hover { background: #FFFFFF; }
+.estreita.modo-cartao .linha.corpo.com-marca { padding-left: 48px; }
+.estreita.modo-cartao .linha.corpo.com-botao > .cel[data-papel="titulo"] { padding-right: 40px; }
+.estreita.modo-cartao .cel { order: var(--ordem, 30); text-align: left; white-space: normal; justify-self: stretch; }
+.estreita.modo-cartao .cel[data-papel="fora"] { display: none; }
+.estreita.modo-cartao .cel[data-papel="titulo"] { grid-column: 1 / -1; order: 1; font-size: 15px; }
+.estreita.modo-cartao .cel[data-papel="etiquetas"] { grid-column: 1 / -1; order: 2; }
+.estreita.modo-cartao .cel[data-papel="dado_largo"] { grid-column: 1 / -1; }
+.estreita.modo-cartao .cel[data-papel="dado"]::before,
+.estreita.modo-cartao .cel[data-papel="dado_largo"]::before,
+.estreita.modo-cartao .cel[data-papel="destaque"]::before {
+  content: attr(data-rotulo); display: block; font-size: var(--fs-min, 12px); color: var(--texto-suporte, #3F4750);
+}
+.estreita.modo-cartao .cel[data-papel="acao"] { order: 90; align-self: end; }
+.estreita.modo-cartao .cel[data-papel="destaque"] { order: 91; text-align: right; align-self: end; grid-column: 2; }
+.estreita.modo-cartao .cel[data-papel="destaque"] > div:first-of-type { font-size: 16px; font-weight: 700; color: var(--navy, #17375E); }
+.estreita.modo-cartao .cel[data-papel="dado"] { padding-right: var(--esp-2, 8px); }
+/* Uma linha só, acima da quantidade e do subtotal (a linha em cima de cada dado ficava picotada). */
+.estreita.modo-cartao .cel[data-papel="acao"],
+.estreita.modo-cartao .cel[data-papel="destaque"] { padding-top: var(--esp-2, 8px); border-top: 1px solid #EEF0F3; }
+/* Cartão sem quantidade (Por Produto): o destaque na linha inteira, alinhado à direita, com a linha inteira em cima. */
+.estreita.modo-cartao .linha.corpo:not(:has(.cel[data-papel="acao"])) > .cel[data-papel="destaque"] { grid-column: 1 / -1; }
+.estreita.modo-cartao .pilha > span { display: inline-block; margin: 0 4px 4px 0; }
+.estreita.modo-cartao .pilha > span + span { margin-top: 0; }
+.estreita.modo-cartao .cel.sel { position: absolute; left: 12px; top: 14px; }
+.estreita.modo-cartao .marca { width: 22px; height: 22px; }
+.estreita.modo-cartao .cel.botao.so-celular { display: block; position: absolute; right: 8px; top: 8px; }
+.estreita.modo-cartao .cel.botao:not(.so-celular) { position: absolute; right: 8px; top: 8px; }
+.estreita.modo-cartao .acao { width: 36px; height: 36px; }
+/* Quantidade com − e + (dedo): botões de 44 px; o campo continua digitável. */
+.estreita.modo-cartao .passo { display: inline-flex; align-items: center; justify-content: center; width: 44px; height: 44px;
+  padding: 0; border: 1px solid var(--borda, #E4E7EB); background: var(--fundo-card, #F7F8FA);
+  color: var(--navy, #17375E); font: inherit; font-size: 20px; cursor: pointer; }
+.estreita.modo-cartao .passo.menos { border-radius: 10px 0 0 10px; }
+.estreita.modo-cartao .passo.mais { border-radius: 0 10px 10px 0; }
+.estreita.modo-cartao .entrada { height: 44px; width: 56px; border-radius: 0; border-left: 0; border-right: 0;
+  text-align: center; font-size: 16px; }
+.estreita.modo-cartao .com-passos { display: inline-flex; align-items: center; }
+/* === FIM DO CELULAR === */
+
 /* Estado vazio */
 .vazio { padding: var(--esp-6, 32px) var(--esp-4, 16px); text-align: center; }
 .vazio .selo {
@@ -361,7 +431,7 @@ function el(tag, classe, texto) {
   return e;
 }
 
-function campoEntrada(p, aoEditar) {
+function campoEntrada(p, aoEditar, passos) {
   const campo = el("input", "entrada " + (p.c || ""));
   campo.type = "number"; campo.min = "0"; campo.step = "1"; campo.inputMode = "numeric";
   campo.value = String(p.entrada);
@@ -370,17 +440,39 @@ function campoEntrada(p, aoEditar) {
   campo.onkeydown = (ev) => { if (ev.key === "Enter") campo.blur(); };
   campo.onchange = () => { if (campo.value !== original) aoEditar(campo.value); };
   if (p.dica) campo.title = p.dica;
-  return campo;
+  if (!passos) return campo;
+  // Celular: − e + em volta do campo (escondidos no PC). Toques seguidos somam na tela e gravam UMA vez, 0,7 s
+  // depois do último — cada gravação roda a página de novo.
+  const grupo = el("span", "com-passos");
+  let espera = null;
+  const passo = (classe, texto, rotulo, delta) => {
+    const b = el("button", "passo " + classe, texto);
+    b.type = "button";
+    b.setAttribute("aria-label", rotulo);
+    b.onclick = () => {
+      campo.value = String(Math.max(0, (parseInt(campo.value, 10) || 0) + delta));
+      clearTimeout(espera);
+      espera = setTimeout(() => { if (campo.value !== original) aoEditar(campo.value); }, 700);
+    };
+    return b;
+  };
+  grupo.append(passo("menos", "−", "Diminuir a quantidade", -1), campo, passo("mais", "+", "Aumentar a quantidade", 1));
+  return grupo;
 }
 
-function montarCelula(linhas, aoEditar) {
+const so = (linha, classe) => linha.length && linha.every(p => (" " + (p.c || "") + " ").includes(" " + classe + " "));
+
+function montarCelula(linhas, aoEditar, passos) {
   const frag = document.createDocumentFragment();
   for (const linha of (linhas || [])) {
     const div = el("div");
     if (linha.length && linha[0].pilha) div.className = "pilha";
+    // Linha só do celular (ou só do PC): a linha inteira some, não só o texto — senão sobrava o vão entre linhas.
+    if (so(linha, "so-celular")) div.classList.add("so-celular");
+    if (so(linha, "so-pc")) div.classList.add("so-pc");
     linha.forEach((p, i) => {
-      if (i && !div.className) div.appendChild(document.createTextNode(" "));
-      if (p.entrada !== undefined && aoEditar) { div.appendChild(campoEntrada(p, aoEditar)); return; }
+      if (i && !div.classList.contains("pilha")) div.appendChild(document.createTextNode(" "));
+      if (p.entrada !== undefined && aoEditar) { div.appendChild(campoEntrada(p, aoEditar, passos)); return; }
       const span = el("span", p.c || "", p.t);
       if (p.dica) { span.dataset.dica = p.dica; span.classList.add("dica-acima"); }
       div.appendChild(span);
@@ -414,6 +506,29 @@ export default function (component) {
   };
   raiz.style.setProperty("--colunas", trilhas.join(" "));
   raiz.classList.toggle("densa", !!data.densa);
+  // Celular (29/10/2026): o modo que a tela pediu e, abaixo de 600 px de largura, a classe "estreita" — pela
+  // largura da PRÓPRIA tabela (o pop-up de detalhe no celular também é estreito). Sem `celular`, nada muda.
+  const modo = data.celular || null;
+  raiz.classList.toggle("modo-cartao", modo === "cartao");
+  raiz.classList.toggle("modo-tabela", modo === "tabela");
+  const doCelular = colunas.filter(c => c.celular).map(c => c.largura || "auto");
+  if (selecao) doCelular.unshift("auto");
+  if (data.acao) doCelular.push("auto");
+  if (linhas.some(l => l.filhos)) doCelular.push("auto");
+  raiz.style.setProperty("--colunas-celular", doCelular.join(" "));
+  const medir = () => raiz.classList.toggle("estreita", !!modo && raiz.getBoundingClientRect().width < 600);
+  if (!raiz.__observador) {
+    raiz.__observador = new ResizeObserver(() => raiz.__medir && raiz.__medir());
+    raiz.__observador.observe(raiz);
+  }
+  raiz.__medir = medir;
+  medir();
+  const papel = (cel, c) => {
+    cel.dataset.papel = c.celular || "fora";
+    cel.dataset.rotulo = c.rotulo_celular || c.rotulo;
+    if (c.ordem_celular) cel.style.setProperty("--ordem", String(c.ordem_celular));
+  };
+  const detalheCelular = !data.acao && data.detalhe_celular ? data.detalhe_celular : null;
 
   const quadro = el("div", "quadro");
   quadro.setAttribute("role", "table");
@@ -455,9 +570,12 @@ export default function (component) {
   for (const c of colunas) {
     const cel = el("div", "cel" + (c.direita ? " direita" : "") + (c.centro ? " centro" : ""));
     cel.setAttribute("role", "columnheader");
+    papel(cel, c);
     const ativa = data.ordem && data.ordem[0] === c.campo;
     const titulo = el(c.campo ? "button" : "span", "titulo");
-    titulo.appendChild(el("span", "", c.rotulo));
+    titulo.appendChild(el("span", c.rotulo_celular ? "so-pc" : "", c.rotulo));
+    // Título curto no celular (modo "tabela"): "Estoque a preço de compra" não cabe em 390 px.
+    if (c.rotulo_celular) titulo.appendChild(el("span", "so-celular", c.rotulo_celular));
     if (c.campo) {
       titulo.type = "button";
       titulo.appendChild(svg(ativa && data.ordem[1] ? SETA_CIMA : SETA_BAIXO, "seta" + (ativa ? " ativa" : "")));
@@ -473,7 +591,7 @@ export default function (component) {
       // Colado no texto (entre o título e a seta); passar o mouse mostra a
       // dica, clicar nele não ordena.
       ajuda.onclick = (ev) => ev.stopPropagation();
-      titulo.firstChild.after(ajuda);
+      (c.rotulo_celular ? titulo.children[1] : titulo.firstChild).after(ajuda);
     }
     cab.appendChild(cel);
   }
@@ -485,6 +603,8 @@ export default function (component) {
   for (const l of linhas) {
     const linha = el("div", "linha corpo" + (l.classe ? " " + l.classe : ""));
     linha.setAttribute("role", "row");
+    if (selecao) linha.classList.add("com-marca");
+    if (data.acao || detalheCelular) linha.classList.add("com-botao");
     elementos.set(String(l.id), linha);
     if (l.pai != null) {
       linha.classList.add("sub");
@@ -522,6 +642,7 @@ export default function (component) {
     colunas.forEach((c, ic) => {
       const cel = el("div", "cel" + (c.direita ? " direita" : "") + (c.centro ? " centro" : ""));
       cel.setAttribute("role", "cell");
+      papel(cel, c);
       if (ic === 0 && l.nivel) cel.style.paddingLeft = (l.nivel * 20) + "px";
       if (c.icone && ICONES_CEL[c.icone]) {
         cel.classList.add("com-icone");
@@ -530,10 +651,23 @@ export default function (component) {
         texto.appendChild(montarCelula(l.celulas[c.id]));
         cel.appendChild(texto);
       } else {
-        cel.appendChild(montarCelula(l.celulas[c.id], (valor) => setTriggerValue("editar", { id: l.id, valor })));
+        cel.appendChild(montarCelula(l.celulas[c.id], (valor) => setTriggerValue("editar", { id: l.id, valor }),
+                                     modo === "cartao"));
       }
       linha.appendChild(cel);
     });
+    if (detalheCelular) {
+      // Detalhe só do celular (o Assistente no PC mostra tudo na linha e nas dicas; no celular não há "passar o
+      // mouse"). display: none no PC: não ocupa coluna do grid.
+      const cel = el("div", "cel botao so-celular");
+      const botao = el("button", "acao");
+      botao.type = "button";
+      botao.setAttribute("aria-label", detalheCelular);
+      botao.appendChild(svg(SETA_DIREITA));
+      botao.onclick = () => setTriggerValue("acao", l.id);
+      cel.appendChild(botao);
+      linha.appendChild(cel);
+    }
     if (data.acao) {
       const cel = el("div", "cel botao");
       const botao = el("button", "acao dica-esquerda");
@@ -600,6 +734,8 @@ def tabela(
     ao_marcar: Callable[[dict[str, bool]], None] | None = None,
     selecao_linhas: list[str] | None = None,
     ao_clicar_linha: Callable[[str, bool], None] | None = None,
+    celular: str | None = None,
+    detalhe_celular: str | None = None,
 ) -> None:
     """Desenha a tabela.
 
@@ -620,7 +756,12 @@ def tabela(
     False` (o total) não clica nem apaga; `"classe": "total"` a deixa em negrito.
     Linhas que abrem (26/10/2026): `"filhos": True` põe a setinha no fim da linha; a linha com `"pai": id` fica
     escondida até o pai (e os avós) estarem abertos, recuada `"nivel"` × 20 px; com `"grupo": id`, ela apaga junto
-    quando há seleção e o grupo não está nela. Abrir e fechar não roda o script."""
+    quando há seleção e o grupo não está nela. Abrir e fechar não roda o script.
+    Celular (29/10/2026, etapa 6): `celular="cartao"` (um cartão por linha, com os papéis de `ColunaTabela.celular`)
+    ou `"tabela"` (só as colunas com papel), quando a tabela fica abaixo de 600 px; None = como sempre.
+    `detalhe_celular`: dica do botão de detalhe que só aparece no cartão (a tabela sem `acao`); o clique chega por
+    `acao_clicada`, como o botão de sempre. Pedaço com a classe "so-celular" só aparece no cartão; "so-pc", só fora
+    dele."""
     por_campo = {c.campo: c for c in colunas if c.campo}
 
     def _ordenar() -> None:
@@ -653,9 +794,12 @@ def tabela(
         data={
             "colunas": [
                 {"id": c.id, "campo": c.campo, "rotulo": c.rotulo, "largura": c.largura,
-                 "direita": c.direita, "centro": c.centro, "dica": c.dica, "icone": c.icone}
+                 "direita": c.direita, "centro": c.centro, "dica": c.dica, "icone": c.icone,
+                 "celular": c.celular, "rotulo_celular": c.rotulo_celular, "ordem_celular": c.ordem_celular}
                 for c in colunas
             ],
+            "celular": celular,
+            "detalhe_celular": detalhe_celular,
             "linhas": linhas,
             "ordem": list(ordem),
             "acao": acao,

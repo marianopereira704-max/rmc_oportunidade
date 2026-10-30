@@ -490,6 +490,16 @@ def exportacao(linhas: pd.DataFrame) -> pd.DataFrame:
     return saida
 
 
+def exportacao_envio(linhas: pd.DataFrame) -> pd.DataFrame:
+    """"Enviar pedido" do celular (29/10/2026, decisão do Mariano): o Excel que vai pelo WhatsApp ou e-mail para
+    quem compra — EAN, PRODUTO e QUANTIDADE, uma linha por produto, com o EAN principal (o genérico com vários EANs
+    leva o dele). Só itens com quantidade > 0."""
+    df = linhas[linhas["quantidade"] > 0]
+    eans = [p if isinstance(p, str) and p else (e[0] if len(e) else "") for p, e in zip(df["ean_principal"], df["eans"])]
+    return pd.DataFrame({"EAN": eans, "PRODUTO": df["nome"].to_numpy(),
+                         "QUANTIDADE": df["quantidade"].astype(int).to_numpy()})
+
+
 def _colunas_ean(df: pd.DataFrame, saida: pd.DataFrame) -> pd.DataFrame:
     maximo = max([len(e) for e in df["eans"]] + [1])
     for i in range(maximo):

@@ -44,10 +44,21 @@ def _linha_filtros(loja_id: int, todas: pd.DataFrame) -> tuple[str | None, tuple
     base = f"{_KEY}_status_{loja_id}"
     ja_escolhidos = st.session_state.get(f"{base}_valor", [])
     status = [t for t in calculo.TAGS_STATUS if t in set(calculo.opcoes_status(listadas)) | set(ja_escolhidos)]
+    # Celular (29/10/2026, decidido pelo Mariano): a busca fica à vista e o resto abre no botão "Filtros" (com o
+    # número dos que estão em uso). No PC o botão fica escondido por CSS e a linha é a de sempre — os campos são
+    # os MESMOS (um widget não pode aparecer duas vezes): o botão só mostra ou esconde, pelo marcador abaixo.
+    em_uso = sum(bool(st.session_state.get(k)) for k in (
+        f"{_KEY}_cat_{loja_id}", f"{_KEY}_fab_{loja_id}", f"{base}_{st.session_state.get(f'{base}_v', 0)}"))
+    aberto_chave = f"{_KEY}_filtros_abertos"
     with st.container(key="pedido-filtros-linha", horizontal=True, vertical_alignment="center", gap="small"):
         busca = st.text_input("Buscar", placeholder="Buscar produto, EAN ou fabricante", key=f"{_KEY}_busca",
                               icon=":material/search:",
                               label_visibility="collapsed")
+        st.button(f"Filtros ({em_uso})" if em_uso else "Filtros", key=f"{_KEY}_filtros_celular",
+                  icon=":material/tune:",
+                  on_click=lambda: st.session_state.update({aberto_chave: not st.session_state.get(aberto_chave)}))
+        if st.session_state.get(aberto_chave):
+            st.markdown('<span class="rmc-filtros-abertos"></span>', unsafe_allow_html=True)
         escolhidas = st.multiselect("Categoria", categorias, placeholder="Categoria", key=f"{_KEY}_cat_{loja_id}",
                                     label_visibility="collapsed")
         tags = st.multiselect("Status", status, default=ja_escolhidos, placeholder="Status", format_func=rotulo_status,

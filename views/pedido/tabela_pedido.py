@@ -1,12 +1,15 @@
 """Assistente de pedido: colunas, células e dicas da tabela, e os 4 cards do pedido inteiro."""
 from __future__ import annotations
 
+import html
+
 import pandas as pd
 import streamlit as st
 
 from core import dicas, revisar, theme, ui
 from pedido import calculo
 from pedido import categorias as cat
+from views import popups
 from views import tabela as tb
 from views.pedido.avisos import _dialog_saiba_mais
 from views.pedido.estado import _KEY
@@ -15,40 +18,44 @@ from views.pedido.formato import _data, _moeda, _numero
 def _colunas(p: calculo.Parametros) -> list[tb.ColunaTabela]:
     # Laboratório embaixo do produto e Mín./Máx. numa coluna só: abrem espaço
     # pra seleção, Status e Subtotal caberem em 1280 px (Q7 de 29/09/2026).
+    # Celular (29/10/2026, decidido pelo Mariano): o cartão leva nome, etiquetas, Estoque, Mín./Ideal, "vendeu em
+    # 90 dias", a última compra com data e fornecedor, a quantidade e o subtotal; a Curva vai para o detalhe.
     return [
         # Produto até 150 px e sem "?" em Curva/Subtotal: com seleção, Status e
         # Subtotal a tabela passava 48 px da borda em 1280 px (29/09/2026).
-        tb.ColunaTabela("nome", "Produto", "fit-content(150px)"),
+        tb.ColunaTabela("nome", "Produto", "fit-content(150px)", celular="titulo"),
         # "auto" + tags sempre empilhadas: a coluna fica da largura da maior
         # tag. Com fit-content(140px) e 2 tags lado a lado que não cabiam, a
         # coluna ficava ~30 px mais larga que o texto e o vão visível até a
         # Curva saía desigual no teste visual (29/09/2026).
-        tb.ColunaTabela(None, "Status", id="status"),
+        tb.ColunaTabela(None, "Status", id="status", celular="etiquetas"),
         # Curva sem "?" no título (29/10/2026, de novo): o "?" alargava a coluna ~20 px e, em 1280 px, a tabela
         # deixava de caber (o nome do produto quebrava em 2 linhas; teste visual). A explicação fica na própria
         # letra de cada linha (`_DICA_CURVA`).
-        tb.ColunaTabela("curva", "Curva"),
+        tb.ColunaTabela("curva", "Curva", celular=None),
         # Dicas (02/10/2026): frases curtas, um parágrafo por ideia ("\n\n"),
         # e "sistema de vendas" no lugar de "GPS" — é lá que a loja corrige.
         tb.ColunaTabela("preco", "Última compra", direita=True, numerica=True,
-                        dica="A compra mais recente, por unidade e sem ST. Bonificações não entram."),
+                        dica="A compra mais recente, por unidade e sem ST. Bonificações não entram.",
+                        celular="dado_largo", ordem_celular=40),
         # "Venda 90 dias" no lugar de "Demanda/dia" (01/10/2026): "vendeu 15
         # em 90 dias" se entende; "0,17 por dia" parecia contradizer a
         # sugestão. Só exibição — a sugestão segue a demanda da janela.
         # Quantidades centralizadas e dinheiro à direita (Q6 de 02/10/2026).
         tb.ColunaTabela("venda_90d", "Venda 90 dias", centro=True, numerica=True,
                         dica="Unidades vendidas nos últimos 90 dias.\n\nA sugestão usa a média por dia de todo "
-                             "o período de vendas."),
+                             "o período de vendas.", rotulo_celular="Vendeu em 90 dias", ordem_celular=33),
         # "Ideal" no lugar de "Máx." (02/10/2026): é onde o estoque deve chegar.
         # "Mínimo / Ideal" por extenso (29/10/2026) passava ~30 px e a tabela deixava de caber em 1280 px (teste
         # visual): o título fica "Mín./Ideal"; a dica, por extenso.
         tb.ColunaTabela("estoque_max", "Mín./Ideal", centro=True, numerica=True,
                         dica=f"Mínimo: estoque para {p.dias_ruptura} dias de venda; abaixo disso, vai faltar."
-                             "\n\nIdeal: quanto ter depois do pedido."),
-        tb.ColunaTabela("estoque", "Estoque", centro=True, numerica=True),
+                             "\n\nIdeal: quanto ter depois do pedido.", ordem_celular=32),
+        tb.ColunaTabela("estoque", "Estoque", centro=True, numerica=True, ordem_celular=31),
         tb.ColunaTabela("quantidade", "Sugestão", centro=True, numerica=True,
-                        dica="A quantidade do pedido. Digite outro número para mudar.\n\nEm azul: alterada à mão."),
-        tb.ColunaTabela("subtotal", "Subtotal", direita=True, numerica=True),
+                        dica="A quantidade do pedido. Digite outro número para mudar.\n\nEm azul: alterada à mão.",
+                        celular="acao"),
+        tb.ColunaTabela("subtotal", "Subtotal", direita=True, numerica=True, celular="destaque"),
     ]
 
 
@@ -96,9 +103,14 @@ def _celula_produto(r: dict) -> list:
     # célula — a busca continua achando por eles e a exportação leva os EANs.
     linhas = [tb.pedaco(r["nome"], "forte quebra")]
     if r["categoria"]:
-        categoria = r["categoria"]
-        linhas.append(tb.pedaco(categoria.capitalize() if categoria.isupper() else categoria, "aux"))
+        # No cartão do celular a categoria sai (29/10/2026): o filtro Categoria cobre, e o cartão fica mais curto.
+        linhas.append(tb.pedaco(_categoria(r), "aux so-pc"))
     return tb.celula(*linhas)
+
+
+def _categoria(r: dict) -> str:
+    categoria = r["categoria"] or ""
+    return categoria.capitalize() if categoria.isupper() else categoria
 
 
 # Nome que a etiqueta mostra na tela, quando difere do valor interno (29/10/2026, textos em linguagem de dono de
@@ -180,21 +192,32 @@ def _dica_custo_ajustado(r: dict) -> str:
             "cadastro no sistema de vendas.")
 
 
+def _fornecedor(r: dict) -> str | None:
+    f = r.get("compra_fornecedor")
+    return " ".join(f.split()) if isinstance(f, str) and f.strip() else None
+
+
+def _dica_compra(r: dict) -> str | None:
+    """A dica da Última compra — também o texto do detalhe do celular (lá não há "passar o mouse")."""
+    partes_dica = []
+    if r["preco_origem"] == "compra":
+        partes_dica.append(
+            f"Última compra: {_moeda(r['compra_vlr_unitario'])} por embalagem de {_numero(r['compra_fracao'])} un., "
+            f"desconto de {_numero(r['compra_vlr_desconto'] or 0, 2)}%.")
+        if _fornecedor(r):
+            partes_dica.append(f"Fornecedor: {_fornecedor(r)}.")
+        partes_dica.append("No pedido, o preço é por unidade, sem ST.")
+    if r.get("custo_ajustado"):
+        partes_dica.append(_dica_custo_ajustado(r))
+    return "\n\n".join(partes_dica) or None
+
+
 def _celula_compra(r: dict) -> list:
     """Preço e data (desde 02/10/2026, sem etiquetas): "A revisar" foi pra
     coluna Status, "custo ajustado" vai na dica do preço e da data, e preço
-    de cadastro/bonificação viram texto miúdo — são detalhe, não decisão."""
-    partes_dica = []
-    if r["preco_origem"] == "compra":
-        fornecedor = (f"\n\nFornecedor: {' '.join(r['compra_fornecedor'].split())}."
-                      if isinstance(r["compra_fornecedor"], str) and r["compra_fornecedor"].strip() else "")
-        partes_dica.append(
-            f"Última compra: {_moeda(r['compra_vlr_unitario'])} por embalagem de {_numero(r['compra_fracao'])} un., "
-            f"desconto de {_numero(r['compra_vlr_desconto'] or 0, 2)}%.{fornecedor}\n\nNo pedido, o preço é por "
-            "unidade, sem ST.")
-    if r.get("custo_ajustado"):
-        partes_dica.append(_dica_custo_ajustado(r))
-    dica = "\n\n".join(partes_dica) or None
+    de cadastro/bonificação viram texto miúdo — são detalhe, não decisão.
+    No cartão do celular (29/10/2026) o fornecedor aparece embaixo — o Mariano quis data e fornecedor à vista."""
+    dica = _dica_compra(r)
     if r["preco_origem"] == "sem":
         linhas = [tb.pedaco("—", "aux"), tb.pedaco("sem compra", "aux")]
     else:
@@ -209,6 +232,8 @@ def _celula_compra(r: dict) -> list:
             # "-" no lugar de "· cadastro" (02/10/2026); a explicação fica na dica.
             linhas.append(tb.pedaco("-", "aux", "Sem compra nos últimos meses.\n\nO preço é o custo de cadastro do "
                                                 "sistema de vendas, um valor aproximado."))
+    if r["preco_origem"] == "compra" and _fornecedor(r):
+        linhas.append(tb.pedaco(_fornecedor(r), "aux so-celular"))
     return tb.celula(*linhas)
 
 
@@ -259,9 +284,44 @@ def _linha(r: dict, p: calculo.Parametros) -> dict:
             "estoque_max": tb.celula(tb.pedaco(f"{_numero(r['estoque_min'])} / {_numero(r['estoque_max'])}")),
             "estoque": _celula_estoque(r),
             "quantidade": _celula_sugestao(r),
-            "subtotal": tb.celula(tb.pedaco(_moeda(r["subtotal"]), None if r["selecionado"] else "aux")),
+            "subtotal": tb.celula(tb.pedaco(_moeda(r["subtotal"]), None if r["selecionado"] else "aux"),
+                                  # Cartão do celular: a conta à vista ("6 × R$ 17,34").
+                                  tb.pedaco(f"{_numero(r['quantidade'])} × {_moeda(r['preco'])}", "aux so-celular")),
         },
     }
+
+
+@popups.popup("Detalhes do produto", "curto")
+def _dialog_detalhe(r: dict, p: calculo.Parametros) -> None:
+    """Detalhe do cartão no celular (29/10/2026): o que no PC está na linha e nos balões de dica — no celular não
+    há "passar o mouse". A Curva saiu do cartão e fica aqui."""
+    def bloco(titulo: str, texto: str | None) -> None:
+        if texto:
+            st.markdown(f"**{titulo}**")
+            for paragrafo in texto.split("\n\n"):
+                st.markdown(comum_markdown(paragrafo))
+
+    st.markdown(f'<div class="rmc-detalhe-nome">{html.escape(r["nome"])}</div>', unsafe_allow_html=True)
+    if r["categoria"]:
+        st.caption(_categoria(r))
+    for t in r["status"]:
+        if t in _CLASSE_STATUS:
+            bloco(rotulo_status(t), _dica_status(t, r, p))
+    bloco(f"Curva {r['curva']}", _DICA_CURVA)
+    bloco(f"Mín./Ideal: {_numero(r['estoque_min'])} / {_numero(r['estoque_max'])}",
+          f"Mínimo: estoque para {p.dias_ruptura} dias de venda; abaixo disso, vai faltar.\n\n"
+          "Ideal: quanto ter depois do pedido. O pedido é o ideal menos o estoque.")
+    preco = "sem compra" if r["preco_origem"] == "sem" else _moeda(r["preco"])
+    bloco(f"Última compra: {preco}" + (f" em {_data(r['compra_data'])}" if r["preco_origem"] == "compra" else ""),
+          _dica_compra(r))
+    st.markdown(f"**Vendeu em 90 dias:** {_numero(r['venda_90d'])} · **Estoque:** {_numero(r['estoque'])}")
+
+
+def comum_markdown(texto: str) -> str:
+    """Texto do banco no Markdown do Streamlit: sem fórmula ("R$ … R$") nem marcação acidental."""
+    from views import analise_comum
+
+    return analise_comum.texto_markdown(texto.replace("*", "\\*").replace("_", "\\_").replace("#", "\\#"))
 
 
 def _indicadores(pedido: pd.DataFrame, p: calculo.Parametros) -> None:

@@ -419,7 +419,9 @@ def indicadores(visao: str, linhas: pd.DataFrame, laboratorio: str, filtros_: an
             "sub": f"nos {ui.formatar_numero(atual.produtos_com_oportunidade)} com oportunidade",
             "variacao": var("economia_media_produto"), "dica_variacao": dica,
         }
-        theme.kpis([produtos, economia, lojas, media])
+        # Celular (29/10/2026): só Produtos com oportunidade e Economia potencial — o resumo; os outros dois
+        # (uma conta sobre estes e o que interessa ao consultor) ficam no PC.
+        theme.kpis([produtos, economia, {**lojas, "classe": "so-pc"}, {**media, "classe": "so-pc"}])
 
 
 # ---------------------------------------------------------------------------

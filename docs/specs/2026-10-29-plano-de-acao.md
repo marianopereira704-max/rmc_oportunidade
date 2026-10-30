@@ -147,6 +147,41 @@ loja a loja (resultado pronto idêntico ao calculado na hora, como na cópia das
 - Medir o que quebra (tabela larga, rodapé fixo, barra lateral, filtros) e corrigir; o que não couber numa
   tabela no celular vira cartão por produto (decisão de desenho com o M, com capturas antes/depois).
 
+**Medido (29/10/2026, 390 × 844, loja fictícia):** nenhuma tela rola a página na horizontal; login, Criar senha,
+pop-ups, cards e gráficos do Dashboard ficam bons. Quebram: a tabela do Assistente (Sugestão e Subtotal escondidos à
+direita, nome quebrado letra a letra), o rodapé fixo (~160 px, 19% da tela), os filtros do Assistente espremidos, os
+4 cards da Por Produto numa linha (números cortados) e a Economia escondida; nas tabelas do Dashboard as colunas da
+direita. Maquete do Assistente: https://claude.ai/artifact/UoBD8X3dfbaWpDhB42NREy.
+
+**Decidido pelo M (29/10/2026).** Regra: o cartão é o resumo (decidir e agir); o toque abre o detalhe (conferir).
+Nada sai do sistema — e no celular não há "passar o mouse", então o que hoje está nos balões de dica vai para o
+detalhe. Só abaixo de ~640 px de largura; no PC nada muda (o teste visual de 1280/1920 continua idêntico).
+- **Assistente:** o cartão mantém caixinha, nome, etiquetas, Estoque + "vendeu N em 90 dias", **Mín./Ideal** (o
+  pedido difere do ideal quando a loja tem estoque), **última compra com data e fornecedor**, quantidade − / + e
+  subtotal ("6 × R$ 17,34"). Saem do cartão a Curva e a categoria embaixo do nome (vão para um pop-up de detalhe
+  NOVO, que também traz o motivo do "Conferir preço" e o "O que fazer"). Cards do topo: Orçamento, Produtos para
+  comprar e Ruptura (o "Sem categoria" sai no celular — o pop-up ao abrir a loja já avisa). Filtros: busca + botão
+  "Filtros" (painel com Categoria, Fabricante, Status, Ocultar giro baixo). Rodapé: **some ao rolar para baixo e
+  volta ao rolar para cima** (opção B). **Enviar pedido (N)** no lugar do Exportar no celular: abre a janela de
+  compartilhar do aparelho (WhatsApp, e-mail…) com um Excel de EAN, Produto e Quantidade; **conta como exportação**
+  (registro, aviso contra pedido duplicado, limpa a área de trabalho).
+- **Por Produto:** o cartão mantém produto (e a loja com "Todas"), **Laboratório**, Economia em destaque, "pago ×
+  laboratório" e a quantidade; saem "N de M notas acima", a Diferença un. e a categoria (ficam no detalhe, que já
+  existe). Cards: Economia potencial e Produtos com oportunidade.
+- **Dashboard:** cards e gráficos ficam. Por categoria — Ruptura: Categoria, Em ruptura, Nível de serviço; Estoque:
+  Categoria, Estoque a preço de compra, Cobertura; Compras: Categoria, Dotação, Consumido, Eficiência. Produtos
+  críticos/não otimizados viram cartão com nome, etiquetas e 2 números (Ruptura: Perda e Repor; Estoque: Valor em
+  estoque e Cobertura; Compras: comprado × vendido e Não otimizado); o resto vai para o detalhe, que já existe.
+- Ficam como estão: login, Criar senha, pop-ups, Por Loja e Cadastro (equipe RMC, no PC).
+
+**Feito em 29/10/2026 (aprovado pelo M pelas fotos):** modo cartão/tabela na peça da tabela (`views/tabela.py`),
+Assistente (cartão, detalhe novo, cards, botão "Filtros", rodapé com "Enviar pedido" e "Mais" que some ao rolar),
+Por Produto e Dashboard. Teste visual com a volta de 390 px (17 fotos de referência); o PC ficou idêntico.
+Ajustes vistos nas fotos e corrigidos: a caixa vazia do Streamlit em volta da versão escondida do rodapé (o rodapé
+do PC subia 14 px), os dois botões do rodapé empilhados, a busca espremida com os filtros abertos, a linha picotada
+entre os dados do cartão e o "Mais" cortado. Fora daqui, para depois: a ordenação pelo título não existe no cartão
+(vale a ordem padrão) e a tabela de notas dentro do detalhe da Por Produto continua rolando de lado no celular.
+
 ## 7. E-mails para as lojas (C, com decisões do M)
 
 Para Comprador e Proprietário, cada um escolhe: **relatório diário**, **aviso de ruptura**, **os dois** ou nenhum
